@@ -19,8 +19,6 @@ docker-compose.override.yml
 .ruff_cache/
 .pytest_cache/
 *.db
-*.db-shm
-*.db-wal
 .plan.md
 .plan-*.md
 .hypothesis/
@@ -32,3 +30,8 @@ design_ideas/
 .claude/
 docs/design/
 /.idea
+/secrets
+.github/issues/bare_metal_migration/db_backup
+.github/issues/bare_metal_migration/secrets
+turnstone_migration_bundle_*.tar.gz
+*.tar.gz
