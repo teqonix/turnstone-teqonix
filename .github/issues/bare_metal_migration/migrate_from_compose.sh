@@ -164,8 +164,19 @@ elif [ "${MODE}" == "--import" ]; then
         exit 1
     fi
 
-    # Step 5: Start All Coordinator Containers
-    log_info "Step 5: Launching remaining Coordinator services..."
+    # Step 5: Wipe Stale Node State
+    log_info "Step 5: Purging stale compose container node registrations..."
+    docker compose exec -T postgres psql -U "${POSTGRES_USER}" -d turnstone -c "
+        TRUNCATE TABLE node_metadata CASCADE;
+        DELETE FROM services WHERE service_type = 'server';
+        TRUNCATE TABLE workstream_overrides CASCADE;
+        DELETE FROM system_settings WHERE node_id != '';
+        DELETE FROM watches WHERE node_id != '';
+    " || log_warn "Could not clean stale node metadata tables."
+    log_success "Stale compose cluster node registrations cleared."
+
+    # Step 6: Start All Coordinator Containers
+    log_info "Step 6: Launching remaining Coordinator services..."
     docker compose up -d
 
     # Cleanup

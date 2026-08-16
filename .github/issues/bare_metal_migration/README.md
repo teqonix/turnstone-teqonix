@@ -65,69 +65,108 @@ This directory contains the complete deployment and migration tooling for transi
 
 ---
 
-### Phase 2: Export & Import Existing Docker Compose Data
+### Choosing Your Migration Path (Mutually Exclusive)
 
-1. **Export on Current Host**:
-   Run the migration export command on your current Docker Compose machine:
+There are two distinct migration and restoration paths. **Choose Path A or Path B based on your deployment topology — do NOT combine them:**
+
+```
+               ┌─────────────────────────────────────────────────────────┐
+               │              Choose Your Migration Strategy             │
+               └────────────┬───────────────────────────────┬────────────┘
+                            │                               │
+                            ▼                               ▼
+       ┌────────────────────────────────────────┐ ┌────────────────────────────────────────┐
+       │ Path A: Distributed / Dedicated DB     │ │ Path B: All-in-One Compose Migration   │
+       │ (Recommended Multi-Node Topology)      │ │ (Single Standalone VM Bundle)          │
+       ├────────────────────────────────────────┤ ├────────────────────────────────────────┤
+       │ 1. deploy_coordinator.sh (silo-14 VM)  │ │ 1. migrate_from_compose.sh --export    │
+       │ 2. restore_postgres.sh (DB Host/VM)    │ │    (Run on old Compose machine)        │
+       │ 3. restart console (silo-14 VM)        │ │ 2. scp bundle to silo-14 VM            │
+       │ 4. deploy_ryzen_node / deploy_mlx_node │ │ 3. migrate_from_compose.sh --import    │
+       │    (Run on each bare-metal worker node)│ │    (Imports DB, Caddy CA, and .env)    │
+       └────────────────────────────────────────┘ └────────────────────────────────────────┘
+```
+
+---
+
+### Path A: Distributed Architecture & Dedicated Database (Recommended)
+
+Use this path when running a distributed infrastructure with a dedicated central PostgreSQL instance (or embedded coordinator DB) and bare-metal LLM nodes:
+
+#### Step 1: Deploy Coordinator VM on TrueNAS (`silo-14`)
+1. SSH into the `silo-14` Coordinator VM and run:
+   ```bash
+   sudo ./.github/issues/bare_metal_migration/deploy_coordinator.sh
+   ```
+2. Note the generated credentials and PostgreSQL URL.
+
+#### Step 2: Restore Database Backup (`restore_postgres.sh`)
+Run `restore_postgres.sh` on the database host (`turnstone-postgres.lan`) or Coordinator VM:
+```bash
+./.github/issues/bare_metal_migration/restore_postgres.sh \
+  -s .github/issues/bare_metal_migration/secrets/postgres_admin.secret \
+  -f .github/issues/bare_metal_migration/db_backup/db/turnstone_db_20260815_130936.sql.gz
+```
+- **What it does**:
+  - Automatically takes a safety backup (`existing_database_backup_${DATE}_${TIME}.sql.gz`).
+  - Drops and recreates the `public` schema cleanly to prevent relation/constraint duplicate errors.
+  - Imports all conversation history turns, workstreams, prompt templates, users, and tokens.
+  - Reassigns table ownership to the application user (`turnstone-np` / `turnstone`).
+  - Wipes stale 11-node container metadata so bare-metal nodes register freshly.
+
+#### Step 3: Refresh Coordinator Console Connection Pool
+Restart the console container on `silo-14` so its database connection pool binds cleanly to the newly restored schema:
+```bash
+sudo docker compose -f /opt/turnstone-coordinator/docker-compose.yml restart console
+```
+
+#### Step 4: Deploy & Register Bare-Metal Worker Nodes
+Run the node scripts on each respective machine:
+```bash
+# On AMD Ryzen AI Halo #1 (amd-ai-core-one.lan):
+NODE_ID="ryzen-halo-1" sudo -E ./.github/issues/bare_metal_migration/deploy_ryzen_node.sh
+
+# On AMD Ryzen AI Halo #2 (amd-ai-core-two.lan):
+NODE_ID="ryzen-halo-2" sudo -E ./.github/issues/bare_metal_migration/deploy_ryzen_node.sh
+
+# On Apple Silicon M5 Max (mbp-ai-core.lan):
+./.github/issues/bare_metal_migration/deploy_mlx_node.sh
+```
+
+---
+
+### Path B: All-in-One Standalone Compose Migration (`migrate_from_compose.sh`)
+
+Use this path only if you are migrating a standalone self-contained Docker Compose stack (including local Caddy CA root certificates, `.env` secrets, and database dump) onto a single all-in-one Coordinator VM:
+
+1. **Export on Current Docker Compose Host**:
    ```bash
    ./.github/issues/bare_metal_migration/migrate_from_compose.sh --export
    ```
-   *Output*: Creates a compressed migration bundle, e.g. `turnstone_migration_bundle_20260812_211111.tar.gz` containing all 19,944 conversation turns, 234 workstreams, and Caddy CA root keys.
+   *Output*: Creates a compressed migration bundle, e.g. `turnstone_migration_bundle_20260812_211111.tar.gz`.
 
 2. **Transfer Bundle to `silo-14`**:
    ```bash
    scp turnstone_migration_bundle_*.tar.gz user@silo-14:/tmp/
    ```
 
-3. **Import on Coordinator VM (`silo-14`)**:
-   SSH into `silo-14` and run:
+3. **Import on Standalone Coordinator VM (`silo-14`)**:
    ```bash
    sudo ./.github/issues/bare_metal_migration/migrate_from_compose.sh --import /tmp/turnstone_migration_bundle_*.tar.gz
    ```
-   *Output*: Restores environment secrets, Caddy CA keys, imports PostgreSQL dump, and verifies turn and workstream counts.
+   *Output*: Restores environment secrets, Caddy CA keys, imports the database dump, and automatically purges old compose container node metadata.
 
----
-
-### Phase 3: Deploy LLM Node 1 (M5 Max MacBook Pro)
-
-Run on `mbp-ai-core.lan`:
-```bash
-./.github/issues/bare_metal_migration/deploy_mlx_node.sh
-```
-- Interactive prompts will ask for `COORDINATOR_IP`, `JWT_SECRET`, and `POSTGRES_PASSWORD`.
-- Launches `mlx-lm.server` with 384k context window on port `8080` and registers `turnstone-server` via `launchd`.
-
----
-
-### Phase 4: Deploy LLM Nodes 2 & 3 (AMD Ryzen AI Halo #1 & #2)
-
-Run on each Ryzen box:
-```bash
-# On Ryzen Halo #1 (Orchestrator):
-NODE_ID="ryzen-halo-1" sudo -E ./.github/issues/bare_metal_migration/deploy_ryzen_node.sh
-
-# On Ryzen Halo #2 (Judge):
-NODE_ID="ryzen-halo-2" sudo -E ./.github/issues/bare_metal_migration/deploy_ryzen_node.sh
-```
-- Installs `/etc/turnstone/config.toml` (chmod 0600) and starts `/etc/systemd/system/turnstone-server.service`.
-
----
-
-### Phase 5: Configure Automated Daily ZFS Backups
-
-On `silo-14` Coordinator VM, install a crontab entry for daily backups at `02:00 AM`:
-```bash
-(crontab -l 2>/dev/null; echo "0 2 * * * /bin/bash /path/to/.github/issues/bare_metal_migration/backup_turnstone.sh >> /var/log/turnstone_backup.log 2>&1") | crontab -
-```
+> [!NOTE]
+> Do not execute `migrate_from_compose.sh --import` after running `restore_postgres.sh`. `migrate_from_compose.sh` is an all-in-one standalone importer, whereas `restore_postgres.sh` is for direct database-level restoration in the distributed architecture.
 
 ---
 
 ## Verification & Health Checks
 
 1. **Dashboard Access**:
-   Open browser at `https://silo-14:9443`. Confirm all 19,944 conversation history turns load cleanly.
+   Open browser at `https://silo-14:9443` (or `http://turnstone-coordinator-nerd-projects.lan:8090`). Confirm all conversation history turns and workstreams load cleanly.
 2. **Node Heartbeat Status**:
-   In the Dashboard under **Nodes**, confirm `mbp-ai-core`, `ryzen-halo-1`, and `ryzen-halo-2` display active heartbeats.
+   In the Dashboard under **Nodes** (and the top-left Cluster status counter), confirm active worker nodes (`ryzen-halo-1`, `ryzen-halo-2`, `mbp-ai-core`) show as `idle` with green heartbeats and auto-detected hardware metadata.
 3. **Decommission Old Instance**:
    Once verified, stop the local docker compose service:
    ```bash
