@@ -53,12 +53,15 @@ fi
 
 # Target Cluster Nodes Definition
 # Format: KEY | HOST | USER | DEST_REL_PATH | DESCRIPTION
-NODE_KEYS=("postgres" "coordinator")
+NODE_KEYS=("postgres" "coordinator" "ai-core-one" "ai-core-two" "mbp-ai-core")
 
 node_host() {
     case "$1" in
         postgres) echo "turnstone-postgres.lan" ;;
         coordinator) echo "turnstone-coordinator-nerd-projects.lan" ;;
+        ai-core-one) echo "amd-ai-core-one.lan" ;;
+        ai-core-two) echo "amd-ai-core-two.lan" ;;
+        mbp-ai-core) echo "mbp-ai-core.lan" ;;
         *) echo "" ;;
     esac
 }
@@ -66,14 +69,14 @@ node_host() {
 node_user() {
     case "$1" in
         postgres) echo "postgres" ;;
-        coordinator) echo "turnstone" ;;
+        coordinator|ai-core-one|ai-core-two|mbp-ai-core) echo "turnstone" ;;
         *) echo "" ;;
     esac
 }
 
 node_dest() {
     case "$1" in
-        postgres|coordinator) echo "~/nerd_projects/turnstone-teqonix" ;;
+        postgres|coordinator|ai-core-one|ai-core-two|mbp-ai-core) echo "~/nerd_projects/turnstone-teqonix" ;;
         *) echo "" ;;
     esac
 }
@@ -82,6 +85,9 @@ node_desc() {
     case "$1" in
         postgres) echo "PostgreSQL Database Node (turnstone-postgres.lan)" ;;
         coordinator) echo "Coordinator Stack Node (turnstone-coordinator-nerd-projects.lan)" ;;
+        ai-core-one) echo "Ryzen AI Halo Worker Node #1 (amd-ai-core-one.lan)" ;;
+        ai-core-two) echo "Ryzen AI Halo Worker Node #2 (amd-ai-core-two.lan)" ;;
+        mbp-ai-core) echo "Apple M5 Max MLX Worker Node (mbp-ai-core.lan)" ;;
         *) echo "" ;;
     esac
 }
@@ -106,9 +112,12 @@ ${BOLD}TARGETS:${NC}
   all           Sync to ALL cluster nodes (Default)
   postgres      Sync to postgres@turnstone-postgres.lan
   coordinator   Sync to turnstone@turnstone-coordinator-nerd-projects.lan
+  ai-core-one   Sync to turnstone@amd-ai-core-one.lan
+  ai-core-two   Sync to turnstone@amd-ai-core-two.lan
+  mbp-ai-core   Sync to turnstone@mbp-ai-core.lan
 
 ${BOLD}OPTIONS:${NC}
-  -t, --target <node>    Specify target node ('postgres', 'coordinator', or 'all')
+  -t, --target <node>    Specify target node ('postgres', 'coordinator', 'ai-core-one', 'ai-core-two', 'mbp-ai-core', or 'all')
   -i, --interactive      Prompt for node selection interactively
   -n, --dry-run          Perform a trial run with no changes made to remote
   -d, --delete           Delete extraneous files from destination directories
@@ -121,11 +130,11 @@ ${BOLD}EXAMPLES:${NC}
   # Sync repo to all nodes (default)
   $(basename "$0")
 
-  # Sync repo to turnstone-postgres.lan only
-  $(basename "$0") postgres
+  # Sync repo to amd-ai-core-one.lan only
+  $(basename "$0") ai-core-one
 
-  # Perform a dry-run sync to coordinator node
-  $(basename "$0") coordinator --dry-run
+  # Sync repo to mbp-ai-core.lan
+  $(basename "$0") mbp-ai-core
 
   # Interactively choose node and sync with delete option
   $(basename "$0") -i -d
@@ -187,7 +196,7 @@ parse_args() {
                     exit 1
                 fi
                 ;;
-            all|postgres|coordinator|turnstone-postgres|turnstone-postgres.lan|turnstone-coordinator|turnstone-coordinator-nerd-projects.lan|1|2)
+            all|postgres|coordinator|turnstone-postgres|turnstone-postgres.lan|turnstone-coordinator|turnstone-coordinator-nerd-projects.lan|ai-core-one|amd-ai-core-one|amd-ai-core-one.lan|ai-core-two|amd-ai-core-two|amd-ai-core-two.lan|mbp-ai-core|mbp-ai-core.lan|1|2|3|4|5)
                 TARGET_CHOICE="$1"
                 shift
                 ;;
@@ -205,13 +214,22 @@ resolve_targets() {
     local choice="$1"
     case "$choice" in
         all)
-            SELECTED_TARGETS=("postgres" "coordinator")
+            SELECTED_TARGETS=("postgres" "coordinator" "ai-core-one" "ai-core-two" "mbp-ai-core")
             ;;
         postgres|turnstone-postgres|turnstone-postgres.lan|1)
             SELECTED_TARGETS=("postgres")
             ;;
         coordinator|turnstone-coordinator|turnstone-coordinator-nerd-projects.lan|2)
             SELECTED_TARGETS=("coordinator")
+            ;;
+        ai-core-one|amd-ai-core-one|amd-ai-core-one.lan|3)
+            SELECTED_TARGETS=("ai-core-one")
+            ;;
+        ai-core-two|amd-ai-core-two|amd-ai-core-two.lan|4)
+            SELECTED_TARGETS=("ai-core-two")
+            ;;
+        mbp-ai-core|mbp-ai-core.lan|5)
+            SELECTED_TARGETS=("mbp-ai-core")
             ;;
         *)
             log_error "Invalid target selection: '${choice}'."
@@ -225,13 +243,19 @@ prompt_interactive() {
     echo "1) All Cluster Nodes"
     echo "2) postgres    (turnstone-postgres.lan)"
     echo "3) coordinator (turnstone-coordinator-nerd-projects.lan)"
+    echo "4) ai-core-one  (amd-ai-core-one.lan)"
+    echo "5) ai-core-two  (amd-ai-core-two.lan)"
+    echo "6) mbp-ai-core  (mbp-ai-core.lan)"
     echo
-    read -rp "Select target node [1-3] (Default: 1): " choice
+    read -rp "Select target node [1-6] (Default: 1): " choice
     choice="${choice:-1}"
     case "$choice" in
         1|all) TARGET_CHOICE="all" ;;
         2|postgres) TARGET_CHOICE="postgres" ;;
         3|coordinator) TARGET_CHOICE="coordinator" ;;
+        4|ai-core-one|amd-ai-core-one) TARGET_CHOICE="ai-core-one" ;;
+        5|ai-core-two|amd-ai-core-two) TARGET_CHOICE="ai-core-two" ;;
+        6|mbp-ai-core) TARGET_CHOICE="mbp-ai-core" ;;
         *)
             log_error "Invalid selection: $choice"
             exit 1
