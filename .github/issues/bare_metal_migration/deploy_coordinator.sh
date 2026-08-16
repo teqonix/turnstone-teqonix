@@ -38,7 +38,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." 2>/dev/null && pwd || pwd)"
 
 # Default secret file locations
-DEFAULT_SECRET_FILE="${REPO_ROOT}/secrets/postgres_admin.secret"
+DEFAULT_SECRET_FILE="${SCRIPT_DIR}/secrets/postgres_admin.secret"
+[ -f "${DEFAULT_SECRET_FILE}" ] || DEFAULT_SECRET_FILE="${REPO_ROOT}/secrets/postgres_admin.secret"
 SYS_ADMIN_ENV="/etc/turnstone/postgres_admin.env"
 
 SECRET_FILE="${POSTGRES_ADMIN_SECRET_FILE:-${SECRET_FILE:-}}"
@@ -48,14 +49,19 @@ POSTGRES_HOST="${POSTGRES_HOST:-}"
 POSTGRES_PORT="${POSTGRES_PORT:-}"
 POSTGRES_DB="${POSTGRES_DB:-}"
 EMBED_POSTGRES="${EMBED_POSTGRES:-false}"
+DISABLE_STACK="${DISABLE_STACK:-false}"
+PURGE_STACK="${PURGE_STACK:-false}"
 
 usage() {
     echo "Usage: $0 [OPTIONS]"
     echo ""
     echo "Options:"
-    echo "  -s, --secret-file <path> Path to secret file containing DB connection string or env vars"
-    echo "  --embed-postgres         Force running an embedded PostgreSQL container in Docker Compose"
-    echo "  -h, --help               Display this help message and exit"
+    echo "  -u, --user, --postgres-user <user> PostgreSQL username (e.g. turnstone-np, postgres)"
+    echo "  -s, --secret-file <path>           Path to secret file containing DB connection string or env vars"
+    echo "  --embed-postgres                   Force running an embedded PostgreSQL container in Docker Compose"
+    echo "  --disable, --stop, --down          Stop and remove coordinator containers and services"
+    echo "  --purge                            When used with --disable, remove configs and volumes (/opt/turnstone-coordinator)"
+    echo "  -h, --help                         Display this help message and exit"
     echo ""
     echo "Environment Variables Respected:"
     echo "  POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_HOST, POSTGRES_PORT, POSTGRES_DB,"
@@ -65,12 +71,24 @@ usage() {
 
 while [[ $# -gt 0 ]]; do
     case $1 in
+        -u|--user|--postgres-user)
+            POSTGRES_USER="$2"
+            shift 2
+            ;;
         -s|--secret-file)
             SECRET_FILE="$2"
             shift 2
             ;;
         --embed-postgres)
             EMBED_POSTGRES="true"
+            shift
+            ;;
+        --disable|--down|--stop)
+            DISABLE_STACK="true"
+            shift
+            ;;
+        --purge)
+            PURGE_STACK="true"
             shift
             ;;
         -h|--help)
@@ -86,6 +104,39 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+find_secret_by_user() {
+    local target_user="$1"
+    [ -z "${target_user}" ] && return 0
+
+    local search_dirs=("${SCRIPT_DIR}/secrets" "${REPO_ROOT}/secrets")
+    local sanitized_user
+    sanitized_user=$(echo "${target_user}" | tr '-' '_')
+
+    for sdir in "${search_dirs[@]}"; do
+        if [ -d "${sdir}" ]; then
+            if [ -f "${sdir}/postgres_${sanitized_user}.secret" ]; then
+                echo "${sdir}/postgres_${sanitized_user}.secret"
+                return 0
+            elif [ -f "${sdir}/postgres_${target_user}.secret" ]; then
+                echo "${sdir}/postgres_${target_user}.secret"
+                return 0
+            elif [ -f "${sdir}/${target_user}.secret" ]; then
+                echo "${sdir}/${target_user}.secret"
+                return 0
+            fi
+
+            for f in "${sdir}"/*.secret "${sdir}"/*.env; do
+                [ -f "${f}" ] || continue
+                if grep -qE "://(${target_user}|${target_user}:)" "${f}" 2>/dev/null || \
+                   grep -qE "^[[:space:]]*(POSTGRES_USER|POSTGRES_ADMIN_USER)=[\"']?${target_user}[\"']?[[:space:]]*$" "${f}" 2>/dev/null; then
+                    echo "${f}"
+                    return 0
+                fi
+            done
+        fi
+    done
+}
+
 parse_connection_uri() {
     local raw_url="$1"
     raw_url=$(echo "${raw_url}" | tr -d '\r' | xargs)
@@ -95,11 +146,10 @@ parse_connection_uri() {
         local userpass="${url%%@*}"
         local hostportdb="${url#*@}"
         
-        if [ -z "${POSTGRES_USER:-}" ]; then
-            local u="${userpass%%:*}"
-            [ -n "${u}" ] && POSTGRES_USER="${u}"
-        fi
-        if [ -z "${POSTGRES_PASSWORD:-}" ] && [[ "${userpass}" == *":"* ]]; then
+        local u="${userpass%%:*}"
+        [ -n "${u}" ] && POSTGRES_USER="${u}"
+
+        if [[ "${userpass}" == *":"* ]]; then
             local p="${userpass#*:}"
             [ -n "${p}" ] && POSTGRES_PASSWORD="${p}"
         fi
@@ -108,16 +158,13 @@ parse_connection_uri() {
         if [[ "${hostportdb}" == *"/"* ]]; then
             local db_in_url="${hostportdb#*/}"
             db_in_url="${db_in_url%%[?#]*}"
-            if [ -n "${db_in_url}" ] && [ -z "${POSTGRES_DB:-}" ]; then
-                POSTGRES_DB="${db_in_url}"
-            fi
+            [ -n "${db_in_url}" ] && POSTGRES_DB="${db_in_url}"
         fi
         
-        if [ -z "${POSTGRES_HOST:-}" ]; then
-            local h="${hostport%%:*}"
-            [ -n "${h}" ] && POSTGRES_HOST="${h}"
-        fi
-        if [ -z "${POSTGRES_PORT:-}" ] && [[ "${hostport}" == *":"* ]]; then
+        local h="${hostport%%:*}"
+        [ -n "${h}" ] && POSTGRES_HOST="${h}"
+
+        if [[ "${hostport}" == *":"* ]]; then
             local pt="${hostport#*:}"
             [ -n "${pt}" ] && POSTGRES_PORT="${pt}"
         fi
@@ -182,22 +229,76 @@ if [ "$EUID" -ne 0 ]; then
 fi
 log_success "Permissions verified."
 
-# Step 2: Docker & Docker Compose Verification
-log_info "Step 2: Checking Docker and Docker Compose installation..."
-if ! command -v docker &> /dev/null; then
-    log_info "Docker is not installed. Installing Docker..."
-    curl -fsSL https://get.docker.com | sh
-    systemctl enable --now docker
-    log_success "Docker installed successfully."
-else
-    log_success "Docker is already installed ($(docker --version))."
+if [ "${DISABLE_STACK}" = "true" ]; then
+    echo -e "${YELLOW}=================================================================${NC}"
+    echo -e "${YELLOW}       Disabling Turnstone Coordinator Stack                     ${NC}"
+    echo -e "${YELLOW}=================================================================${NC}"
+
+    COORDINATOR_DIR="/opt/turnstone-coordinator"
+    
+    # Configure DOCKER_HOST if using podman socket
+    if [ -S /run/podman/podman.sock ] && [ ! -S /var/run/docker.sock ]; then
+        export DOCKER_HOST="unix:///run/podman/podman.sock"
+    elif [ -S /var/run/docker.sock ]; then
+        export DOCKER_HOST="unix:///var/run/docker.sock"
+    fi
+
+    if [ -d "${COORDINATOR_DIR}" ] && [ -f "${COORDINATOR_DIR}/docker-compose.yml" ]; then
+        log_info "Stopping and removing coordinator containers in ${COORDINATOR_DIR}..."
+        cd "${COORDINATOR_DIR}"
+        if [ "${PURGE_STACK}" = "true" ]; then
+            docker compose down --volumes --remove-orphans || true
+            cd /
+            rm -rf "${COORDINATOR_DIR}"
+            rm -f /etc/turnstone/postgres_admin.env
+            log_success "Coordinator stack, volumes, and configuration purged completely."
+        else
+            docker compose down --remove-orphans || true
+            log_success "Coordinator containers stopped and removed."
+        fi
+    elif docker compose -p turnstone-coordinator ps &>/dev/null; then
+        docker compose -p turnstone-coordinator down --remove-orphans || true
+        log_success "Coordinator containers stopped."
+    else
+        log_warn "No running coordinator compose stack found at ${COORDINATOR_DIR}."
+    fi
+
+    exit 0
 fi
 
-if ! docker compose version &> /dev/null; then
-    log_error "Docker Compose plugin is missing. Please install docker-compose-plugin."
+# Step 2: Container Engine & Docker Compose Verification
+log_info "Step 2: Checking container engine (Docker / Podman)..."
+
+# Quiet podman emulation notice if present
+mkdir -p /etc/containers 2>/dev/null || true
+touch /etc/containers/nodocker 2>/dev/null || true
+
+if command -v podman &>/dev/null && ! command -v dockerd &>/dev/null; then
+    log_info "Podman detected as container engine. Ensuring 'podman.socket' is enabled and active..."
+    systemctl enable --now podman.socket || true
+    export DOCKER_HOST="${DOCKER_HOST:-unix:///run/podman/podman.sock}"
+    log_success "Podman socket configured at ${DOCKER_HOST}."
+elif [ -S /run/podman/podman.sock ] && [ ! -S /var/run/docker.sock ]; then
+    log_info "Active Podman socket detected at /run/podman/podman.sock."
+    export DOCKER_HOST="${DOCKER_HOST:-unix:///run/podman/podman.sock}"
+else
+    if ! command -v docker &> /dev/null; then
+        log_info "Docker is not installed. Installing Docker..."
+        curl -fsSL https://get.docker.com | sh
+        systemctl enable --now docker
+        log_success "Docker installed successfully."
+    else
+        log_success "Docker is installed ($(docker --version 2>/dev/null || echo 'docker'))."
+    fi
+    systemctl enable --now docker 2>/dev/null || true
+    export DOCKER_HOST="${DOCKER_HOST:-unix:///var/run/docker.sock}"
+fi
+
+if ! docker compose version &> /dev/null && ! command -v podman-compose &> /dev/null; then
+    log_error "Compose plugin is missing. Please install docker-compose-plugin or podman-compose."
     exit 1
 fi
-log_success "Docker Compose verified."
+log_success "Container compose environment verified."
 
 # Step 3: Directory Structure Setup
 COORDINATOR_DIR="/opt/turnstone-coordinator"
@@ -208,45 +309,24 @@ mkdir -p "${COORDINATOR_DIR}/searxng"
 mkdir -p "/mnt/storage/backups/turnstone" 2>/dev/null || mkdir -p "/var/backups/turnstone"
 
 SEARXNG_SETTINGS_FILE="${COORDINATOR_DIR}/searxng/settings.yml"
-SEARXNG_LIMITER_FILE="${COORDINATOR_DIR}/searxng/limiter.toml"
 
-if [ ! -f "${SEARXNG_LIMITER_FILE}" ]; then
-    cat > "${SEARXNG_LIMITER_FILE}" <<EOF
-# SearXNG Limiter Configuration
-[real_ip]
-x_for = 0
-
-[botdetection.ip_limit]
-default = 0
-EOF
-    chmod 644 "${SEARXNG_LIMITER_FILE}"
-fi
+# Remove obsolete limiter.toml that causes TypeError in modern SearXNG botdetection schema
+rm -f "${COORDINATOR_DIR}/searxng/limiter.toml" 2>/dev/null || true
 
 log_info "Configuring SearXNG settings at ${SEARXNG_SETTINGS_FILE}..."
-SEARXNG_SECRET=$(python3 -c "import secrets; print(secrets.token_hex(32))" 2>/dev/null || openssl rand -hex 32)
 cat > "${SEARXNG_SETTINGS_FILE}" <<EOF
+# Turnstone-bundled SearxNG configuration
 use_default_settings: true
+
 server:
-  secret_key: "${SEARXNG_SECRET}"
+  secret_key: "turnstone-bundled-searxng-not-secret"
   limiter: false
-  image_proxy: true
+  public_instance: false
+
 search:
-  safe_search: 0
-  autocomplete: ""
-  default_lang: ""
   formats:
     - html
     - json
-engines:
-  - name: wikidata
-    engine: wikidata
-    disabled: true
-  - name: ahmia
-    engine: ahmia
-    disabled: true
-  - name: torch
-    engine: torch
-    disabled: true
 EOF
 chmod 644 "${SEARXNG_SETTINGS_FILE}"
 log_success "Directory structure and SearXNG configuration created."
@@ -256,13 +336,30 @@ ENV_FILE="${COORDINATOR_DIR}/.env"
 log_info "Step 4: Configuring secrets and environment (.env)..."
 
 if [ -z "${SECRET_FILE}" ]; then
-    if [ -f "${SYS_ADMIN_ENV}" ]; then
-        log_info "System database configuration file found at '${SYS_ADMIN_ENV}'."
-        SECRET_FILE="${SYS_ADMIN_ENV}"
-    elif [ -f "${DEFAULT_SECRET_FILE}" ]; then
+    if [ -z "${POSTGRES_USER}" ]; then
+        read -r -p "Enter PostgreSQL username [e.g. turnstone-np, postgres, turnstone]: " INPUT_USER
+        if [ -n "${INPUT_USER}" ]; then
+            POSTGRES_USER=$(echo "${INPUT_USER}" | xargs)
+        fi
+    fi
+
+    if [ -n "${POSTGRES_USER}" ]; then
+        MATCHED_SECRET=$(find_secret_by_user "${POSTGRES_USER}")
+        if [ -n "${MATCHED_SECRET}" ]; then
+            log_info "Found matching secret file '${MATCHED_SECRET}' for PostgreSQL user '${POSTGRES_USER}'."
+            SECRET_FILE="${MATCHED_SECRET}"
+        fi
+    fi
+fi
+
+if [ -z "${SECRET_FILE}" ]; then
+    if [ -f "${DEFAULT_SECRET_FILE}" ]; then
         log_info "Default secret file found at '${DEFAULT_SECRET_FILE}'."
         read -r -p "Enter path to .secret file [press Enter to use default '${DEFAULT_SECRET_FILE}']: " INPUT_SECRET
         SECRET_FILE="${INPUT_SECRET:-${DEFAULT_SECRET_FILE}}"
+    elif [ -f "${SYS_ADMIN_ENV}" ]; then
+        log_info "System database configuration file found at '${SYS_ADMIN_ENV}'."
+        SECRET_FILE="${SYS_ADMIN_ENV}"
     else
         echo ""
         read -r -p "Enter path to .secret file containing DB connection string [leave blank to enter DB details interactively]: " INPUT_SECRET
@@ -302,8 +399,7 @@ if [ -z "${POSTGRES_PASSWORD}" ]; then
 fi
 
 mkdir -p /etc/turnstone
-if [ ! -f "${SYS_ADMIN_ENV}" ]; then
-    cat > "${SYS_ADMIN_ENV}" <<EOF
+cat > "${SYS_ADMIN_ENV}" <<EOF
 # Turnstone PostgreSQL Connection Credentials
 POSTGRES_ADMIN_USER=${POSTGRES_USER}
 POSTGRES_ADMIN_PASS=${POSTGRES_PASSWORD}
@@ -311,15 +407,22 @@ POSTGRES_HOST=${POSTGRES_HOST}
 POSTGRES_PORT=${POSTGRES_PORT}
 POSTGRES_DB=${POSTGRES_DB}
 EOF
-    chmod 600 "${SYS_ADMIN_ENV}"
-    log_info "Saved database connection credentials to '${SYS_ADMIN_ENV}'."
+chmod 600 "${SYS_ADMIN_ENV}"
+log_info "Saved database connection credentials to '${SYS_ADMIN_ENV}'."
+
+# Preserve existing JWT secret if available, otherwise generate new
+JWT_SECRET=""
+if [ -f "${ENV_FILE}" ]; then
+    log_info "Existing ${ENV_FILE} found. Preserving JWT secret and updating DB credentials..."
+    EXISTING_JWT=$(grep '^TURNSTONE_JWT_SECRET=' "${ENV_FILE}" 2>/dev/null | cut -d'=' -f2- | tr -d '\r' | xargs || true)
+    [ -n "${EXISTING_JWT}" ] && JWT_SECRET="${EXISTING_JWT}"
 fi
 
-if [ ! -f "${ENV_FILE}" ]; then
-    log_info "Generating new secure environment configuration..."
+if [ -z "${JWT_SECRET}" ]; then
     JWT_SECRET=$(python3 -c "import secrets; print(secrets.token_hex(32))" 2>/dev/null || openssl rand -hex 32)
-    
-    cat > "${ENV_FILE}" <<EOF
+fi
+
+cat > "${ENV_FILE}" <<EOF
 # Turnstone Coordinator Environment Configuration
 TURNSTONE_JWT_SECRET=${JWT_SECRET}
 POSTGRES_USER=${POSTGRES_USER}
@@ -333,27 +436,8 @@ SEARXNG_API_PORT=8081
 SEARXNG_HTTPS_PORT=8444
 TURNSTONE_HOST_IP=0.0.0.0
 EOF
-    chmod 600 "${ENV_FILE}"
-    log_success "Created ${ENV_FILE} with PostgreSQL credentials and generated JWT secret."
-else
-    log_info "Existing ${ENV_FILE} found. Preserving current secrets."
-    source "${ENV_FILE}"
-    if [ -n "${SECRET_FILE}" ]; then
-        log_info "Updating PostgreSQL credentials in ${ENV_FILE} from '${SECRET_FILE}'..."
-        sed -i '/^POSTGRES_USER=/d' "${ENV_FILE}"
-        sed -i '/^POSTGRES_PASSWORD=/d' "${ENV_FILE}"
-        sed -i '/^POSTGRES_HOST=/d' "${ENV_FILE}"
-        sed -i '/^POSTGRES_PORT=/d' "${ENV_FILE}"
-        sed -i '/^POSTGRES_DB=/d' "${ENV_FILE}"
-        cat >> "${ENV_FILE}" <<EOF
-POSTGRES_USER=${POSTGRES_USER}
-POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-POSTGRES_HOST=${POSTGRES_HOST}
-POSTGRES_PORT=${POSTGRES_PORT}
-POSTGRES_DB=${POSTGRES_DB}
-EOF
-    fi
-fi
+chmod 600 "${ENV_FILE}"
+log_success "Saved ${ENV_FILE} with PostgreSQL credentials for '${POSTGRES_USER}'@'${POSTGRES_HOST}'."
 
 # Step 5: Generate docker-compose.yaml for Coordinator Services
 COMPOSE_FILE="${COORDINATOR_DIR}/docker-compose.yml"
@@ -500,8 +584,17 @@ EOF
 log_success "Docker Compose specification written."
 
 # Step 6: Deploy / Update Coordinator Stack
-log_info "Step 6: Launching Coordinator Docker containers..."
+log_info "Step 6: Launching Coordinator containers..."
 cd "${COORDINATOR_DIR}"
+
+if [ -z "${DOCKER_HOST:-}" ]; then
+    if [ -S /run/podman/podman.sock ] && [ ! -S /var/run/docker.sock ]; then
+        export DOCKER_HOST="unix:///run/podman/podman.sock"
+    elif [ -S /var/run/docker.sock ]; then
+        export DOCKER_HOST="unix:///var/run/docker.sock"
+    fi
+fi
+
 docker compose pull --quiet || true
 docker compose up -d
 
