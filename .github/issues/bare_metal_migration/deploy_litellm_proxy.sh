@@ -171,12 +171,13 @@ if [ ! -d "${VENV_DIR}" ] || [ ! -f "${VENV_DIR}/bin/litellm" ]; then
     rm -rf "${VENV_DIR}"
     uv venv "${VENV_DIR}" --python "${SYSTEM_PYTHON}"
     
-    log_info "Installing 'litellm[proxy]' and async server dependencies..."
-    uv pip install --python "${VENV_DIR}" "litellm[proxy]" uvicorn gunicorn backoff
+    log_info "Installing 'litellm[proxy]', pinned fastapi, and async server dependencies..."
+    uv pip install --python "${VENV_DIR}" "fastapi>=0.112.0,<0.116.0" "litellm[proxy]" uvicorn gunicorn backoff
     log_success "LiteLLM Proxy installed into ${VENV_DIR}."
 else
     log_info "Virtual environment already exists at ${VENV_DIR}."
-    # Ensure package is up to date
+    # Ensure package and FastAPI compatibility are up to date
+    uv pip install --python "${VENV_DIR}" "fastapi>=0.112.0,<0.116.0" --upgrade >/dev/null 2>&1 || true
     uv pip install --python "${VENV_DIR}" --upgrade "litellm[proxy]" >/dev/null 2>&1 || true
 fi
 
@@ -184,6 +185,15 @@ fi
 chown -R "${LITELLM_USER}:${LITELLM_USER}" "${VENV_DIR}"
 chmod -R a+rX "${VENV_DIR}"
 chmod +x "${VENV_DIR}/bin"/* 2>/dev/null || true
+
+# Test Python imports before continuing
+log_info "Verifying LiteLLM proxy server module imports..."
+if ! "${VENV_DIR}/bin/python3" -c "import litellm; from litellm.proxy.proxy_server import app; print('Python imports: OK')" 2>/dev/null; then
+    log_error "LiteLLM module import test failed. Running with full traceback:"
+    "${VENV_DIR}/bin/python3" -c "import litellm; from litellm.proxy.proxy_server import app"
+    exit 1
+fi
+log_success "Python package import verification passed."
 
 # -----------------------------------------------------------------------------
 # Step 5: Configure LiteLLM Routing & Model Groups
@@ -373,7 +383,8 @@ Group=${LITELLM_USER}
 WorkingDirectory=${LITELLM_DIR}
 Environment="LITELLM_MASTER_KEY=${MASTER_KEY}"
 Environment="PYTHONUNBUFFERED=1"
-ExecStart=${VENV_DIR}/bin/litellm --config ${LITELLM_CONFIG} --host ${LITELLM_HOST} --port ${LITELLM_PORT}
+Environment="PATH=${VENV_DIR}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ExecStart=${VENV_DIR}/bin/python3 -m litellm.proxy.proxy_cli --config ${LITELLM_CONFIG} --host ${LITELLM_HOST} --port ${LITELLM_PORT}
 Restart=always
 RestartSec=5s
 LimitNOFILE=65536
@@ -393,20 +404,38 @@ else
     systemctl restart litellm.service
 fi
 
-sleep 2
-
 # -----------------------------------------------------------------------------
 # Step 7: Service Health Verification
 # -----------------------------------------------------------------------------
 log_section "Step 7: Verification & Health Check"
 
-HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "127.0.0.1")
+log_info "Waiting for LiteLLM to become healthy on port ${LITELLM_PORT}..."
+SERVICE_HEALTHY=false
+for i in $(seq 1 15); do
+    if ! systemctl is-active --quiet litellm.service; then
+        log_warn "litellm.service is not active yet (attempt ${i}/15)..."
+        sleep 1
+        continue
+    fi
 
-if systemctl is-active --quiet litellm.service; then
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 "http://127.0.0.1:${LITELLM_PORT}/health/readiness" -H "Authorization: Bearer ${MASTER_KEY}" || true)
+    if [ "${HTTP_CODE}" = "200" ] || [ "${HTTP_CODE}" = "401" ] || [ "${HTTP_CODE}" = "403" ]; then
+        SERVICE_HEALTHY=true
+        log_success "LiteLLM Proxy is responsive (HTTP ${HTTP_CODE})!"
+        break
+    fi
+    sleep 1
+done
+
+if [ "${SERVICE_HEALTHY}" = true ]; then
     log_success "LiteLLM Proxy is running successfully on port ${LITELLM_PORT}!"
 else
-    log_warn "Service did not start immediately. Checking recent journal logs:"
-    journalctl -u litellm.service -n 25 --no-pager || true
+    log_error "LiteLLM Proxy failed to become ready within 15 seconds."
+    echo -e "\n${YELLOW}--- Systemd Service Status ---${NC}"
+    systemctl status litellm.service --no-pager || true
+    echo -e "\n${YELLOW}--- Recent Journal Logs (litellm.service) ---${NC}"
+    journalctl -u litellm.service -n 35 --no-pager || true
+    exit 1
 fi
 
 echo -e "\n${GREEN}=================================================================${NC}"
