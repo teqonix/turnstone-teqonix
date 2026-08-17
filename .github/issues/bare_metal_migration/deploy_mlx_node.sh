@@ -38,6 +38,9 @@ POSTGRES_PORT="${POSTGRES_PORT:-}"
 POSTGRES_DB="${POSTGRES_DB:-}"
 COORDINATOR_IP="${COORDINATOR_IP:-}"
 JWT_SECRET="${JWT_SECRET:-}"
+SMB_PATH="${SMB_PATH:-}"
+SMB_USER="${SMB_USER:-}"
+SMB_PASSWORD="${SMB_PASSWORD:-}"
 
 usage() {
     echo "Usage: $0 [OPTIONS]"
@@ -46,6 +49,9 @@ usage() {
     echo "  -u, --user, --postgres-user <user> PostgreSQL username (e.g. turnstone-np, postgres)"
     echo "  -s, --secret-file <path>           Path to secret file containing DB connection string or env vars"
     echo "  -c, --coordinator <ip>             Coordinator VM IP address or hostname"
+    echo "      --smb-path <path>              Remote SMB path + protocol (e.g. smb://silo-14.lan/ai_playground)"
+    echo "      --smb-user <user>              SMB username (e.g. turnstone-np)"
+    echo "      --smb-pass <pass>              SMB password"
     echo "  -h, --help                         Display this help message and exit"
     exit 0
 }
@@ -64,6 +70,18 @@ while [[ $# -gt 0 ]]; do
             COORDINATOR_IP="$2"
             shift 2
             ;;
+        --smb-path)
+            SMB_PATH="$2"
+            shift 2
+            ;;
+        --smb-user)
+            SMB_USER="$2"
+            shift 2
+            ;;
+        --smb-pass|--smb-password)
+            SMB_PASSWORD="$2"
+            shift 2
+            ;;
         -h|--help)
             usage
             ;;
@@ -76,6 +94,55 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+parse_smb_path() {
+    local raw_path="$1"
+    raw_path=$(echo "${raw_path}" | tr -d '\r' | xargs)
+    
+    # Convert Windows-style backslashes to forward slashes
+    raw_path="${raw_path//\\//}"
+    
+    # Strip protocol prefix (smb://, cifs://, etc.)
+    local stripped="${raw_path#*://}"
+    stripped="${stripped#//}"
+    stripped="${stripped#/}"
+    stripped="${stripped%/}"
+    
+    # Parse user:password@ if present
+    if [[ "${stripped}" == *"@"* ]]; then
+        local userinfo="${stripped%%@*}"
+        stripped="${stripped#*@}"
+        userinfo=$(echo "${userinfo}" | tr -d '=')
+        if [[ "${userinfo}" == *":"* ]]; then
+            [ -z "${SMB_USER:-}" ] && SMB_USER="${userinfo%%:*}"
+            [ -z "${SMB_PASSWORD:-}" ] && SMB_PASSWORD="${userinfo#*:}"
+        else
+            [ -z "${SMB_USER:-}" ] && SMB_USER="${userinfo}"
+        fi
+    fi
+    
+    # Remove accidental leading '=' from hostname
+    stripped="${stripped#=}"
+    
+    SERVER_HOSTNAME="${stripped%%/*}"
+    local path_part=""
+    if [[ "${stripped}" == *"/"* ]]; then
+        path_part="${stripped#*/}"
+        path_part="${path_part#/}"
+        path_part="${path_part%/}"
+    fi
+    
+    if [ -z "${path_part}" ] || [ "${SERVER_HOSTNAME}" = "${path_part}" ]; then
+        SHARE_NAME="ai_playground"
+    else
+        # If user passed a full TrueNAS storage path (e.g. /mnt/silo-14/ai_playground), extract the SMB share name
+        if [[ "${path_part}" =~ ^mnt/[^/]+/(.+)$ ]]; then
+            SHARE_NAME="${BASH_REMATCH[1]}"
+        else
+            SHARE_NAME="${path_part}"
+        fi
+    fi
+}
 
 find_secret_by_user() {
     local target_user="$1"
@@ -229,6 +296,28 @@ if [ -z "${JWT_SECRET}" ]; then
     read -rp "Enter TURNSTONE_JWT_SECRET from Coordinator setup: " JWT_SECRET
 fi
 
+if [ -z "${SMB_PATH}" ]; then
+    read -rp "Enter remote SMB storage path + protocol [default: smb://silo-14.lan/ai_playground]: " INPUT_SMB_PATH
+    SMB_PATH="${INPUT_SMB_PATH:-smb://silo-14.lan/ai_playground}"
+fi
+
+parse_smb_path "${SMB_PATH}"
+SERVER_HOSTNAME="${SERVER_HOSTNAME:-silo-14.lan}"
+SHARE_NAME="${SHARE_NAME:-ai_playground}"
+
+if [ -z "${SMB_USER}" ]; then
+    read -rp "Enter SMB username to connect as [default: turnstone-np]: " INPUT_SMB_USER
+    SMB_USER="${INPUT_SMB_USER:-turnstone-np}"
+fi
+REMOTE_USERNAME="${SMB_USER}"
+
+if [ -z "${SMB_PASSWORD}" ]; then
+    read -r -s -p "Enter SMB Password for '${REMOTE_USERNAME}'@'${SERVER_HOSTNAME}': " SMB_PASSWORD
+    echo ""
+fi
+
+MOUNT_POINT="/mnt/${SERVER_HOSTNAME}/${REMOTE_USERNAME}/${SHARE_NAME}"
+
 NODE_ID="mbp-ai-core"
 LAN_IP=$(ifconfig | grep "inet " | grep -v 127.0.0.1 | awk '{print $2}' | head -n 1)
 
@@ -284,9 +373,72 @@ log_success "Configuration written and secured (0600)."
 mkdir -p "$HOME/Library/LaunchAgents"
 mkdir -p "$HOME/Library/Logs"
 
-# Step 5: Setup MLX Launchd Service (mlx-lm.server)
+# Step 5: Configure & Mount Remote SMB Storage at Startup
+log_info "Step 5: Configuring remote SMB mount at ${MOUNT_POINT}..."
+
+if [ ! -d "/mnt" ]; then
+    sudo mkdir -p "/System/Volumes/Data/mnt" 2>/dev/null || true
+    if [ -f "/etc/synthetic.conf" ]; then
+        if ! grep -q "^mnt" /etc/synthetic.conf 2>/dev/null; then
+            printf "mnt\t/System/Volumes/Data/mnt\n" | sudo tee -a /etc/synthetic.conf >/dev/null 2>&1 || true
+        fi
+    else
+        printf "mnt\t/System/Volumes/Data/mnt\n" | sudo tee /etc/synthetic.conf >/dev/null 2>&1 || true
+    fi
+    sudo /System/Library/Filesystems/apfs.fs/Contents/Resources/apfs_synthetic_links 2>/dev/null || true
+fi
+
+sudo mkdir -p "${MOUNT_POINT}" 2>/dev/null || mkdir -p "${MOUNT_POINT}" 2>/dev/null || true
+sudo chown -R "$(whoami)" "${MOUNT_POINT}" 2>/dev/null || true
+sudo chmod 775 "${MOUNT_POINT}" 2>/dev/null || true
+
+cat > "${CONFIG_DIR}/mount_smb.sh" <<EOF
+#!/usr/bin/env bash
+mkdir -p "${MOUNT_POINT}" 2>/dev/null || true
+if ! mount | grep -Fq "on ${MOUNT_POINT} "; then
+    mount_smbfs "//${REMOTE_USERNAME}:${SMB_PASSWORD}@${SERVER_HOSTNAME}/${SHARE_NAME}" "${MOUNT_POINT}" 2>/dev/null || true
+fi
+EOF
+chmod 700 "${CONFIG_DIR}/mount_smb.sh"
+
+SMB_MOUNT_PLIST="$HOME/Library/LaunchAgents/com.turnstone.smb-mount.plist"
+cat > "${SMB_MOUNT_PLIST}" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.turnstone.smb-mount</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>${CONFIG_DIR}/mount_smb.sh</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>NetworkState</key>
+        <true/>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>${HOME}/Library/Logs/smb-mount.log</string>
+    <key>StandardErrorPath</key>
+    <string>${HOME}/Library/Logs/smb-mount.err</string>
+</dict>
+</plist>
+EOF
+
+launchctl bootout "gui/$(id -u)/com.turnstone.smb-mount" 2>/dev/null || launchctl unload "${SMB_MOUNT_PLIST}" 2>/dev/null || true
+launchctl bootstrap "gui/$(id -u)" "${SMB_MOUNT_PLIST}" 2>/dev/null || launchctl load "${SMB_MOUNT_PLIST}" 2>/dev/null || true
+bash "${CONFIG_DIR}/mount_smb.sh" 2>/dev/null || true
+log_success "SMB storage configured for startup mount at ${MOUNT_POINT}."
+
+# Step 6: Setup MLX Launchd Service (mlx-lm.server)
 MLX_PLIST="$HOME/Library/LaunchAgents/com.turnstone.mlx-server.plist"
-log_info "Step 5: Configuring MLX Server launchd service..."
+log_info "Step 6: Configuring MLX Server launchd service..."
 
 cat > "${MLX_PLIST}" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -323,9 +475,9 @@ launchctl bootout "gui/$(id -u)/com.turnstone.mlx-server" 2>/dev/null || launchc
 launchctl bootstrap "gui/$(id -u)" "${MLX_PLIST}" 2>/dev/null || launchctl load "${MLX_PLIST}"
 log_success "MLX Server service loaded."
 
-# Step 6: Setup Turnstone Server Launchd Service
+# Step 7: Setup Turnstone Server Launchd Service
 SERVER_PLIST="$HOME/Library/LaunchAgents/com.turnstone.server.plist"
-log_info "Step 6: Configuring turnstone-server launchd service..."
+log_info "Step 7: Configuring turnstone-server launchd service..."
 
 cat > "${SERVER_PLIST}" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -334,6 +486,8 @@ cat > "${SERVER_PLIST}" <<EOF
 <dict>
     <key>Label</key>
     <string>com.turnstone.server</string>
+    <key>WorkingDirectory</key>
+    <string>${MOUNT_POINT}</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>TURNSTONE_NODE_ID</key>
@@ -350,6 +504,10 @@ cat > "${SERVER_PLIST}" <<EOF
         <string>postgresql</string>
         <key>TURNSTONE_DB_URL</key>
         <string>postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}</string>
+        <key>TURNSTONE_STORAGE_DIR</key>
+        <string>${MOUNT_POINT}</string>
+        <key>TURNSTONE_SMB_MOUNT</key>
+        <string>${MOUNT_POINT}</string>
     </dict>
     <key>ProgramArguments</key>
     <array>
@@ -384,3 +542,4 @@ echo -e "Node ID: ${NODE_ID}"
 echo -e "Advertise URL: http://${LAN_IP}:8080"
 echo -e "PostgreSQL Backend: ${POSTGRES_USER}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}"
 echo -e "MLX Server API: http://127.0.0.1:8000/v1 (384k Context Window)"
+echo -e "SMB Storage Mount: ${MOUNT_POINT} (${SMB_PATH})"
