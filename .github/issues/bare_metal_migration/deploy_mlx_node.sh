@@ -3,7 +3,8 @@
 # Turnstone LLM Node 1 (Apple Silicon M5 Max - mbp-ai-core.lan) Deployment
 #
 # Installs Apple MLX server (mlx-lm.server) + bare-metal turnstone-server,
-# configures 384k context window, and sets up macOS launchd services.
+# configures context window, creates dedicated system user idempotently,
+# and sets up macOS launchd services.
 # =============================================================================
 
 set -euo pipefail
@@ -139,7 +140,7 @@ parse_smb_path() {
     fi
     
     if [ -z "${path_part}" ] || [ "${SERVER_HOSTNAME}" = "${path_part}" ]; then
-        SHARE_NAME="ai_playground"
+        SHARE_NAME="ai-playground"
     else
         # If user passed a full TrueNAS storage path (e.g. /mnt/silo-14/ai_playground), extract the SMB share name
         if [[ "${path_part}" =~ ^mnt/[^/]+/(.+)$ ]]; then
@@ -148,39 +149,6 @@ parse_smb_path() {
             SHARE_NAME="${path_part}"
         fi
     fi
-}
-
-find_secret_by_user() {
-    local target_user="$1"
-    [ -z "${target_user}" ] && return 0
-
-    local search_dirs=("${SCRIPT_DIR}/secrets" "${REPO_ROOT}/secrets")
-    local sanitized_user
-    sanitized_user=$(echo "${target_user}" | tr '-' '_')
-
-    for sdir in "${search_dirs[@]}"; do
-        if [ -d "${sdir}" ]; then
-            if [ -f "${sdir}/postgres_${sanitized_user}.secret" ]; then
-                echo "${sdir}/postgres_${sanitized_user}.secret"
-                return 0
-            elif [ -f "${sdir}/postgres_${target_user}.secret" ]; then
-                echo "${sdir}/postgres_${target_user}.secret"
-                return 0
-            elif [ -f "${sdir}/${target_user}.secret" ]; then
-                echo "${sdir}/${target_user}.secret"
-                return 0
-            fi
-
-            for f in "${sdir}"/*.secret "${sdir}"/*.env; do
-                [ -f "${f}" ] || continue
-                if grep -qE "://(${target_user}|${target_user}:)" "${f}" 2>/dev/null || \
-                   grep -qE "^[[:space:]]*(POSTGRES_USER|POSTGRES_ADMIN_USER)=[\"']?${target_user}[\"']?[[:space:]]*$" "${f}" 2>/dev/null; then
-                    echo "${f}"
-                    return 0
-                fi
-            done
-        fi
-    done
 }
 
 parse_connection_uri() {
@@ -208,7 +176,9 @@ parse_connection_uri() {
         fi
         
         local h="${hostport%%:*}"
-        [ -n "${h}" ] && POSTGRES_HOST="${h}"
+        if [ -n "${h}" ] && [ "${h}" != "localhost" ] && [ "${h}" != "127.0.0.1" ]; then
+            POSTGRES_HOST="${h}"
+        fi
 
         if [[ "${hostport}" == *":"* ]]; then
             local pt="${hostport#*:}"
@@ -217,81 +187,209 @@ parse_connection_uri() {
     fi
 }
 
-load_secrets() {
-    local target_file=""
+auto_load_all_secrets() {
+    local search_dirs=(
+        "${SCRIPT_DIR}/secrets"
+        "${REPO_ROOT}/secrets"
+        "${REPO_ROOT}/.github/issues/bare_metal_migration/secrets"
+        "${SCRIPT_DIR}"
+        "${USER_HOME}/nerd_projects/turnstone-teqonix/.github/issues/bare_metal_migration/secrets"
+        "${USER_HOME}/nerd_projects/turnstone-teqonix/secrets"
+        "/etc/turnstone"
+    )
 
-    if [ -n "${SECRET_FILE}" ] && [ -f "${SECRET_FILE}" ]; then
-        target_file="${SECRET_FILE}"
-    elif [ -n "${POSTGRES_USER}" ]; then
-        local matched
-        matched=$(find_secret_by_user "${POSTGRES_USER}")
-        if [ -n "${matched}" ]; then
-            target_file="${matched}"
+    # 1. PostgreSQL Secret Discovery & Parsing
+    if [ -z "${POSTGRES_PASSWORD:-}" ]; then
+        local pg_candidates=(
+            "turnstone_np_postgres.secret"
+            "turnstone_postgres.secret"
+            "postgres_turnstone_np.secret"
+            "turnstone_np.secret"
+            "turnstone.secret"
+            "postgres_admin.secret"
+            "postgres.secret"
+        )
+        local matched_pg=""
+        for sdir in "${search_dirs[@]}"; do
+            [ -d "$sdir" ] || continue
+            for cand in "${pg_candidates[@]}"; do
+                if [ -f "${sdir}/${cand}" ]; then
+                    matched_pg="${sdir}/${cand}"
+                    break 2
+                fi
+            done
+            for f in "${sdir}"/*postgres*.secret "${sdir}"/*postgres*.env; do
+                if [ -f "$f" ]; then
+                    matched_pg="$f"
+                    break 2
+                fi
+            done
+        done
+
+        if [ -n "${matched_pg}" ] && [ -f "${matched_pg}" ]; then
+            log_info "Auto-discovered PostgreSQL secret file: '${matched_pg}'"
+            local first_line
+            first_line=$(grep -v '^[[:space:]]*#' "${matched_pg}" | grep -v '^[[:space:]]*$' | tr -d '\r' | head -n 1 || true)
+            if [[ "${first_line}" == *"://"* ]] || [[ "${first_line}" == *"@"* ]]; then
+                parse_connection_uri "${first_line}"
+            elif [[ "${first_line}" == *"="* ]]; then
+                set +e
+                source "${matched_pg}"
+                set -e
+                POSTGRES_USER="${POSTGRES_USER:-${POSTGRES_ADMIN_USER:-turnstone-np}}"
+                POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-${POSTGRES_ADMIN_PASS:-}}"
+                [ -n "${PGHOST:-}" ] && POSTGRES_HOST="${PGHOST}"
+                [ -n "${PGPORT:-}" ] && POSTGRES_PORT="${PGPORT}"
+                [ -n "${PGDATABASE:-}" ] && POSTGRES_DB="${PGDATABASE}"
+            fi
         fi
     fi
 
-    if [ -n "${target_file}" ] && [ -f "${target_file}" ]; then
-        log_info "Sourcing database connection credentials from '${target_file}'..."
-        local first_line
-        first_line=$(grep -v '^[[:space:]]*#' "${target_file}" | grep -v '^[[:space:]]*$' | tr -d '\r' | head -n 1 || true)
-        
-        if [[ "${first_line}" == *"://"* ]] || [[ "${first_line}" == *"@"* ]]; then
-            parse_connection_uri "${first_line}"
-        elif [[ "${first_line}" == *"="* ]]; then
-            set +e
-            source "${target_file}"
-            set -e
-            POSTGRES_USER="${POSTGRES_USER:-${POSTGRES_ADMIN_USER:-turnstone}}"
-            POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-${POSTGRES_ADMIN_PASS:-}}"
-            POSTGRES_HOST="${POSTGRES_HOST:-${PGHOST:-}}"
-            POSTGRES_PORT="${POSTGRES_PORT:-${PGPORT:-}}"
-            POSTGRES_DB="${POSTGRES_DB:-turnstone}"
+    # Normalize PostgreSQL parameters for worker node
+    if [ -z "${POSTGRES_HOST:-}" ] || [ "${POSTGRES_HOST}" = "localhost" ] || [ "${POSTGRES_HOST}" = "127.0.0.1" ]; then
+        POSTGRES_HOST="turnstone-postgres.lan"
+    fi
+    POSTGRES_USER="${POSTGRES_USER:-turnstone-np}"
+    POSTGRES_PORT="${POSTGRES_PORT:-5432}"
+    POSTGRES_DB="${POSTGRES_DB:-turnstone}"
+
+    # 2. SMB Storage Secret Discovery & Parsing
+    if [ -z "${SMB_PASSWORD:-}" ] || [ -z "${SMB_USER:-}" ] || [ -z "${SMB_PATH:-}" ]; then
+        local smb_candidates=(
+            "turnstone_np_smb.secret"
+            "turnstone_smb.secret"
+            "smb.secret"
+            "silo_14.secret"
+            "silo-14.secret"
+        )
+        local matched_smb=""
+        for sdir in "${search_dirs[@]}"; do
+            [ -d "$sdir" ] || continue
+            for cand in "${smb_candidates[@]}"; do
+                if [ -f "${sdir}/${cand}" ]; then
+                    matched_smb="${sdir}/${cand}"
+                    break 2
+                fi
+            done
+            for f in "${sdir}"/*smb*.secret "${sdir}"/*smb*.env; do
+                if [ -f "$f" ]; then
+                    matched_smb="$f"
+                    break 2
+                fi
+            done
+        done
+
+        if [ -n "${matched_smb}" ] && [ -f "${matched_smb}" ]; then
+            log_info "Auto-discovered SMB secret file: '${matched_smb}'"
+            local smb_line
+            smb_line=$(grep -v '^[[:space:]]*#' "${matched_smb}" | grep -v '^[[:space:]]*$' | tr -d '\r' | head -n 1 || true)
+            if [ -n "${smb_line}" ]; then
+                parse_smb_path "${smb_line}"
+            fi
         fi
     fi
+
+    SERVER_HOSTNAME="${SERVER_HOSTNAME:-silo-14.lan}"
+    SHARE_NAME="${SHARE_NAME:-ai-playground}"
+    SMB_USER="${SMB_USER:-turnstone-np}"
+    REMOTE_USERNAME="${SMB_USER}"
+    SMB_PATH="${SMB_PATH:-smb://${SERVER_HOSTNAME}/${SHARE_NAME}}"
+
+    # 3. JWT Secret Discovery & Parsing
+    if [ -z "${JWT_SECRET:-}" ]; then
+        local jwt_candidates=(
+            "jwt_secret.secret"
+            "turnstone_jwt.secret"
+            "jwt.secret"
+            "coordinator.secret"
+            "coordinator_turnstone.secret"
+        )
+        local matched_jwt=""
+        for sdir in "${search_dirs[@]}"; do
+            [ -d "$sdir" ] || continue
+            for cand in "${jwt_candidates[@]}"; do
+                if [ -f "${sdir}/${cand}" ]; then
+                    matched_jwt="${sdir}/${cand}"
+                    break 2
+                fi
+            done
+            for f in "${sdir}"/*jwt*.secret "${sdir}"/*jwt*.env; do
+                if [ -f "$f" ]; then
+                    matched_jwt="$f"
+                    break 2
+                fi
+            done
+        done
+
+        if [ -n "${matched_jwt}" ] && [ -f "${matched_jwt}" ]; then
+            log_info "Auto-discovered JWT secret file: '${matched_jwt}'"
+            JWT_SECRET=$(grep -v '^[[:space:]]*#' "${matched_jwt}" | grep -v '^[[:space:]]*$' | tr -d '\r' | head -n 1 || true)
+        fi
+    fi
+
+    # 4. Coordinator Host
+    COORDINATOR_IP="${COORDINATOR_IP:-turnstone-coordinator-nerd-projects.lan}"
 }
 
 echo -e "${BLUE}=================================================================${NC}"
 echo -e "${BLUE}   Turnstone Node 1 Deployment (M5 Max MacBook Pro - MLX Engine)  ${NC}"
 echo -e "${BLUE}=================================================================${NC}"
 
-# macOS User Session Check
-if [ "$EUID" -eq 0 ]; then
-    if [ -n "${SUDO_USER:-}" ]; then
-        log_warn "On macOS, MLX Server and LaunchAgents must run as the regular login user ('${SUDO_USER}'), not root."
-        log_info "Switching execution to user '${SUDO_USER}'..."
-        exec sudo -u "${SUDO_USER}" -i bash -c "cd '$(pwd)' && '$0' $*"
+# Determine target local system user
+if [ -z "${TURNSTONE_USER}" ]; then
+    if id "turnstone" &>/dev/null; then
+        TURNSTONE_USER="turnstone"
+    elif [ -n "${SUDO_USER:-}" ]; then
+        TURNSTONE_USER="${SUDO_USER}"
     else
-        log_warn "Running as root on macOS is discouraged for user LaunchAgents."
+        TURNSTONE_USER="$(whoami)"
     fi
 fi
 
-# Step 1: Prompt / Environment Credentials
-if [ -z "${SECRET_FILE}" ]; then
-    if [ -z "${POSTGRES_USER}" ]; then
-        read -rp "Enter PostgreSQL username [default: turnstone-np]: " INPUT_USER
-        POSTGRES_USER="${INPUT_USER:-turnstone-np}"
+# Step 0: Idempotent macOS System User Creation
+if ! id "${TURNSTONE_USER}" &>/dev/null; then
+    log_info "Creating dedicated local macOS user '${TURNSTONE_USER}'..."
+    NEXT_UID=$(dscl . -list /Users UniqueID 2>/dev/null | awk '$2 >= 501 && $2 < 1000 {print $2}' | sort -n | tail -1)
+    NEXT_UID=$(( ${NEXT_UID:-501} + 1 ))
+
+    if command -v sysadminctl &>/dev/null; then
+        sudo sysadminctl -addUser "${TURNSTONE_USER}" -UID "${NEXT_UID}" -home "/Users/${TURNSTONE_USER}" -shell /bin/zsh 2>/dev/null || \
+        (
+            sudo dscl . -create "/Users/${TURNSTONE_USER}" 2>/dev/null || true
+            sudo dscl . -create "/Users/${TURNSTONE_USER}" UserShell /bin/zsh 2>/dev/null || true
+            sudo dscl . -create "/Users/${TURNSTONE_USER}" RealName "Turnstone Node Service" 2>/dev/null || true
+            sudo dscl . -create "/Users/${TURNSTONE_USER}" UniqueID "${NEXT_UID}" 2>/dev/null || true
+            sudo dscl . -create "/Users/${TURNSTONE_USER}" PrimaryGroupID 20 2>/dev/null || true
+            sudo dscl . -create "/Users/${TURNSTONE_USER}" NFSHomeDirectory "/Users/${TURNSTONE_USER}" 2>/dev/null || true
+        )
     fi
+    sudo mkdir -p "/Users/${TURNSTONE_USER}" 2>/dev/null || true
+    sudo chown -R "${TURNSTONE_USER}:staff" "/Users/${TURNSTONE_USER}" 2>/dev/null || true
+    log_success "Created macOS user '${TURNSTONE_USER}' (UID: ${NEXT_UID})."
+fi
 
-    MATCHED_SECRET=$(find_secret_by_user "${POSTGRES_USER}")
-    if [ -n "${MATCHED_SECRET}" ]; then
-        log_info "Found matching secret file '${MATCHED_SECRET}' for PostgreSQL user '${POSTGRES_USER}'."
-        SECRET_FILE="${MATCHED_SECRET}"
+# Resolve target user's home directory
+if [ "${TURNSTONE_USER}" = "$(whoami)" ]; then
+    USER_HOME="${HOME}"
+else
+    USER_HOME="$(dscl . -read "/Users/${TURNSTONE_USER}" NFSHomeDirectory 2>/dev/null | awk '{print $2}')"
+    [ -z "${USER_HOME}" ] && USER_HOME="/Users/${TURNSTONE_USER}"
+fi
+
+sudo mkdir -p "${USER_HOME}" 2>/dev/null || mkdir -p "${USER_HOME}" 2>/dev/null || true
+sudo chown "${TURNSTONE_USER}" "${USER_HOME}" 2>/dev/null || true
+
+# Execution wrapper to run commands as the target user
+run_as_target_user() {
+    if [ "$(whoami)" = "${TURNSTONE_USER}" ]; then
+        bash -c "$1"
+    else
+        sudo -u "${TURNSTONE_USER}" -H bash -c "$1"
     fi
-fi
+}
 
-load_secrets
-
-if [ -z "${COORDINATOR_IP}" ]; then
-    read -rp "Enter Coordinator VM IP Address / Hostname [default: turnstone-coordinator-nerd-projects.lan]: " INPUT_COORD
-    COORDINATOR_IP="${INPUT_COORD:-turnstone-coordinator-nerd-projects.lan}"
-fi
-if [ -z "${POSTGRES_HOST}" ]; then
-    read -rp "Enter PostgreSQL DB Host IP / Hostname [default: turnstone-postgres.lan]: " INPUT_PGHOST
-    POSTGRES_HOST="${INPUT_PGHOST:-turnstone-postgres.lan}"
-fi
-POSTGRES_USER="${POSTGRES_USER:-turnstone-np}"
-POSTGRES_PORT="${POSTGRES_PORT:-5432}"
-POSTGRES_DB="${POSTGRES_DB:-turnstone}"
+# Step 1: Auto-Load Secrets or Prompt if Missing
+auto_load_all_secrets
 
 if [ -z "${POSTGRES_PASSWORD}" ]; then
     read -r -s -p "Enter PostgreSQL Password for user '${POSTGRES_USER}'@'${POSTGRES_HOST}': " POSTGRES_PASSWORD
@@ -302,130 +400,145 @@ if [ -z "${JWT_SECRET}" ]; then
     read -rp "Enter TURNSTONE_JWT_SECRET from Coordinator setup: " JWT_SECRET
 fi
 
-if [ -z "${SMB_PATH}" ]; then
-    read -rp "Enter remote SMB storage path + protocol [default: smb://silo-14.lan/ai-playground]: " INPUT_SMB_PATH
-    SMB_PATH="${INPUT_SMB_PATH:-smb://silo-14.lan/ai-playground}"
-fi
-
-parse_smb_path "${SMB_PATH}"
-SERVER_HOSTNAME="${SERVER_HOSTNAME:-silo-14.lan}"
-SHARE_NAME="${SHARE_NAME:-ai-playground}"
-
-if [ -z "${SMB_USER}" ]; then
-    read -rp "Enter SMB username to connect as [default: turnstone-np]: " INPUT_SMB_USER
-    SMB_USER="${INPUT_SMB_USER:-turnstone-np}"
-fi
-REMOTE_USERNAME="${SMB_USER}"
-
 if [ -z "${SMB_PASSWORD}" ]; then
     read -r -s -p "Enter SMB Password for '${REMOTE_USERNAME}'@'${SERVER_HOSTNAME}': " SMB_PASSWORD
     echo ""
 fi
 
 MOUNT_POINT="/mnt/${SERVER_HOSTNAME}/${REMOTE_USERNAME}/${SHARE_NAME}"
+log_success "Configured credentials for PostgreSQL (${POSTGRES_USER}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}) and SMB (${SMB_PATH})."
 
 NODE_ID="mbp-ai-core"
 LAN_IP=$(ifconfig | grep "inet " | grep -v 127.0.0.1 | awk '{print $2}' | head -n 1)
 
 # Step 2: Check Python & UV Installation
-log_info "Step 2: Checking Python 3 and UV package manager..."
-export PATH="$HOME/.local/bin:$PATH"
-if ! command -v uv &> /dev/null; then
-    log_info "Installing uv package manager..."
-    curl -LsSf https://astral.sh/uv/install.sh | sh
+log_info "Step 2: Checking Python 3 and UV package manager for '${TURNSTONE_USER}'..."
+run_as_target_user '
     export PATH="$HOME/.local/bin:$PATH"
-fi
-log_success "Package manager verified."
+    if ! command -v uv &>/dev/null; then
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+    fi
+'
+UV_BIN="${USER_HOME}/.local/bin/uv"
+[ -x "${UV_BIN}" ] || UV_BIN="$(command -v uv 2>/dev/null || echo "uv")"
+log_success "Package manager verified (${UV_BIN})."
 
 # Step 3: Set up MLX and Turnstone Virtual Environments
-if [ -z "${TURNSTONE_USER}" ]; then
-    if id "turnstone" &>/dev/null; then
-        TURNSTONE_USER="turnstone"
-    else
-        TURNSTONE_USER="$(whoami)"
-    fi
-fi
-
-if [ "${TURNSTONE_USER}" = "$(whoami)" ]; then
-    USER_HOME="${HOME}"
-else
-    USER_HOME="$(dscl . -read "/Users/${TURNSTONE_USER}" NFSHomeDirectory 2>/dev/null | awk '{print $2}' || eval echo "~${TURNSTONE_USER}")"
-fi
-
-mkdir -p "${USER_HOME}"
-
-VENV_DIR="$HOME/.local/share/turnstone-venv"
+VENV_DIR="${USER_HOME}/.local/share/turnstone-venv"
 log_info "Step 3: Creating virtual environment at ${VENV_DIR}..."
-mkdir -p "$HOME/.local/share"
+run_as_target_user "mkdir -p '${USER_HOME}/.local/share'"
 if [ ! -d "${VENV_DIR}" ]; then
-    uv venv "${VENV_DIR}" --python 3.12
+    run_as_target_user "'${UV_BIN}' venv '${VENV_DIR}' --python 3.12"
 fi
-log_info "Installing mlx-lm, turnstone, and psycopg packages into virtualenv..."
+
+log_info "Installing mlx-lm, turnstone, psycopg, and huggingface_hub packages into virtualenv..."
 if [ -f "${REPO_ROOT}/pyproject.toml" ]; then
-    uv pip install --python "${VENV_DIR}" mlx-lm "psycopg[binary]"
-    uv pip install --python "${VENV_DIR}" --reinstall "${REPO_ROOT}"
+    run_as_target_user "'${UV_BIN}' pip install --python '${VENV_DIR}' mlx-lm 'psycopg[binary]' 'huggingface_hub[cli]'"
+    run_as_target_user "'${UV_BIN}' pip install --python '${VENV_DIR}' --reinstall '${REPO_ROOT}'"
 else
-    uv pip install --python "${VENV_DIR}" mlx-lm turnstone "psycopg[binary]"
+    run_as_target_user "'${UV_BIN}' pip install --python '${VENV_DIR}' mlx-lm turnstone 'psycopg[binary]' 'huggingface_hub[cli]'"
 fi
 log_success "MLX and Turnstone installed successfully."
 
-# Step 3b: Install Local Homebrew & all-smi Hardware Monitor for Turnstone User
+# Step 3a: Create convenience CLI wrapper for mlx-lm / mlx_lm
+MLX_WRAPPER="${VENV_DIR}/bin/mlx-lm"
+run_as_target_user "cat > '${MLX_WRAPPER}' << 'EOF'
+#!/usr/bin/env bash
+SCRIPT_DIR=\"\$(cd \"\$(dirname \"\${BASH_SOURCE[0]}\")\" && pwd)\"
+PYTHON_BIN=\"\${SCRIPT_DIR}/python\"
+
+if [ \$# -eq 0 ]; then
+    echo \"Turnstone MLX-LM Command Interface\"
+    echo \"Usage:\"
+    echo \"  mlx-lm generate --model <model> --prompt <text>\"
+    echo \"  mlx-lm server --model <model> --port 8000\"
+    echo \"  mlx-lm chat --model <model>\"
+    echo \"  mlx-lm convert --hf-path <repo>\"
+    echo \"  mlx-lm lora --model <model> --data <data>\"
+    echo \"\"
+    exec \"\${PYTHON_BIN}\" -m mlx_lm.generate --help
+fi
+
+SUBCMD=\"\$1\"
+case \"\${SUBCMD}\" in
+    generate|server|convert|lora|fuse|manage|cache_prompt|chat)
+        shift
+        exec \"\${PYTHON_BIN}\" -m \"mlx_lm.\${SUBCMD}\" \"\$@\"
+        ;;
+    -h|--help)
+        echo \"Turnstone MLX-LM Command Interface\"
+        echo \"Usage: mlx-lm [generate|server|convert|lora|fuse|manage|chat] [options]\"
+        echo \"\"
+        exec \"\${PYTHON_BIN}\" -m mlx_lm.generate --help
+        ;;
+    *)
+        # Default to mlx_lm.generate if arguments are passed directly
+        exec \"\${PYTHON_BIN}\" -m mlx_lm.generate \"\$@\"
+        ;;
+esac
+EOF
+chmod +x '${MLX_WRAPPER}'
+ln -sfn '${MLX_WRAPPER}' '${VENV_DIR}/bin/mlx_lm' 2>/dev/null || true
+"
+
+# Create global symlinks in /usr/local/bin for all users
+sudo mkdir -p /usr/local/bin 2>/dev/null || true
+for tool_bin in mlx-lm mlx_lm mlx_lm.server mlx_lm.generate mlx_lm.convert mlx_lm.lora mlx_lm.fuse turnstone-server hf huggingface-cli; do
+    if [ -x "${VENV_DIR}/bin/${tool_bin}" ]; then
+        sudo ln -sfn "${VENV_DIR}/bin/${tool_bin}" "/usr/local/bin/${tool_bin}" 2>/dev/null || true
+    fi
+done
+if [ -x "${USER_HOME}/.local/bin/uv" ]; then
+    sudo ln -sfn "${USER_HOME}/.local/bin/uv" /usr/local/bin/uv 2>/dev/null || true
+fi
+
+# Step 3b: Install Local Homebrew, all-smi Hardware Monitor & Ollama for Turnstone User
 LOCAL_BREW_DIR="${USER_HOME}/.homebrew"
 log_info "Checking local Homebrew installation in ${LOCAL_BREW_DIR}..."
 if [ ! -x "${LOCAL_BREW_DIR}/bin/brew" ]; then
     log_info "Installing standalone Homebrew into ${LOCAL_BREW_DIR} for '${TURNSTONE_USER}'..."
-    rm -rf "${LOCAL_BREW_DIR}"
-    if [ "$(whoami)" = "${TURNSTONE_USER}" ]; then
-        git clone --depth=1 https://github.com/Homebrew/brew "${LOCAL_BREW_DIR}"
-    else
-        sudo -u "${TURNSTONE_USER}" git clone --depth=1 https://github.com/Homebrew/brew "${LOCAL_BREW_DIR}"
-    fi
+    run_as_target_user "rm -rf '${LOCAL_BREW_DIR}' && git clone --depth=1 https://github.com/Homebrew/brew '${LOCAL_BREW_DIR}'"
 fi
 
-if [ "$(whoami)" != "${TURNSTONE_USER}" ]; then
-    sudo chown -R "${TURNSTONE_USER}" "${LOCAL_BREW_DIR}" 2>/dev/null || true
-fi
-
-# Persist Homebrew environment across all future shell sessions
+# Persist Virtualenv, Local bin, and Homebrew environment across all future shell sessions
+ENV_EXPORT_CMD="export PATH=\"${VENV_DIR}/bin:${USER_HOME}/.local/bin:\$PATH\""
 BREW_ENV_CMD="eval \"\$(${LOCAL_BREW_DIR}/bin/brew shellenv)\""
 for rc_file in "${USER_HOME}/.zprofile" "${USER_HOME}/.zshrc" "${USER_HOME}/.bash_profile" "${USER_HOME}/.bashrc"; do
-    if [ ! -f "${rc_file}" ]; then
-        if [ "$(whoami)" = "${TURNSTONE_USER}" ]; then
-            touch "${rc_file}"
-        else
-            sudo -u "${TURNSTONE_USER}" touch "${rc_file}" 2>/dev/null || true
-        fi
+    run_as_target_user "touch '${rc_file}'"
+    if ! grep -qF "${VENV_DIR}/bin" "${rc_file}" 2>/dev/null; then
+        run_as_target_user "printf '\n# Turnstone virtualenv and user bins\n%s\n' '${ENV_EXPORT_CMD}' >> '${rc_file}'"
     fi
     if ! grep -qF "${LOCAL_BREW_DIR}/bin/brew shellenv" "${rc_file}" 2>/dev/null; then
-        if [ "$(whoami)" = "${TURNSTONE_USER}" ]; then
-            echo "" >> "${rc_file}"
-            echo "# Homebrew environment" >> "${rc_file}"
-            echo "${BREW_ENV_CMD}" >> "${rc_file}"
-        else
-            sudo -u "${TURNSTONE_USER}" bash -c "echo '' >> '${rc_file}'; echo '# Homebrew environment' >> '${rc_file}'; echo 'eval \"\$(${LOCAL_BREW_DIR}/bin/brew shellenv)\"' >> '${rc_file}'" 2>/dev/null || true
-        fi
+        run_as_target_user "printf '\n# Homebrew environment\n%s\n' '${BREW_ENV_CMD}' >> '${rc_file}'"
     fi
 done
 
-# Install all-smi via Homebrew
-log_info "Installing all-smi utility via Homebrew for user '${TURNSTONE_USER}'..."
-if [ "$(whoami)" = "${TURNSTONE_USER}" ]; then
-    eval "$(${LOCAL_BREW_DIR}/bin/brew shellenv)"
+# Install all-smi and Ollama via Homebrew
+log_info "Installing all-smi utility and Ollama engine via Homebrew for user '${TURNSTONE_USER}'..."
+run_as_target_user "
+    export NONINTERACTIVE=1
+    export CI=1
+    export HOMEBREW_NO_AUTO_UPDATE=1
+    export HOMEBREW_NO_ENV_HINTS=1
+    export HOMEBREW_NO_INSTALL_CLEANUP=1
+    eval \"\$(${LOCAL_BREW_DIR}/bin/brew shellenv)\"
     brew tap lablup/tap --quiet 2>/dev/null || true
-    brew install lablup/tap/all-smi || brew install all-smi
-else
-    sudo -u "${TURNSTONE_USER}" -H bash -c "
-        eval \"\$(${LOCAL_BREW_DIR}/bin/brew shellenv)\"
-        brew tap lablup/tap --quiet 2>/dev/null || true
-        brew install lablup/tap/all-smi || brew install all-smi
-    "
-fi
+    brew install --quiet lablup/tap/all-smi 2>/dev/null || brew install --quiet all-smi 2>/dev/null || true
+    brew install --quiet ollama 2>/dev/null || true
+"
 
 ALL_SMI_BIN="${LOCAL_BREW_DIR}/bin/all-smi"
 if [ -x "${ALL_SMI_BIN}" ]; then
     sudo mkdir -p /usr/local/bin 2>/dev/null || true
     sudo ln -sfn "${ALL_SMI_BIN}" /usr/local/bin/all-smi 2>/dev/null || true
     log_success "all-smi utility successfully installed at ${ALL_SMI_BIN} (symlinked to /usr/local/bin/all-smi)."
+fi
+
+OLLAMA_BIN="${LOCAL_BREW_DIR}/bin/ollama"
+if [ -x "${OLLAMA_BIN}" ]; then
+    sudo mkdir -p /usr/local/bin 2>/dev/null || true
+    sudo ln -sfn "${OLLAMA_BIN}" /usr/local/bin/ollama 2>/dev/null || true
+    log_success "Ollama engine successfully installed at ${OLLAMA_BIN} (symlinked to /usr/local/bin/ollama)."
 fi
 
 # Configure Passwordless Sudo for all-smi
@@ -456,12 +569,13 @@ fi
 rm -f "${TMP_SUDOERS}"
 
 # Step 4: Configure ~/.config/turnstone/config.toml
-CONFIG_DIR="$HOME/.config/turnstone"
+CONFIG_DIR="${USER_HOME}/.config/turnstone"
 CONFIG_FILE="${CONFIG_DIR}/config.toml"
 log_info "Step 4: Configuring secrets at ${CONFIG_FILE}..."
 
-mkdir -p "${CONFIG_DIR}"
-cat > "${CONFIG_FILE}" <<EOF
+run_as_target_user "mkdir -p '${CONFIG_DIR}'"
+TMP_CONFIG="$(mktemp -t turnstone-config-XXXXXX 2>/dev/null || mktemp /tmp/turnstone-config-XXXXXX)"
+cat > "${TMP_CONFIG}" <<EOF
 [auth]
 jwt_secret = "${JWT_SECRET}"
 
@@ -474,12 +588,69 @@ base_url = "http://127.0.0.1:8000/v1"
 api_key = "dummy"
 EOF
 
-chmod 600 "${CONFIG_FILE}"
+sudo cp "${TMP_CONFIG}" "${CONFIG_FILE}" 2>/dev/null || cp "${TMP_CONFIG}" "${CONFIG_FILE}"
+sudo chown "${TURNSTONE_USER}" "${CONFIG_FILE}" 2>/dev/null || true
+sudo chmod 600 "${CONFIG_FILE}" 2>/dev/null || chmod 600 "${CONFIG_FILE}"
+rm -f "${TMP_CONFIG}"
 log_success "Configuration written and secured (0600)."
 
-# Ensure LaunchAgents and Logs directories exist
-mkdir -p "$HOME/Library/LaunchAgents"
-mkdir -p "$HOME/Library/Logs"
+# Ensure LaunchDaemons and Logs directories exist
+SYSTEM_DAEMONS_DIR="/Library/LaunchDaemons"
+LAUNCH_LOGS_DIR="${USER_HOME}/Library/Logs"
+sudo mkdir -p "${SYSTEM_DAEMONS_DIR}" "${LAUNCH_LOGS_DIR}"
+sudo chown -R "${TURNSTONE_USER}:staff" "${LAUNCH_LOGS_DIR}" 2>/dev/null || true
+
+# Helper function to idempotently manage system launchd daemons
+manage_launch_daemon() {
+    local plist_path="$1"
+    local label="$2"
+    local port="${3:-}"
+    local target_uid
+    target_uid=$(id -u "${TURNSTONE_USER}" 2>/dev/null || echo "501")
+
+    # Clean up any legacy LaunchAgents in user/gui domain
+    sudo -u "${TURNSTONE_USER}" launchctl bootout "gui/${target_uid}/${label}" 2>/dev/null || true
+    sudo -u "${TURNSTONE_USER}" launchctl bootout "user/${target_uid}/${label}" 2>/dev/null || true
+    rm -f "${USER_HOME}/Library/LaunchAgents/${label}.plist" 2>/dev/null || true
+
+    sudo chown root:wheel "${plist_path}" 2>/dev/null || true
+    sudo chmod 644 "${plist_path}" 2>/dev/null || true
+
+    # Gracefully boot out existing daemon if active and wait for completion
+    if sudo launchctl print "system/${label}" &>/dev/null; then
+        sudo launchctl bootout "system/${label}" 2>/dev/null || sudo launchctl unload "${plist_path}" 2>/dev/null || true
+        for _ in {1..10}; do
+            if ! sudo launchctl print "system/${label}" &>/dev/null; then
+                break
+            fi
+            sleep 0.5
+        done
+    fi
+
+    # If a specific port was given and is still held, terminate lingering process
+    if [ -n "${port}" ]; then
+        local lingering_pids
+        lingering_pids=$(lsof -ti:"${port}" 2>/dev/null || true)
+        if [ -n "${lingering_pids}" ]; then
+            log_info "Releasing port ${port} held by lingering process(es): ${lingering_pids}..."
+            echo "${lingering_pids}" | xargs kill -9 2>/dev/null || true
+            sleep 1
+        fi
+    fi
+
+    # Ensure log files exist and are writable by daemon user
+    sudo touch "${LAUNCH_LOGS_DIR}/${label#com.turnstone.}.log" "${LAUNCH_LOGS_DIR}/${label#com.turnstone.}.err" 2>/dev/null || true
+    sudo chown -R "${TURNSTONE_USER}:staff" "${LAUNCH_LOGS_DIR}" 2>/dev/null || true
+    sudo chmod 664 "${LAUNCH_LOGS_DIR}"/* 2>/dev/null || true
+
+    # Bootstrap the fresh plist into system domain
+    if ! sudo launchctl bootstrap "system" "${plist_path}" 2>/dev/null; then
+        sudo launchctl load -w "${plist_path}" 2>/dev/null || true
+    fi
+
+    # Kickstart daemon to ensure it is actively running
+    sudo launchctl kickstart -k "system/${label}" 2>/dev/null || true
+}
 
 # Step 5: Configure & Mount Remote SMB Storage at Startup
 log_info "Step 5: Configuring remote SMB mount at ${MOUNT_POINT}..."
@@ -497,19 +668,21 @@ if [ ! -d "/mnt" ]; then
 fi
 
 sudo mkdir -p "${MOUNT_POINT}" 2>/dev/null || mkdir -p "${MOUNT_POINT}" 2>/dev/null || true
-sudo chown -R "$(whoami)" "${MOUNT_POINT}" 2>/dev/null || true
+sudo chown -R "${TURNSTONE_USER}" "${MOUNT_POINT}" 2>/dev/null || true
 sudo chmod 775 "${MOUNT_POINT}" 2>/dev/null || true
 
-cat > "${CONFIG_DIR}/mount_smb.sh" <<EOF
+MOUNT_SCRIPT="${CONFIG_DIR}/mount_smb.sh"
+cat > "${MOUNT_SCRIPT}" <<EOF
 #!/usr/bin/env bash
 mkdir -p "${MOUNT_POINT}" 2>/dev/null || true
 if ! mount | grep -Fq "on ${MOUNT_POINT} "; then
     mount_smbfs "//${REMOTE_USERNAME}:${SMB_PASSWORD}@${SERVER_HOSTNAME}/${SHARE_NAME}" "${MOUNT_POINT}" 2>/dev/null || true
 fi
 EOF
-chmod 700 "${CONFIG_DIR}/mount_smb.sh"
+sudo chown "${TURNSTONE_USER}" "${MOUNT_SCRIPT}" 2>/dev/null || true
+chmod 700 "${MOUNT_SCRIPT}"
 
-SMB_MOUNT_PLIST="$HOME/Library/LaunchAgents/com.turnstone.smb-mount.plist"
+SMB_MOUNT_PLIST="${SYSTEM_DAEMONS_DIR}/com.turnstone.smb-mount.plist"
 cat > "${SMB_MOUNT_PLIST}" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -517,6 +690,12 @@ cat > "${SMB_MOUNT_PLIST}" <<EOF
 <dict>
     <key>Label</key>
     <string>com.turnstone.smb-mount</string>
+    <key>UserName</key>
+    <string>${TURNSTONE_USER}</string>
+    <key>GroupName</key>
+    <string>staff</string>
+    <key>WorkingDirectory</key>
+    <string>${USER_HOME}</string>
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
@@ -532,21 +711,20 @@ cat > "${SMB_MOUNT_PLIST}" <<EOF
         <true/>
     </dict>
     <key>StandardOutPath</key>
-    <string>${HOME}/Library/Logs/smb-mount.log</string>
+    <string>${LAUNCH_LOGS_DIR}/smb-mount.log</string>
     <key>StandardErrorPath</key>
-    <string>${HOME}/Library/Logs/smb-mount.err</string>
+    <string>${LAUNCH_LOGS_DIR}/smb-mount.err</string>
 </dict>
 </plist>
 EOF
 
-launchctl bootout "gui/$(id -u)/com.turnstone.smb-mount" 2>/dev/null || launchctl unload "${SMB_MOUNT_PLIST}" 2>/dev/null || true
-launchctl bootstrap "gui/$(id -u)" "${SMB_MOUNT_PLIST}" 2>/dev/null || launchctl load "${SMB_MOUNT_PLIST}" 2>/dev/null || true
-bash "${CONFIG_DIR}/mount_smb.sh" 2>/dev/null || true
+manage_launch_daemon "${SMB_MOUNT_PLIST}" "com.turnstone.smb-mount"
+run_as_target_user "bash '${MOUNT_SCRIPT}' 2>/dev/null || true"
 log_success "SMB storage configured for startup mount at ${MOUNT_POINT}."
 
-# Step 6: Setup MLX Launchd Service (mlx-lm.server)
-MLX_PLIST="$HOME/Library/LaunchAgents/com.turnstone.mlx-server.plist"
-log_info "Step 6: Configuring MLX Server launchd service..."
+# Step 6: Setup MLX Launchd Daemon (mlx-lm.server - Pinned to Qwen3-Coder-Next-6bit)
+MLX_PLIST="${SYSTEM_DAEMONS_DIR}/com.turnstone.mlx-server.plist"
+log_info "Step 6: Configuring MLX Server system daemon (pinned: mlx-community/Qwen3-Coder-Next-6bit)..."
 
 cat > "${MLX_PLIST}" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -555,37 +733,137 @@ cat > "${MLX_PLIST}" <<EOF
 <dict>
     <key>Label</key>
     <string>com.turnstone.mlx-server</string>
+    <key>UserName</key>
+    <string>${TURNSTONE_USER}</string>
+    <key>GroupName</key>
+    <string>staff</string>
+    <key>WorkingDirectory</key>
+    <string>${USER_HOME}</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>${USER_HOME}</string>
+        <key>PATH</key>
+        <string>${VENV_DIR}/bin:${USER_HOME}/.local/bin:${LOCAL_BREW_DIR}/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
     <key>ProgramArguments</key>
     <array>
         <string>${VENV_DIR}/bin/python</string>
         <string>-m</string>
         <string>mlx_lm.server</string>
         <string>--model</string>
-        <string>mlx-community/Qwen2.5-Coder-32B-Instruct-4bit</string>
+        <string>mlx-community/Qwen3-Coder-Next-6bit</string>
+        <string>--host</string>
+        <string>0.0.0.0</string>
         <string>--port</string>
         <string>8000</string>
-        <string>--max-kv-size</string>
-        <string>384000</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>${HOME}/Library/Logs/mlx-server.log</string>
+    <string>${LAUNCH_LOGS_DIR}/mlx-server.log</string>
     <key>StandardErrorPath</key>
-    <string>${HOME}/Library/Logs/mlx-server.err</string>
+    <string>${LAUNCH_LOGS_DIR}/mlx-server.err</string>
 </dict>
 </plist>
 EOF
 
-launchctl bootout "gui/$(id -u)/com.turnstone.mlx-server" 2>/dev/null || launchctl unload "${MLX_PLIST}" 2>/dev/null || true
-launchctl bootstrap "gui/$(id -u)" "${MLX_PLIST}" 2>/dev/null || launchctl load "${MLX_PLIST}"
-log_success "MLX Server service loaded."
+manage_launch_daemon "${MLX_PLIST}" "com.turnstone.mlx-server" 8000
+log_success "MLX Server system daemon loaded."
 
-# Step 7: Setup Turnstone Server Launchd Service
-SERVER_PLIST="$HOME/Library/LaunchAgents/com.turnstone.server.plist"
-log_info "Step 7: Configuring turnstone-server launchd service..."
+# Step 6b: Setup Ollama Launchd Daemon (Multi-Model Swapping Engine on Port 11434)
+OLLAMA_PLIST="${SYSTEM_DAEMONS_DIR}/com.turnstone.ollama.plist"
+log_info "Step 6b: Configuring Ollama system daemon on port 11434..."
+
+cat > "${OLLAMA_PLIST}" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.turnstone.ollama</string>
+    <key>UserName</key>
+    <string>${TURNSTONE_USER}</string>
+    <key>GroupName</key>
+    <string>staff</string>
+    <key>WorkingDirectory</key>
+    <string>${USER_HOME}</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>${USER_HOME}</string>
+        <key>PATH</key>
+        <string>${VENV_DIR}/bin:${USER_HOME}/.local/bin:${LOCAL_BREW_DIR}/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>OLLAMA_HOST</key>
+        <string>0.0.0.0:11434</string>
+        <key>OLLAMA_ORIGINS</key>
+        <string>*</string>
+        <key>OLLAMA_MODELS</key>
+        <string>${USER_HOME}/.ollama/models</string>
+        <key>OLLAMA_KEEP_ALIVE</key>
+        <string>1h</string>
+        <key>OLLAMA_NUM_PARALLEL</key>
+        <string>1</string>
+    </dict>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${LOCAL_BREW_DIR}/bin/ollama</string>
+        <string>serve</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>${LAUNCH_LOGS_DIR}/ollama.log</string>
+    <key>StandardErrorPath</key>
+    <string>${LAUNCH_LOGS_DIR}/ollama.err</string>
+</dict>
+</plist>
+EOF
+
+manage_launch_daemon "${OLLAMA_PLIST}" "com.turnstone.ollama" 11434
+log_success "Ollama system daemon loaded."
+
+# Step 6c: Download and Associate Models with Servers
+log_info "Step 6c: Verifying & downloading models for MLX and Ollama..."
+
+# 1. MLX Model: mlx-community/Qwen3-Coder-Next-6bit
+log_info "Checking / downloading MLX model 'mlx-community/Qwen3-Coder-Next-6bit' via Hugging Face..."
+run_as_target_user "
+    export PATH=\"${VENV_DIR}/bin:${USER_HOME}/.local/bin:\$PATH\"
+    if command -v huggingface-cli &>/dev/null; then
+        huggingface-cli download mlx-community/Qwen3-Coder-Next-6bit --local-dir-use-symlinks False 2>/dev/null || true
+    fi
+"
+log_success "MLX model verified (mlx-community/Qwen3-Coder-Next-6bit)."
+
+# 2. Ollama Models: Qwen3.8 27B & Gemma 4 31B
+log_info "Waiting for Ollama daemon to initialize..."
+for i in {1..20}; do
+    if curl -s http://127.0.0.1:11434/api/tags &>/dev/null; then
+        break
+    fi
+    sleep 1
+done
+
+log_info "Pulling Ollama models (Qwen 3.8 27B and Gemma 4 31B)..."
+run_as_target_user "
+    eval \"\$(${LOCAL_BREW_DIR}/bin/brew shellenv)\"
+    export OLLAMA_HOST=127.0.0.1:11434
+    echo 'Pulling Qwen 3.8 27B model into Ollama...'
+    ollama pull qwen3.8:27b-8bit 2>/dev/null || ollama pull qwen3.8:27b 2>/dev/null || ollama pull qwen3.8:latest 2>/dev/null || ollama pull qwen2.5:32b 2>/dev/null || true
+
+    echo 'Pulling Gemma 4 31B model into Ollama...'
+    ollama pull gemma4:31b-8bit 2>/dev/null || ollama pull gemma4:31b 2>/dev/null || ollama pull gemma4:latest 2>/dev/null || ollama pull gemma:31b 2>/dev/null || true
+"
+log_success "Ollama models pulled successfully."
+
+# Step 7: Setup Turnstone Server Launchd Daemon
+SERVER_PLIST="${SYSTEM_DAEMONS_DIR}/com.turnstone.server.plist"
+log_info "Step 7: Configuring turnstone-server system daemon..."
 
 cat > "${SERVER_PLIST}" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -594,10 +872,18 @@ cat > "${SERVER_PLIST}" <<EOF
 <dict>
     <key>Label</key>
     <string>com.turnstone.server</string>
+    <key>UserName</key>
+    <string>${TURNSTONE_USER}</string>
+    <key>GroupName</key>
+    <string>staff</string>
     <key>WorkingDirectory</key>
-    <string>${MOUNT_POINT}</string>
+    <string>${USER_HOME}</string>
     <key>EnvironmentVariables</key>
     <dict>
+        <key>HOME</key>
+        <string>${USER_HOME}</string>
+        <key>PATH</key>
+        <string>${VENV_DIR}/bin:${USER_HOME}/.local/bin:${LOCAL_BREW_DIR}/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>TURNSTONE_NODE_ID</key>
         <string>${NODE_ID}</string>
         <key>TURNSTONE_ADVERTISE_URL</key>
@@ -634,25 +920,98 @@ cat > "${SERVER_PLIST}" <<EOF
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>${HOME}/Library/Logs/turnstone-server.log</string>
+    <string>${LAUNCH_LOGS_DIR}/turnstone-server.log</string>
     <key>StandardErrorPath</key>
-    <string>${HOME}/Library/Logs/turnstone-server.err</string>
+    <string>${LAUNCH_LOGS_DIR}/turnstone-server.err</string>
 </dict>
 </plist>
 EOF
 
-launchctl bootout "gui/$(id -u)/com.turnstone.server" 2>/dev/null || launchctl unload "${SERVER_PLIST}" 2>/dev/null || true
-launchctl bootstrap "gui/$(id -u)" "${SERVER_PLIST}" 2>/dev/null || launchctl load "${SERVER_PLIST}"
-log_success "Turnstone Server service loaded and connected to PostgreSQL."
+manage_launch_daemon "${SERVER_PLIST}" "com.turnstone.server" 8080
+log_success "Turnstone Server system daemon loaded and connected to PostgreSQL."
+
+# Step 8: Post-Deployment Health Verification
+log_info "Step 8: Performing post-deployment health verification..."
+
+DEPLOY_HAS_ERROR=false
+
+# 1. Check MLX Server (Port 8000)
+log_info "Testing MLX Server health at http://127.0.0.1:8000/v1/models (waiting up to 60s for weight allocation)..."
+MLX_READY=false
+for attempt in {1..60}; do
+    if curl -s -f http://127.0.0.1:8000/v1/models &>/dev/null; then
+        MLX_READY=true
+        break
+    fi
+    sleep 1
+done
+
+if [ "${MLX_READY}" = true ]; then
+    MLX_MODELS=$(curl -s http://127.0.0.1:8000/v1/models || true)
+    log_success "MLX Server is healthy: ${MLX_MODELS}"
+else
+    log_error "MLX Server failed to respond on http://127.0.0.1:8000/v1/models!"
+    log_warn "Recent MLX stdout log (${LAUNCH_LOGS_DIR}/mlx-server.log):"
+    tail -n 25 "${LAUNCH_LOGS_DIR}/mlx-server.log" 2>/dev/null || true
+    log_warn "Recent MLX stderr log (${LAUNCH_LOGS_DIR}/mlx-server.err):"
+    tail -n 25 "${LAUNCH_LOGS_DIR}/mlx-server.err" 2>/dev/null || true
+    DEPLOY_HAS_ERROR=true
+fi
+
+# 2. Check Ollama Server (Port 11434)
+log_info "Testing Ollama Server health at http://127.0.0.1:11434/api/tags..."
+OLLAMA_READY=false
+for attempt in {1..30}; do
+    if curl -s -f http://127.0.0.1:11434/api/tags &>/dev/null; then
+        OLLAMA_READY=true
+        break
+    fi
+    sleep 1
+done
+
+if [ "${OLLAMA_READY}" = true ]; then
+    OLLAMA_TAGS=$(curl -s http://127.0.0.1:11434/api/tags || true)
+    log_success "Ollama Server is healthy: ${OLLAMA_TAGS}"
+else
+    log_error "Ollama Server failed to respond on http://127.0.0.1:11434/api/tags!"
+    log_warn "Recent Ollama stderr log (${LAUNCH_LOGS_DIR}/ollama.err):"
+    tail -n 25 "${LAUNCH_LOGS_DIR}/ollama.err" 2>/dev/null || true
+    DEPLOY_HAS_ERROR=true
+fi
+
+# 3. Check Turnstone Server (Port 8080)
+log_info "Testing Turnstone Server health at http://${LAN_IP}:8080..."
+TURNSTONE_READY=false
+for attempt in {1..30}; do
+    if curl -s "http://127.0.0.1:8080" &>/dev/null || curl -s "http://${LAN_IP}:8080" &>/dev/null; then
+        TURNSTONE_READY=true
+        break
+    fi
+    sleep 1
+done
+
+if [ "${TURNSTONE_READY}" = true ]; then
+    log_success "Turnstone Server is healthy and listening on http://${LAN_IP}:8080."
+else
+    log_warn "Turnstone Server not yet responding on port 8080."
+    log_warn "Recent Turnstone stderr log (${LAUNCH_LOGS_DIR}/turnstone-server.err):"
+    tail -n 25 "${LAUNCH_LOGS_DIR}/turnstone-server.err" 2>/dev/null || true
+fi
 
 echo -e "${GREEN}=================================================================${NC}"
 echo -e "${GREEN}  Node 1 (M5 Max MacBook Pro) Deployed Successfully!            ${NC}"
 echo -e "${GREEN}=================================================================${NC}"
+echo -e "System User: ${TURNSTONE_USER} (${USER_HOME})"
 echo -e "Node ID: ${NODE_ID}"
 echo -e "Advertise URL: http://${LAN_IP}:8080"
 echo -e "PostgreSQL Backend: ${POSTGRES_USER}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}"
-echo -e "MLX Server API: http://127.0.0.1:8000/v1 (384k Context Window)"
+echo -e "MLX Server API (Pinned): http://127.0.0.1:8000/v1 (mlx-community/Qwen3-Coder-Next-6bit)"
+echo -e "Ollama Server API (Dynamic): http://127.0.0.1:11434/v1 (Qwen3.8 27B, Gemma 4 31B)"
 echo -e "SMB Storage Mount: ${MOUNT_POINT} (${SMB_PATH})"
 echo -e "Homebrew Prefix: ${LOCAL_BREW_DIR}"
 echo -e "all-smi Utility: ${ALL_SMI_BIN} (sudo NOPASSWD enabled)"
 
+if [ "${DEPLOY_HAS_ERROR}" = true ]; then
+    log_error "One or more inference services failed health checks. Please review the logs above."
+    exit 1
+fi
