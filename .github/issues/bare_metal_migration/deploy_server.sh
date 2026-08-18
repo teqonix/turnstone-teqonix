@@ -8,6 +8,9 @@
 
 set -euo pipefail
 
+# Ensure standard system binary paths are present in PATH (for usermod, groupadd, adduser, etc.)
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
+
 # Color Codes for Output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -51,7 +54,7 @@ POSTGRES_DB="${POSTGRES_DB:-}"
 EMBED_POSTGRES="${EMBED_POSTGRES:-false}"
 DISABLE_STACK="${DISABLE_STACK:-false}"
 PURGE_STACK="${PURGE_STACK:-false}"
-TURNSTONE_USER_DEBIAN="${TURNSTONE_USER_DEBIAN:-turnstone}"
+TURNSTONE_USER_DEBIAN="${TURNSTONE_USER_DEBIAN:-${TURNSTONE_DEBIAN_USER:-turnstone}}"
 SMB_PATH="${SMB_PATH:-}"
 SMB_USER="${SMB_USER:-}"
 SMB_PASSWORD="${SMB_PASSWORD:-}"
@@ -372,6 +375,32 @@ else
     fi
     systemctl enable --now docker 2>/dev/null || true
     export DOCKER_HOST="${DOCKER_HOST:-unix:///var/run/docker.sock}"
+fi
+
+# Ensure Turnstone user is added to the docker group for container management
+if [ -n "${TURNSTONE_USER_DEBIAN}" ] && id -u "${TURNSTONE_USER_DEBIAN}" &>/dev/null; then
+    if ! getent group docker &>/dev/null; then
+        if command -v groupadd &>/dev/null; then
+            groupadd docker 2>/dev/null || true
+        elif command -v addgroup &>/dev/null; then
+            addgroup docker 2>/dev/null || true
+        fi
+    fi
+
+    if id -nG "${TURNSTONE_USER_DEBIAN}" 2>/dev/null | grep -qw "docker"; then
+        log_info "User '${TURNSTONE_USER_DEBIAN}' is already in the 'docker' group."
+    else
+        if command -v usermod &>/dev/null; then
+            usermod -aG docker "${TURNSTONE_USER_DEBIAN}"
+        elif command -v adduser &>/dev/null; then
+            adduser "${TURNSTONE_USER_DEBIAN}" docker
+        elif command -v gpasswd &>/dev/null; then
+            gpasswd -a "${TURNSTONE_USER_DEBIAN}" docker
+        else
+            log_warn "Neither 'usermod', 'adduser', nor 'gpasswd' was found to add '${TURNSTONE_USER_DEBIAN}' to 'docker' group."
+        fi
+        log_success "Added user '${TURNSTONE_USER_DEBIAN}' to the 'docker' group."
+    fi
 fi
 
 if ! docker compose version &> /dev/null && ! command -v podman-compose &> /dev/null; then

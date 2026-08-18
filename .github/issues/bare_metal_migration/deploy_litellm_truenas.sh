@@ -46,7 +46,10 @@ NUM_WORKERS="${NUM_WORKERS:-4}"
 # Node Endpoints (Defaults match Turnstone cluster hostnames & ports)
 NODE_RYZEN_ONE="${NODE_RYZEN_ONE:-http://amd-ai-core-one.lan:13305/v1}"
 NODE_RYZEN_TWO="${NODE_RYZEN_TWO:-http://amd-ai-core-two.lan:13305/v1}"
-NODE_MBP="${NODE_MBP:-http://mbp-ai-core.lan:11434/v1}"
+NODE_MBP_MLX="${NODE_MBP_MLX:-http://mbp-ai-core.lan:8000/v1}"
+NODE_MBP_OLLAMA="${NODE_MBP_OLLAMA:-${NODE_MBP:-http://mbp-ai-core.lan:11434/v1}}"
+NODE_MBP="${NODE_MBP:-${NODE_MBP_OLLAMA}}"
+MBP_COOLDOWN_SECONDS="${MBP_COOLDOWN_SECONDS:-60}"
 
 MASTER_KEY="${LITELLM_MASTER_KEY:-${MASTER_KEY:-}}"
 ROUTING_STRATEGY="${ROUTING_STRATEGY:-least-busy}"
@@ -62,9 +65,12 @@ Options:
   -p, --port <port>              Port for LiteLLM Proxy to listen on (default: 4000)
   -k, --master-key <key>         LiteLLM Master API Key (auto-generated if empty)
   -w, --workers <num>            Number of Uvicorn workers (default: 4)
-  --node-ryzen-1 <url>           URL for Ryzen AI Halo Node 1 (default: http://amd-ai-core-one.lan:8000/v1)
-  --node-ryzen-2 <url>           URL for Ryzen AI Halo Node 2 (default: http://amd-ai-core-two.lan:8000/v1)
-  --node-mbp <url>               URL for MacBook Pro M5 Node (default: http://mbp-ai-core.lan:11434/v1)
+  --node-ryzen-1 <url>           URL for Ryzen AI Halo Node 1 (default: http://amd-ai-core-one.lan:13305/v1)
+  --node-ryzen-2 <url>           URL for Ryzen AI Halo Node 2 (default: http://amd-ai-core-two.lan:13305/v1)
+  --node-mbp-mlx <url>           URL for MacBook Pro MLX Server (default: http://mbp-ai-core.lan:8000/v1)
+  --node-mbp-ollama <url>        URL for MacBook Pro Ollama Server (default: http://mbp-ai-core.lan:11434/v1)
+  --node-mbp <url>               Alias for MacBook Pro Ollama Server (default: http://mbp-ai-core.lan:11434/v1)
+  --mbp-cooldown <seconds>       Cooldown window for qwen3-coder-next priority (default: 60)
   --strategy <strategy>          Routing strategy: least-busy, latency-based-routing (default: least-busy)
   --restart                      Force restart the service
   -h, --help                     Display this help message
@@ -125,8 +131,10 @@ show_status_summary() {
     echo -e "${BOLD}Service Status:${NC}          ${service_status}"
     echo -e "${BOLD}Single OpenAI Endpoint:${NC}  http://${host_ip}:${LITELLM_PORT}/v1"
     echo -e "${BOLD}Master API Key:${NC}          ${current_key}"
-    echo -e "${BOLD}Routing Strategy:${NC}        ${configured_strategy} (Dynamic Load Balancing)"
+    echo -e "${BOLD}Routing Strategy:${NC}        ${configured_strategy} (MBP Activity Priority + Least-Busy)"
+    echo -e "${BOLD}MBP Cooldown Lock:${NC}       ${MBP_COOLDOWN_SECONDS}s (qwen3-coder-next warm cache reservation)"
     echo -e "${BOLD}Config File:${NC}             ${LITELLM_CONFIG}"
+    echo -e "${BOLD}Router Module:${NC}           ${LITELLM_DIR}/turnstone_router.py"
     echo -e "${BOLD}Virtualenv:${NC}              ${VENV_DIR}"
     echo ""
     echo -e "${CYAN}Container SSH & Troubleshooting Access:${NC}"
@@ -137,14 +145,16 @@ show_status_summary() {
     echo -e "${CYAN}Load-Balanced Physical Nodes:${NC}"
     echo -e "  - Node 1: ${NODE_RYZEN_ONE} (AMD Ryzen Strix Halo 128GB - Lemonade)"
     echo -e "  - Node 2: ${NODE_RYZEN_TWO} (AMD Ryzen Strix Halo 128GB - Lemonade)"
-    echo -e "  - Node 3: ${NODE_MBP} (MacBook Pro M5 128GB - Ollama / MLX)"
+    echo -e "  - Node 3 (MLX):    ${NODE_MBP_MLX} (MacBook Pro M5 128GB - MLX Pinned Server)"
+    echo -e "  - Node 3 (Ollama): ${NODE_MBP_OLLAMA} (MacBook Pro M5 128GB - Ollama Dynamic Engine)"
     echo ""
     echo -e "${CYAN}Unified OpenAI Models Available:${NC}"
-    echo -e "  - ${BOLD}gemma-4-31b${NC}       -> Balanced across Node 1, Node 2, Node 3 (1 slot each)"
-    echo -e "  - ${BOLD}qwen-3.8-27b${NC}      -> Balanced across Node 1 & Node 2"
-    echo -e "  - ${BOLD}qwen3-coder-next${NC}  -> Routed to MBP M5 (Deep 128k Context Code Ingestion)"
-    echo -e "  - ${BOLD}nemotron-3-nano${NC}   -> Node 2 primary (MoE 3 parallel slots for fast evaluation)"
+    echo -e "  - ${BOLD}qwen3-coder-next${NC}  -> Pinned to MBP MLX (${NODE_MBP_MLX}) w/ ${MBP_COOLDOWN_SECONDS}s priority lock"
+    echo -e "  - ${BOLD}gemma-4-31b${NC}       -> Balanced across Node 1, Node 2, & Node 3 Ollama"
+    echo -e "  - ${BOLD}qwen-3.8-27b${NC}      -> Balanced across Node 1, Node 2, & Node 3 Ollama"
+    echo -e "  - ${BOLD}nemotron-3-nano${NC}   -> Node 2 primary (MoE 3 parallel slots) + Node 1"
     echo -e "  - ${BOLD}ornith-latest${NC}     -> Node 1 & Node 2 agentic fast tasks"
+    echo -e "  - ${BOLD}default${NC}           -> Fallback balanced across all nodes"
     echo ""
     echo -e "${CYAN}Health Check & Verification Commands:${NC}"
     echo "  curl -X GET 'http://${host_ip}:${LITELLM_PORT}/health/readiness' -H 'Authorization: Bearer ${current_key}'"
@@ -153,7 +163,7 @@ show_status_summary() {
     echo "  curl -X POST 'http://${host_ip}:${LITELLM_PORT}/v1/chat/completions' \\"
     echo "    -H 'Content-Type: application/json' \\"
     echo "    -H 'Authorization: Bearer ${current_key}' \\"
-    echo "    -d '{\"model\": \"gemma-4-31b\", \"messages\": [{\"role\": \"user\", \"content\": \"Hello Turnstone cluster!\"}]}'"
+    echo "    -d '{\"model\": \"qwen3-coder-next\", \"messages\": [{\"role\": \"user\", \"content\": \"def quicksort(arr):\"}]}'"
     echo "================================================================="
 }
 
@@ -183,8 +193,22 @@ while [[ $# -gt 0 ]]; do
             NODE_RYZEN_TWO="$2"
             shift 2
             ;;
+        --node-mbp-mlx)
+            NODE_MBP_MLX="$2"
+            shift 2
+            ;;
+        --node-mbp-ollama)
+            NODE_MBP_OLLAMA="$2"
+            NODE_MBP="$2"
+            shift 2
+            ;;
         --node-mbp)
             NODE_MBP="$2"
+            NODE_MBP_OLLAMA="$2"
+            shift 2
+            ;;
+        --mbp-cooldown)
+            MBP_COOLDOWN_SECONDS="$2"
             shift 2
             ;;
         --strategy)
@@ -360,7 +384,7 @@ log_success "Python package import verification passed."
 # -----------------------------------------------------------------------------
 # Step 6: Configure LiteLLM Routing & Cluster Model Definitions
 # -----------------------------------------------------------------------------
-log_section "Step 6: Writing Cluster Configuration to ${LITELLM_CONFIG}"
+log_section "Step 6: Writing Cluster Configuration & Router to ${LITELLM_DIR}"
 
 mkdir -p "${LITELLM_DIR}"
 
@@ -382,16 +406,186 @@ else
     chown "${LITELLM_USER}:${LITELLM_USER}" "${KEY_FILE}"
 fi
 
+# -----------------------------------------------------------------------------
+# Step 6a: Custom Python Router & Lifecycle Hook (MBP Activity Prioritization)
+# -----------------------------------------------------------------------------
+ROUTER_PY="${LITELLM_DIR}/turnstone_router.py"
+log_info "Writing custom MBP activity-prioritizing router module to ${ROUTER_PY}..."
+
+cat > "${ROUTER_PY}" <<EOF
+"""
+Turnstone LiteLLM Custom Routing & Lifecycle Strategy for MBP Activity Prioritization
+Prioritizes Apple Silicon MBP (NODE_MBP) for interactive coding with qwen3-coder-next.
+
+Rules:
+1. qwen3-coder-next has priority on NODE_MBP (MLX Server on port 8000).
+2. Once a qwen3-coder-next request completes, start a cooldown timer of ${MBP_COOLDOWN_SECONDS}s.
+   Subsequent qwen3-coder-next requests during cooldown execute immediately.
+3. Other models (gemma-4-31b, qwen-3.8-27b, default) are only routed to NODE_MBP (Ollama on port 11434)
+   if qwen3-coder-next is NOT running and its cooldown timer has expired.
+4. If a request for qwen3-coder-next arrives while NODE_MBP is running another model,
+   it waits for the in-flight request to complete and then immediately executes.
+"""
+
+import asyncio
+import logging
+import os
+import time
+from typing import Dict, List, Optional, Union
+from litellm.integrations.custom_logger import CustomLogger
+from litellm.router import CustomRoutingStrategyBase
+
+logger = logging.getLogger("litellm.turnstone_router")
+
+
+class MBPStateManager:
+    """
+    Manages concurrency and cooldown state across async requests for NODE_MBP.
+    """
+    def __init__(self, cooldown_seconds: float = 60.0):
+        self.cooldown_seconds = cooldown_seconds
+        self.qwen_in_flight = 0
+        self.qwen_pending_waiters = 0
+        self.last_qwen_completion_time: Optional[float] = None
+        self.mbp_non_qwen_in_flight = 0
+        self.mbp_idle_event = asyncio.Event()
+        self.mbp_idle_event.set()
+        self.deployment_in_flight: Dict[str, int] = {}
+
+    def is_mbp_deployment(self, deployment: dict) -> bool:
+        api_base = str(deployment.get("litellm_params", {}).get("api_base", "")).lower()
+        return "mbp" in api_base or ":8000" in api_base or ":11434" in api_base
+
+    def is_qwen_reserved(self) -> bool:
+        if self.qwen_in_flight > 0 or self.qwen_pending_waiters > 0:
+            return True
+        if self.last_qwen_completion_time is not None:
+            elapsed = time.time() - self.last_qwen_completion_time
+            if elapsed < self.cooldown_seconds:
+                return True
+        return False
+
+    def get_in_flight(self, deployment: dict) -> int:
+        dep_id = deployment.get("model_info", {}).get("id") or deployment.get("litellm_params", {}).get("api_base", "")
+        return self.deployment_in_flight.get(str(dep_id), 0)
+
+    def inc_in_flight(self, deployment: dict):
+        dep_id = deployment.get("model_info", {}).get("id") or deployment.get("litellm_params", {}).get("api_base", "")
+        key = str(dep_id)
+        self.deployment_in_flight[key] = self.deployment_in_flight.get(key, 0) + 1
+
+    def dec_in_flight(self, deployment: dict):
+        dep_id = deployment.get("model_info", {}).get("id") or deployment.get("litellm_params", {}).get("api_base", "")
+        key = str(dep_id)
+        if key in self.deployment_in_flight:
+            self.deployment_in_flight[key] = max(0, self.deployment_in_flight[key] - 1)
+
+
+# Singleton state instance shared between router and logger callbacks
+state = MBPStateManager(
+    cooldown_seconds=float(os.getenv("MBP_COOLDOWN_SECONDS", "${MBP_COOLDOWN_SECONDS}"))
+)
+
+# Load static model list from config.yaml as fallback
+STATIC_MODEL_LIST = []
+try:
+    import yaml
+    with open("${LITELLM_CONFIG}", "r") as f:
+        _cfg = yaml.safe_load(f)
+        STATIC_MODEL_LIST = _cfg.get("model_list", [])
+except Exception:
+    pass
+
+
+class TurnstoneLifecycleHandler(CustomLogger):
+    async def async_filter_deployments(
+        self,
+        model: str,
+        healthy_deployments: List[dict],
+        messages: Optional[List] = None,
+        request_kwargs: Optional[dict] = None,
+        parent_otel_span=None,
+    ) -> List[dict]:
+        """
+        Dynamically filters candidate deployments before least-busy load balancing:
+        1. qwen3-coder-next has priority on MBP. Waits if non-Qwen is in-flight on MBP.
+        2. Non-Qwen models are excluded from MBP while Qwen is active or in 60s cooldown.
+        """
+        is_qwen_model = "qwen3-coder-next" in model.lower()
+
+        if is_qwen_model:
+            state.qwen_pending_waiters += 1
+            try:
+                if state.mbp_non_qwen_in_flight > 0:
+                    logger.info("Qwen coder request waiting for active non-Qwen MBP request to complete...")
+                    await state.mbp_idle_event.wait()
+            finally:
+                state.qwen_pending_waiters = max(0, state.qwen_pending_waiters - 1)
+
+            # Prioritize MBP MLX / Ollama deployments if healthy
+            mbp_deps = [d for d in healthy_deployments if state.is_mbp_deployment(d)]
+            if mbp_deps:
+                return mbp_deps
+            return healthy_deployments
+
+        # General / non-Qwen models (gemma-4-31b, qwen-3.8-27b, default, etc.)
+        if state.is_qwen_reserved():
+            # Exclude MBP deployments while Qwen is active, cooling down, or queued
+            non_mbp = [d for d in healthy_deployments if not state.is_mbp_deployment(d)]
+            if non_mbp:
+                return non_mbp
+
+        return healthy_deployments
+
+    async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
+        model = str(data.get("model", "")).lower()
+        if "qwen3-coder-next" in model:
+            state.qwen_in_flight += 1
+        return data
+
+    async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
+        self._handle_completion(kwargs)
+
+    async def async_log_failure_event(self, kwargs, response_obj, start_time, end_time):
+        self._handle_completion(kwargs)
+
+    def _handle_completion(self, kwargs: dict):
+        model = str(kwargs.get("model", "")).lower()
+        litellm_params = kwargs.get("litellm_params", {}) or {}
+        api_base = str(litellm_params.get("api_base", "")).lower()
+        is_mbp = "mbp" in api_base or ":8000" in api_base or ":11434" in api_base
+
+        state.dec_in_flight({"litellm_params": litellm_params})
+
+        if "qwen3-coder-next" in model:
+            state.qwen_in_flight = max(0, state.qwen_in_flight - 1)
+            state.last_qwen_completion_time = time.time()
+            logger.info("Qwen request finished. Activated " + str(state.cooldown_seconds) + "s MBP priority lock.")
+        elif is_mbp:
+            state.mbp_non_qwen_in_flight = max(0, state.mbp_non_qwen_in_flight - 1)
+            if state.mbp_non_qwen_in_flight == 0:
+                state.mbp_idle_event.set()
+
+
+lifecycle_handler = TurnstoneLifecycleHandler()
+EOF
+
+chown "${LITELLM_USER}:${LITELLM_USER}" "${ROUTER_PY}"
+chmod 644 "${ROUTER_PY}"
+
+# -----------------------------------------------------------------------------
+# Step 6b: Write LiteLLM Cluster Configuration YAML
+# -----------------------------------------------------------------------------
 cat > "${LITELLM_CONFIG}" <<EOF
 # =============================================================================
 # Turnstone LiteLLM Load Balancer Configuration (Debian Trixie Container)
-# Load Balancing: Least-Busy dynamic queue routing across 3 hardware nodes
+# Load Balancing: MBP Activity Prioritization + Least-Busy queue balancing
 # =============================================================================
 
 model_list:
   # ---------------------------------------------------------------------------
   # 1. Gemma 4 31B (General Reasoning / Orchestrator)
-  # Balanced across all 3 nodes (2x AMD Strix Halo + 1x Apple Silicon M5)
+  # Balanced across Node 1, Node 2, & Node 3 Ollama (gemma4:31b-mlx)
   # ---------------------------------------------------------------------------
   - model_name: "gemma-4-31b"
     litellm_params:
@@ -411,15 +605,15 @@ model_list:
 
   - model_name: "gemma-4-31b"
     litellm_params:
-      model: "openai/gemma4:31b-mlx"
-      api_base: "${NODE_MBP}"
+      model: "openai/gemma4:31b"
+      api_base: "${NODE_MBP_OLLAMA}"
       api_key: "dummy"
       max_parallel_requests: 1
       rpm: 300
 
   # ---------------------------------------------------------------------------
-  # 2. Qwen 3.8 27B Q8_0 (High Precision Reasoning / Coding)
-  # Balanced across Ryzen Halo Node 1 & Node 2
+  # 2. Qwen 3.8 27B (High Precision Reasoning / Coding)
+  # Balanced across Node 1, Node 2, & Node 3 Ollama (qwen3.8:27b)
   # ---------------------------------------------------------------------------
   - model_name: "qwen-3.8-27b"
     litellm_params:
@@ -433,26 +627,34 @@ model_list:
     litellm_params:
       model: "openai/Qwen3.8-27B-GGUF-Q8_0"
       api_base: "${NODE_RYZEN_TWO}"
+      api_key: "dummy"
+      max_parallel_requests: 1
+      rpm: 300
+
+  - model_name: "qwen-3.8-27b"
+    litellm_params:
+      model: "openai/qwen3.8:27b"
+      api_base: "${NODE_MBP_OLLAMA}"
       api_key: "dummy"
       max_parallel_requests: 1
       rpm: 300
 
   # ---------------------------------------------------------------------------
   # 3. Qwen 3 Coder Next (Deep 128k Context Coding Model)
-  # Primary: MacBook Pro M5 (High memory bandwidth)
-  # Fallback: Ryzen Halo 1
+  # Primary: MacBook Pro M5 MLX Server (Port 8000)
+  # Fallback: MacBook Pro M5 Ollama (Port 11434)
   # ---------------------------------------------------------------------------
   - model_name: "qwen3-coder-next"
     litellm_params:
-      model: "openai/qwen3-coder-next:q4_K_M"
-      api_base: "${NODE_MBP}"
+      model: "openai/mlx-community/Qwen3-Coder-Next-6bit"
+      api_base: "${NODE_MBP_MLX}"
       api_key: "dummy"
       max_parallel_requests: 1
       rpm: 120
 
   # ---------------------------------------------------------------------------
   # 4. Nemotron 3 Nano 30B (MoE Architecture - Fast Judge / Reranking)
-  # Ryzen Halo Node 2 primary (Concurrency limit = 3)
+  # Balanced across Ryzen Halo Node 2 & Node 1
   # ---------------------------------------------------------------------------
   - model_name: "nemotron-3-nano"
     litellm_params:
@@ -472,18 +674,12 @@ model_list:
 
   # ---------------------------------------------------------------------------
   # 5. Ornith Latest (Fast Agentic Model / Tool Calling)
+  # Hosted on MacBook Pro M5 Ollama (ornith:latest)
   # ---------------------------------------------------------------------------
   - model_name: "ornith-latest"
     litellm_params:
       model: "openai/ornith:latest"
-      api_base: "${NODE_RYZEN_TWO}"
-      api_key: "dummy"
-      max_parallel_requests: 2
-
-  - model_name: "ornith-latest"
-    litellm_params:
-      model: "openai/ornith:latest"
-      api_base: "${NODE_RYZEN_ONE}"
+      api_base: "${NODE_MBP_OLLAMA}"
       api_key: "dummy"
       max_parallel_requests: 2
 
@@ -504,12 +700,12 @@ model_list:
 
   - model_name: "default"
     litellm_params:
-      model: "openai/gemma4:31b-mlx"
-      api_base: "${NODE_MBP}"
+      model: "openai/gemma4:31b"
+      api_base: "${NODE_MBP_OLLAMA}"
       api_key: "dummy"
 
 router_settings:
-  routing_strategy: "${ROUTING_STRATEGY}"  # 'least-busy' routes to the deployment with lowest in-flight queue
+  routing_strategy: "${ROUTING_STRATEGY}"
   routing_strategy_args:
     ttl: 30
   num_retries: 3
@@ -523,6 +719,7 @@ general_settings:
   drop_params: true
 
 litellm_settings:
+  callbacks: ["turnstone_router.lifecycle_handler"]
   drop_params: true
   set_verbose: false
   telemetry: false
@@ -552,6 +749,8 @@ Group=${LITELLM_USER}
 WorkingDirectory=${LITELLM_DIR}
 Environment="LITELLM_MASTER_KEY=${MASTER_KEY}"
 Environment="PYTHONUNBUFFERED=1"
+Environment="PYTHONPATH=${LITELLM_DIR}"
+Environment="MBP_COOLDOWN_SECONDS=${MBP_COOLDOWN_SECONDS}"
 Environment="PATH=${VENV_DIR}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 ExecStart=${VENV_DIR}/bin/python3 -m litellm.proxy.proxy_cli --config ${LITELLM_CONFIG} --host ${LITELLM_HOST} --port ${LITELLM_PORT}
 Restart=always
@@ -577,6 +776,8 @@ else
 #!/usr/bin/env bash
 export LITELLM_MASTER_KEY="${MASTER_KEY}"
 export PYTHONUNBUFFERED=1
+export PYTHONPATH="${LITELLM_DIR}:\${PYTHONPATH:-}"
+export MBP_COOLDOWN_SECONDS="${MBP_COOLDOWN_SECONDS}"
 export PATH="${VENV_DIR}/bin:\$PATH"
 exec ${VENV_DIR}/bin/python3 -m litellm.proxy.proxy_cli --config ${LITELLM_CONFIG} --host ${LITELLM_HOST} --port ${LITELLM_PORT}
 EOF
@@ -598,28 +799,28 @@ log_section "Step 8: Verifying Service Startup & Health"
 log_info "Waiting for LiteLLM to bind port ${LITELLM_PORT} and respond to health checks..."
 
 SERVICE_HEALTHY=false
-for i in $(seq 1 15); do
+for i in $(seq 1 45); do
     if [ "${USE_SYSTEMD}" = true ]; then
         if ! systemctl is-active --quiet litellm.service; then
-            log_warn "litellm.service is not active yet (attempt ${i}/15)..."
+            log_warn "litellm.service is not active yet (attempt ${i}/45)..."
             sleep 1
             continue
         fi
     fi
 
-    # Check HTTP endpoint
-    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 "http://127.0.0.1:${LITELLM_PORT}/health/readiness" -H "Authorization: Bearer ${MASTER_KEY}" || true)
+    # Check HTTP readiness endpoint
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 "http://127.0.0.1:${LITELLM_PORT}/health/readiness" -H "Authorization: Bearer ${MASTER_KEY}" || true)
     if [ "${HTTP_CODE}" = "200" ] || [ "${HTTP_CODE}" = "401" ] || [ "${HTTP_CODE}" = "403" ]; then
         SERVICE_HEALTHY=true
         log_success "LiteLLM Proxy is responsive (HTTP ${HTTP_CODE})!"
         break
     fi
 
-    # Alternative check on root/health
-    HTTP_CODE_ALT=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 "http://127.0.0.1:${LITELLM_PORT}/health" || true)
-    if [ "${HTTP_CODE_ALT}" = "200" ]; then
+    # Alternative check on root/health, liveliness or models
+    HTTP_CODE_ALT=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 "http://127.0.0.1:${LITELLM_PORT}/health" || curl -s -o /dev/null -w "%{http_code}" --max-time 3 "http://127.0.0.1:${LITELLM_PORT}/health/liveliness" || true)
+    if [ "${HTTP_CODE_ALT}" = "200" ] || [ "${HTTP_CODE_ALT}" = "401" ] || [ "${HTTP_CODE_ALT}" = "403" ]; then
         SERVICE_HEALTHY=true
-        log_success "LiteLLM Proxy health endpoint is responsive!"
+        log_success "LiteLLM Proxy health endpoint is responsive (HTTP ${HTTP_CODE_ALT})!"
         break
     fi
 
@@ -629,15 +830,15 @@ done
 if [ "${SERVICE_HEALTHY}" = true ]; then
     log_success "LiteLLM Proxy started and verified successfully!"
 else
-    log_error "LiteLLM Proxy failed to become healthy within 15 seconds."
+    log_error "LiteLLM Proxy failed to become healthy within 45 seconds."
     if [ "${USE_SYSTEMD}" = true ]; then
         echo -e "\n${YELLOW}--- Systemd Service Status ---${NC}"
         systemctl status litellm.service --no-pager || true
         echo -e "\n${YELLOW}--- Recent Journal Logs (litellm.service) ---${NC}"
-        journalctl -u litellm.service -n 35 --no-pager || true
+        journalctl -u litellm.service -n 50 --no-pager || true
     else
         echo -e "\n${YELLOW}--- /var/log/litellm.log ---${NC}"
-        tail -n 35 /var/log/litellm.log || true
+        tail -n 50 /var/log/litellm.log || true
     fi
     exit 1
 fi
