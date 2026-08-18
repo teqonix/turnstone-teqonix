@@ -43,7 +43,7 @@ This directory contains the complete deployment and migration tooling for transi
 | [`deploy_ryzen_node.sh`](deploy_ryzen_node.sh) | Worker Node | Ryzen Halo #1 & #2 (Linux) | Installs `turnstone-server` virtualenv, configures secrets, and starts systemd service. |
 | [`deploy_litellm_proxy.sh`](deploy_litellm_proxy.sh) | Load Balancer VM | Dedicated Proxy VM | Idempotently deploys LiteLLM proxy with least-busy routing across Ryzen and Apple Silicon nodes. |
 | [`backup_turnstone.sh`](backup_turnstone.sh) | Backup Cron | `silo-14` TrueNAS VM | Runs daily compressed `pg_dump` of all conversation history, settings, and configs into TrueNAS ZFS dataset. |
-| [`sync_repo.sh`](../../../scripts/sync_repo.sh) | Cluster Sync | Cluster Nodes (`turnstone-postgres.lan`, `turnstone-coordinator-nerd-projects.lan`) | Syncs local turnstone repo copy to LLM cluster nodes via rsync over passwordless SSH. |
+| [`sync_repo.sh`](sync_repo.sh) | Cluster Sync | Cluster Nodes (`turnstone-postgres.lan`, `turnstone-coordinator-nerd-projects.lan`, `amd-ai-core-one.lan`, `amd-ai-core-two.lan`, `mbp-ai-core.lan`, `litellm-proxy.lan`) | Syncs local turnstone repo copy to LLM cluster nodes via rsync over passwordless SSH. |
 | [`set_concurrency_limit.sh`](set_concurrency_limit.sh) | Cluster / Node Config | All Cluster Nodes / Local | Auto-detects installed inference engines and Turnstone configs, setting concurrency limits to 1. |
 | [`install_ryzenadj.sh`](install_ryzenadj.sh) | Worker Node (Ryzen) | Ryzen Halo #1 & #2 (Linux) | Fetches, builds, and installs `ryzen_smu` DKMS driver, `ryzenadj`, and sets up `ryzen-tdp.service` systemd unit for persistent boot TDP limits. |
 
