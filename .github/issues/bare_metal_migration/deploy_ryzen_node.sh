@@ -40,6 +40,11 @@ NODE_ID="${NODE_ID:-}"
 COORDINATOR_IP="${COORDINATOR_IP:-}"
 JWT_SECRET="${JWT_SECRET:-}"
 LEMONADE_URL="${LEMONADE_URL:-http://127.0.0.1:8000/v1}"
+TURNSTONE_USER_DEBIAN="${TURNSTONE_USER_DEBIAN:-turnstone}"
+SMB_PATH="${SMB_PATH:-}"
+SMB_USER="${SMB_USER:-}"
+SMB_PASSWORD="${SMB_PASSWORD:-}"
+SKIP_RYZENADJ="${SKIP_RYZENADJ:-false}"
 
 usage() {
     echo "Usage: $0 [OPTIONS]"
@@ -49,6 +54,11 @@ usage() {
     echo "  -s, --secret-file <path>           Path to secret file containing DB connection string or env vars"
     echo "  -n, --node-id <id>                 Node ID (e.g. ryzen-halo-1, ryzen-halo-2)"
     echo "  -c, --coordinator <ip>             Coordinator VM IP address or hostname"
+    echo "      --smb-path <path>              Remote SMB path + protocol (e.g. smb://silo-14.lan/ai-playground)"
+    echo "      --smb-user <user>              SMB username (e.g. turnstone-np)"
+    echo "      --smb-pass <pass>              SMB password"
+    echo "      --turnstone-user <user>        Local Debian system user [default: turnstone]"
+    echo "      --skip-ryzenadj                Skip checking and installing ryzenadj / TDP service"
     echo "  -h, --help                         Display this help message and exit"
     exit 0
 }
@@ -71,6 +81,26 @@ while [[ $# -gt 0 ]]; do
             COORDINATOR_IP="$2"
             shift 2
             ;;
+        --smb-path)
+            SMB_PATH="$2"
+            shift 2
+            ;;
+        --smb-user)
+            SMB_USER="$2"
+            shift 2
+            ;;
+        --smb-pass|--smb-password)
+            SMB_PASSWORD="$2"
+            shift 2
+            ;;
+        --turnstone-user|--debian-user)
+            TURNSTONE_USER_DEBIAN="$2"
+            shift 2
+            ;;
+        --skip-ryzenadj)
+            SKIP_RYZENADJ="true"
+            shift
+            ;;
         -h|--help)
             usage
             ;;
@@ -83,6 +113,55 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+parse_smb_path() {
+    local raw_path="$1"
+    raw_path=$(echo "${raw_path}" | tr -d '\r' | xargs)
+    
+    # Convert Windows-style backslashes to forward slashes
+    raw_path="${raw_path//\\//}"
+    
+    # Strip protocol prefix (smb://, cifs://, etc.)
+    local stripped="${raw_path#*://}"
+    stripped="${stripped#//}"
+    stripped="${stripped#/}"
+    stripped="${stripped%/}"
+    
+    # Parse user:password@ if present
+    if [[ "${stripped}" == *"@"* ]]; then
+        local userinfo="${stripped%%@*}"
+        stripped="${stripped#*@}"
+        userinfo=$(echo "${userinfo}" | tr -d '=')
+        if [[ "${userinfo}" == *":"* ]]; then
+            [ -z "${SMB_USER:-}" ] && SMB_USER="${userinfo%%:*}"
+            [ -z "${SMB_PASSWORD:-}" ] && SMB_PASSWORD="${userinfo#*:}"
+        else
+            [ -z "${SMB_USER:-}" ] && SMB_USER="${userinfo}"
+        fi
+    fi
+    
+    # Remove accidental leading '=' from hostname
+    stripped="${stripped#=}"
+    
+    SERVER_HOSTNAME="${stripped%%/*}"
+    local path_part=""
+    if [[ "${stripped}" == *"/"* ]]; then
+        path_part="${stripped#*/}"
+        path_part="${path_part#/}"
+        path_part="${path_part%/}"
+    fi
+    
+    if [ -z "${path_part}" ] || [ "${SERVER_HOSTNAME}" = "${path_part}" ]; then
+        SHARE_NAME="ai-playground"
+    else
+        # If user passed a full TrueNAS storage path (e.g. /mnt/silo-14/ai-playground), extract the SMB share name
+        if [[ "${path_part}" =~ ^mnt/[^/]+/(.+)$ ]]; then
+            SHARE_NAME="${BASH_REMATCH[1]}"
+        else
+            SHARE_NAME="${path_part}"
+        fi
+    fi
+}
 
 find_secret_by_user() {
     local target_user="$1"
@@ -237,23 +316,80 @@ if [ -z "${JWT_SECRET}" ]; then
     read -rp "Enter TURNSTONE_JWT_SECRET from Coordinator setup: " JWT_SECRET
 fi
 
-LAN_IP=$(hostname -I | awk '{print $1}')
-
-# Step 3: Create Dedicated System User
-log_info "Step 3: Creating dedicated 'turnstone' system user..."
-if ! id "turnstone" &>/dev/null; then
-    useradd --system --no-create-home --shell /usr/sbin/nologin turnstone
-    log_success "Created system user 'turnstone'."
-else
-    log_success "System user 'turnstone' already exists."
+if [ -z "${SMB_PATH}" ]; then
+    read -rp "Enter remote SMB storage path + protocol [default: smb://silo-14.lan/ai-playground]: " INPUT_SMB_PATH
+    SMB_PATH="${INPUT_SMB_PATH:-smb://silo-14.lan/ai-playground}"
 fi
 
-# Step 4: Install UV and Python Virtualenv
-log_info "Step 4: Setting up Python virtual environment..."
+parse_smb_path "${SMB_PATH}"
+SERVER_HOSTNAME="${SERVER_HOSTNAME:-silo-14.lan}"
+SHARE_NAME="${SHARE_NAME:-ai-playground}"
+
+if [ -z "${SMB_USER}" ]; then
+    read -rp "Enter SMB username to connect as [default: turnstone-np]: " INPUT_SMB_USER
+    SMB_USER="${INPUT_SMB_USER:-turnstone-np}"
+fi
+REMOTE_USERNAME="${SMB_USER}"
+
+if [ -z "${SMB_PASSWORD}" ]; then
+    read -r -s -p "Enter SMB Password for '${REMOTE_USERNAME}'@'${SERVER_HOSTNAME}': " SMB_PASSWORD
+    echo ""
+fi
+
+MOUNT_POINT="/home/${TURNSTONE_USER_DEBIAN}/${SERVER_HOSTNAME}/${SHARE_NAME}"
+
+LAN_IP=$(hostname -I | awk '{print $1}')
+
+# Step 3: Check and Install RyzenAdj Power Management Utility
+log_info "Step 3: Checking for ryzenadj power management utility..."
+if [ "${SKIP_RYZENADJ}" != "true" ]; then
+    if ! command -v ryzenadj &>/dev/null && [ ! -x "/usr/local/bin/ryzenadj" ] && [ ! -x "/usr/bin/ryzenadj" ]; then
+        log_warn "'ryzenadj' is not installed on this node."
+        RYZENADJ_INSTALLER="${SCRIPT_DIR}/install_ryzenadj.sh"
+        if [ -f "${RYZENADJ_INSTALLER}" ]; then
+            log_info "Executing RyzenAdj installer (${RYZENADJ_INSTALLER})..."
+            bash "${RYZENADJ_INSTALLER}"
+            log_success "RyzenAdj and TDP service installation complete."
+        else
+            log_warn "RyzenAdj installer script not found at '${RYZENADJ_INSTALLER}'. Continuing deployment."
+        fi
+    else
+        INSTALLED_RYZENADJ="$(command -v ryzenadj 2>/dev/null || ( [ -x "/usr/local/bin/ryzenadj" ] && echo "/usr/local/bin/ryzenadj" ) || echo "/usr/bin/ryzenadj")"
+        log_success "'ryzenadj' is already installed at: ${INSTALLED_RYZENADJ}"
+    fi
+else
+    log_info "Skipping RyzenAdj check (--skip-ryzenadj specified)."
+fi
+
+# Step 4: Create Dedicated System User
+log_info "Step 4: Creating dedicated '${TURNSTONE_USER_DEBIAN}' system user..."
+if ! id "${TURNSTONE_USER_DEBIAN}" &>/dev/null; then
+    useradd --system --create-home --shell /bin/bash "${TURNSTONE_USER_DEBIAN}" || useradd --system --no-create-home --shell /bin/bash "${TURNSTONE_USER_DEBIAN}"
+    log_success "Created system user '${TURNSTONE_USER_DEBIAN}'."
+else
+    usermod -s /bin/bash "${TURNSTONE_USER_DEBIAN}" 2>/dev/null || true
+    log_success "System user '${TURNSTONE_USER_DEBIAN}' already exists."
+fi
+
+USER_HOME="$(getent passwd "${TURNSTONE_USER_DEBIAN}" | cut -d: -f6 || echo "/home/${TURNSTONE_USER_DEBIAN}")"
+mkdir -p "${USER_HOME}"
+chown -R "${TURNSTONE_USER_DEBIAN}:${TURNSTONE_USER_DEBIAN}" "${USER_HOME}" 2>/dev/null || chown -R "${TURNSTONE_USER_DEBIAN}" "${USER_HOME}" 2>/dev/null || true
+
+# Ensure mount point path exists and is owned by TURNSTONE_USER_DEBIAN
+log_info "Checking mount point directory at ${MOUNT_POINT}..."
+if [ ! -d "${MOUNT_POINT}" ]; then
+    log_info "Mount point '${MOUNT_POINT}' does not exist. Creating directory..."
+    mkdir -p "${MOUNT_POINT}"
+fi
+chown -R "${TURNSTONE_USER_DEBIAN}:${TURNSTONE_USER_DEBIAN}" "${MOUNT_POINT}" 2>/dev/null || chown -R "${TURNSTONE_USER_DEBIAN}" "${MOUNT_POINT}" 2>/dev/null || true
+log_success "Mount point directory '${MOUNT_POINT}' verified and ownership assigned to '${TURNSTONE_USER_DEBIAN}'."
+
+# Step 5: Install UV, Python Virtualenv, CIFS Utilities, Homebrew & all-smi
+log_info "Step 5: Setting up Python virtual environment, storage utilities, and Homebrew..."
 VENV_DIR="/opt/turnstone-venv"
 
 if command -v apt-get &>/dev/null; then
-    DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 python3-venv python3-pip
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 python3-venv python3-pip cifs-utils smbclient git curl build-essential procps file
 fi
 
 if ! command -v uv &> /dev/null; then
@@ -280,13 +416,72 @@ else
 fi
 
 # Fix ownership and execution permissions for turnstone user
-chown -R turnstone:turnstone "${VENV_DIR}"
+chown -R "${TURNSTONE_USER_DEBIAN}:${TURNSTONE_USER_DEBIAN}" "${VENV_DIR}" 2>/dev/null || chown -R "${TURNSTONE_USER_DEBIAN}" "${VENV_DIR}"
 chmod -R a+rX "${VENV_DIR}"
 chmod +x "${VENV_DIR}/bin"/* 2>/dev/null || true
 log_success "Virtualenv created and permissions secured at ${VENV_DIR}."
 
-# Step 5: Configure /etc/turnstone/config.toml Secrets
-log_info "Step 5: Writing secrets configuration to /etc/turnstone/config.toml..."
+# Step 5b: Install Local Homebrew & all-smi Hardware Monitor for Turnstone User
+LOCAL_BREW_DIR="${USER_HOME}/.linuxbrew"
+log_info "Checking local Homebrew installation in ${LOCAL_BREW_DIR}..."
+if [ ! -x "${LOCAL_BREW_DIR}/bin/brew" ]; then
+    log_info "Installing standalone Homebrew into ${LOCAL_BREW_DIR} for '${TURNSTONE_USER_DEBIAN}'..."
+    rm -rf "${LOCAL_BREW_DIR}"
+    sudo -u "${TURNSTONE_USER_DEBIAN}" git clone --depth=1 https://github.com/Homebrew/brew "${LOCAL_BREW_DIR}"
+fi
+chown -R "${TURNSTONE_USER_DEBIAN}:${TURNSTONE_USER_DEBIAN}" "${LOCAL_BREW_DIR}" 2>/dev/null || true
+
+# Persist Homebrew environment across all future shell sessions
+for rc_file in "${USER_HOME}/.bashrc" "${USER_HOME}/.profile"; do
+    if [ ! -f "${rc_file}" ]; then
+        touch "${rc_file}"
+        chown "${TURNSTONE_USER_DEBIAN}:${TURNSTONE_USER_DEBIAN}" "${rc_file}" 2>/dev/null || true
+    fi
+    if ! grep -qF "${LOCAL_BREW_DIR}/bin/brew shellenv" "${rc_file}" 2>/dev/null; then
+        echo "" >> "${rc_file}"
+        echo "# Homebrew environment" >> "${rc_file}"
+        echo "eval \"\$(${LOCAL_BREW_DIR}/bin/brew shellenv)\"" >> "${rc_file}"
+    fi
+done
+
+# Install all-smi via Homebrew
+log_info "Installing all-smi utility via Homebrew for user '${TURNSTONE_USER_DEBIAN}'..."
+sudo -u "${TURNSTONE_USER_DEBIAN}" -H bash -c "
+    eval \"\$(${LOCAL_BREW_DIR}/bin/brew shellenv)\"
+    brew tap lablup/tap --quiet 2>/dev/null || true
+    brew install lablup/tap/all-smi || brew install all-smi
+"
+
+ALL_SMI_BIN="${LOCAL_BREW_DIR}/bin/all-smi"
+if [ -x "${ALL_SMI_BIN}" ]; then
+    mkdir -p /usr/local/bin
+    ln -sfn "${ALL_SMI_BIN}" /usr/local/bin/all-smi
+    log_success "all-smi utility successfully installed at ${ALL_SMI_BIN} (symlinked to /usr/local/bin/all-smi)."
+fi
+
+# Configure Passwordless Sudo for all-smi
+log_info "Configuring passwordless sudo for '${TURNSTONE_USER_DEBIAN}' to execute all-smi..."
+SUDOERS_FILE="/etc/sudoers.d/turnstone-all-smi"
+mkdir -p /etc/sudoers.d
+cat > "${SUDOERS_FILE}" <<EOF
+# Allow ${TURNSTONE_USER_DEBIAN} to execute all-smi with sudo without a password
+${TURNSTONE_USER_DEBIAN} ALL=(ALL) NOPASSWD: ${ALL_SMI_BIN}, /usr/local/bin/all-smi
+EOF
+chmod 0440 "${SUDOERS_FILE}"
+
+if command -v visudo &>/dev/null; then
+    if ! visudo -cf "${SUDOERS_FILE}"; then
+        log_warn "visudo syntax check failed on ${SUDOERS_FILE}. Removing file to prevent sudo breakage."
+        rm -f "${SUDOERS_FILE}"
+    else
+        log_success "Passwordless sudo configured and validated: ${SUDOERS_FILE}"
+    fi
+else
+    log_success "Passwordless sudo configured: ${SUDOERS_FILE}"
+fi
+
+# Step 6: Configure /etc/turnstone/config.toml Secrets
+log_info "Step 6: Writing secrets configuration to /etc/turnstone/config.toml..."
 mkdir -p /etc/turnstone
 
 cat > /etc/turnstone/config.toml <<EOF
@@ -302,24 +497,59 @@ base_url = "${LEMONADE_URL}"
 api_key = "dummy"
 EOF
 
-chown -R turnstone:turnstone /etc/turnstone
+chown -R "${TURNSTONE_USER_DEBIAN}:${TURNSTONE_USER_DEBIAN}" /etc/turnstone 2>/dev/null || chown -R "${TURNSTONE_USER_DEBIAN}" /etc/turnstone
 chmod 600 /etc/turnstone/config.toml
-log_success "Configuration written and permissions secured (0600 turnstone:turnstone)."
+log_success "Configuration written and permissions secured (0600 ${TURNSTONE_USER_DEBIAN}:${TURNSTONE_USER_DEBIAN})."
 
-# Step 6: Install Systemd Service Unit & Drop-in
-log_info "Step 6: Installing Systemd units..."
+# Step 7: Configure & Mount Remote SMB Storage at Startup
+log_info "Step 7: Configuring remote SMB mount at ${MOUNT_POINT}..."
+cat > /etc/turnstone/smbcredentials <<EOF
+username=${REMOTE_USERNAME}
+password=${SMB_PASSWORD}
+EOF
+chmod 600 /etc/turnstone/smbcredentials
+chown root:root /etc/turnstone/smbcredentials
 
-cat > /etc/systemd/system/turnstone-server.service <<'EOF'
+if [ ! -d "${MOUNT_POINT}" ]; then
+    mkdir -p "${MOUNT_POINT}"
+fi
+chown -R "${TURNSTONE_USER_DEBIAN}:${TURNSTONE_USER_DEBIAN}" "${MOUNT_POINT}" 2>/dev/null || chown -R "${TURNSTONE_USER_DEBIAN}" "${MOUNT_POINT}" 2>/dev/null || true
+
+# Configure persistent mount in /etc/fstab with systemd automount
+FSTAB_ENTRY="//${SERVER_HOSTNAME}/${SHARE_NAME} ${MOUNT_POINT} cifs credentials=/etc/turnstone/smbcredentials,uid=${TURNSTONE_USER_DEBIAN},gid=${TURNSTONE_USER_DEBIAN},file_mode=0775,dir_mode=0775,iocharset=utf8,nofail,_netdev,x-systemd.automount 0 0"
+
+# Remove any old turnstone CIFS mount entries from fstab to prevent duplicate/stale systemd mount units
+sed -i '\|/etc/turnstone/smbcredentials|d' /etc/fstab
+echo "${FSTAB_ENTRY}" >> /etc/fstab
+
+systemctl daemon-reload
+if ! mountpoint -q "${MOUNT_POINT}"; then
+    log_info "Mounting SMB share (//${SERVER_HOSTNAME}/${SHARE_NAME} -> ${MOUNT_POINT})..."
+    mount -v "${MOUNT_POINT}" || log_warn "Mount attempt exited with code $?. x-systemd.automount will attempt mount on access."
+fi
+
+# Ensure permissions and symlink /data and /workspace to the mounted SMB storage
+chown -R "${TURNSTONE_USER_DEBIAN}:${TURNSTONE_USER_DEBIAN}" "${MOUNT_POINT}" 2>/dev/null || chown -R "${TURNSTONE_USER_DEBIAN}" "${MOUNT_POINT}" 2>/dev/null || true
+rm -rf /data /workspace
+ln -sfn "${MOUNT_POINT}" /data
+ln -sfn "${MOUNT_POINT}" /workspace
+log_success "SMB storage configured for startup mount at ${MOUNT_POINT} (symlinked to /data and /workspace)."
+
+# Step 8: Install Systemd Service Unit & Drop-in
+log_info "Step 8: Installing Systemd units..."
+
+cat > /etc/systemd/system/turnstone-server.service <<EOF
 [Unit]
 Description=Turnstone Server Node
-After=network.target network-online.target
-Wants=network-online.target
+After=network.target network-online.target remote-fs.target
+Wants=network-online.target remote-fs.target
+RequiresMountsFor=${MOUNT_POINT}
 
 [Service]
 Type=simple
-User=turnstone
-Group=turnstone
-WorkingDirectory=/data
+User=${TURNSTONE_USER_DEBIAN}
+Group=${TURNSTONE_USER_DEBIAN}
+WorkingDirectory=${MOUNT_POINT}
 ExecStart=/opt/turnstone-venv/bin/turnstone-server --host 0.0.0.0 --port 8080 --config /etc/turnstone/config.toml
 Restart=always
 RestartSec=5s
@@ -339,15 +569,13 @@ Environment="TURNSTONE_SEARXNG_URL=http://${COORDINATOR_IP}:8081"
 Environment="TURNSTONE_CONFIG=/etc/turnstone/config.toml"
 Environment="TURNSTONE_DB_BACKEND=postgresql"
 Environment="TURNSTONE_DB_URL=postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}"
+Environment="TURNSTONE_STORAGE_DIR=${MOUNT_POINT}"
+Environment="TURNSTONE_SMB_MOUNT=${MOUNT_POINT}"
+Environment="TURNSTONE_WORKSPACE=${MOUNT_POINT}"
 EOF
 
-# Ensure /data working directory exists for turnstone user and remove stale SQLite DBs
-mkdir -p /data
-rm -f /data/.turnstone.db* 2>/dev/null || true
-chown -R turnstone:turnstone /data
-
-# Step 7: Reload and Restart Systemd Service
-log_info "Step 7: Enabling and restarting turnstone-server service..."
+# Step 9: Reload and Restart Systemd Service
+log_info "Step 9: Enabling and restarting turnstone-server service..."
 systemctl daemon-reload
 systemctl enable turnstone-server.service
 systemctl restart turnstone-server.service
@@ -367,3 +595,7 @@ echo -e "Node ID: ${NODE_ID}"
 echo -e "Advertise URL: http://${LAN_IP}:8080"
 echo -e "PostgreSQL Backend: ${POSTGRES_USER}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}"
 echo -e "Lemonade Backend: ${LEMONADE_URL}"
+echo -e "SMB Storage Mount: ${MOUNT_POINT} (${SMB_PATH})"
+echo -e "Homebrew Prefix: ${LOCAL_BREW_DIR}"
+echo -e "all-smi Utility: ${ALL_SMI_BIN} (sudo NOPASSWD enabled)"
+
