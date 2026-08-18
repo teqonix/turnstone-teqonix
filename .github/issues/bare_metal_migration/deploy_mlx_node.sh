@@ -41,6 +41,7 @@ JWT_SECRET="${JWT_SECRET:-}"
 SMB_PATH="${SMB_PATH:-}"
 SMB_USER="${SMB_USER:-}"
 SMB_PASSWORD="${SMB_PASSWORD:-}"
+TURNSTONE_USER="${TURNSTONE_USER:-}"
 
 usage() {
     echo "Usage: $0 [OPTIONS]"
@@ -49,9 +50,10 @@ usage() {
     echo "  -u, --user, --postgres-user <user> PostgreSQL username (e.g. turnstone-np, postgres)"
     echo "  -s, --secret-file <path>           Path to secret file containing DB connection string or env vars"
     echo "  -c, --coordinator <ip>             Coordinator VM IP address or hostname"
-    echo "      --smb-path <path>              Remote SMB path + protocol (e.g. smb://silo-14.lan/ai_playground)"
+    echo "      --smb-path <path>              Remote SMB path + protocol (e.g. smb://silo-14.lan/ai-playground)"
     echo "      --smb-user <user>              SMB username (e.g. turnstone-np)"
     echo "      --smb-pass <pass>              SMB password"
+    echo "      --turnstone-user <user>        Local system user [default: turnstone or current user]"
     echo "  -h, --help                         Display this help message and exit"
     exit 0
 }
@@ -80,6 +82,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --smb-pass|--smb-password)
             SMB_PASSWORD="$2"
+            shift 2
+            ;;
+        --turnstone-user|--local-user)
+            TURNSTONE_USER="$2"
             shift 2
             ;;
         -h|--help)
@@ -297,13 +303,13 @@ if [ -z "${JWT_SECRET}" ]; then
 fi
 
 if [ -z "${SMB_PATH}" ]; then
-    read -rp "Enter remote SMB storage path + protocol [default: smb://silo-14.lan/ai_playground]: " INPUT_SMB_PATH
-    SMB_PATH="${INPUT_SMB_PATH:-smb://silo-14.lan/ai_playground}"
+    read -rp "Enter remote SMB storage path + protocol [default: smb://silo-14.lan/ai-playground]: " INPUT_SMB_PATH
+    SMB_PATH="${INPUT_SMB_PATH:-smb://silo-14.lan/ai-playground}"
 fi
 
 parse_smb_path "${SMB_PATH}"
 SERVER_HOSTNAME="${SERVER_HOSTNAME:-silo-14.lan}"
-SHARE_NAME="${SHARE_NAME:-ai_playground}"
+SHARE_NAME="${SHARE_NAME:-ai-playground}"
 
 if [ -z "${SMB_USER}" ]; then
     read -rp "Enter SMB username to connect as [default: turnstone-np]: " INPUT_SMB_USER
@@ -332,6 +338,22 @@ fi
 log_success "Package manager verified."
 
 # Step 3: Set up MLX and Turnstone Virtual Environments
+if [ -z "${TURNSTONE_USER}" ]; then
+    if id "turnstone" &>/dev/null; then
+        TURNSTONE_USER="turnstone"
+    else
+        TURNSTONE_USER="$(whoami)"
+    fi
+fi
+
+if [ "${TURNSTONE_USER}" = "$(whoami)" ]; then
+    USER_HOME="${HOME}"
+else
+    USER_HOME="$(dscl . -read "/Users/${TURNSTONE_USER}" NFSHomeDirectory 2>/dev/null | awk '{print $2}' || eval echo "~${TURNSTONE_USER}")"
+fi
+
+mkdir -p "${USER_HOME}"
+
 VENV_DIR="$HOME/.local/share/turnstone-venv"
 log_info "Step 3: Creating virtual environment at ${VENV_DIR}..."
 mkdir -p "$HOME/.local/share"
@@ -346,6 +368,92 @@ else
     uv pip install --python "${VENV_DIR}" mlx-lm turnstone "psycopg[binary]"
 fi
 log_success "MLX and Turnstone installed successfully."
+
+# Step 3b: Install Local Homebrew & all-smi Hardware Monitor for Turnstone User
+LOCAL_BREW_DIR="${USER_HOME}/.homebrew"
+log_info "Checking local Homebrew installation in ${LOCAL_BREW_DIR}..."
+if [ ! -x "${LOCAL_BREW_DIR}/bin/brew" ]; then
+    log_info "Installing standalone Homebrew into ${LOCAL_BREW_DIR} for '${TURNSTONE_USER}'..."
+    rm -rf "${LOCAL_BREW_DIR}"
+    if [ "$(whoami)" = "${TURNSTONE_USER}" ]; then
+        git clone --depth=1 https://github.com/Homebrew/brew "${LOCAL_BREW_DIR}"
+    else
+        sudo -u "${TURNSTONE_USER}" git clone --depth=1 https://github.com/Homebrew/brew "${LOCAL_BREW_DIR}"
+    fi
+fi
+
+if [ "$(whoami)" != "${TURNSTONE_USER}" ]; then
+    sudo chown -R "${TURNSTONE_USER}" "${LOCAL_BREW_DIR}" 2>/dev/null || true
+fi
+
+# Persist Homebrew environment across all future shell sessions
+BREW_ENV_CMD="eval \"\$(${LOCAL_BREW_DIR}/bin/brew shellenv)\""
+for rc_file in "${USER_HOME}/.zprofile" "${USER_HOME}/.zshrc" "${USER_HOME}/.bash_profile" "${USER_HOME}/.bashrc"; do
+    if [ ! -f "${rc_file}" ]; then
+        if [ "$(whoami)" = "${TURNSTONE_USER}" ]; then
+            touch "${rc_file}"
+        else
+            sudo -u "${TURNSTONE_USER}" touch "${rc_file}" 2>/dev/null || true
+        fi
+    fi
+    if ! grep -qF "${LOCAL_BREW_DIR}/bin/brew shellenv" "${rc_file}" 2>/dev/null; then
+        if [ "$(whoami)" = "${TURNSTONE_USER}" ]; then
+            echo "" >> "${rc_file}"
+            echo "# Homebrew environment" >> "${rc_file}"
+            echo "${BREW_ENV_CMD}" >> "${rc_file}"
+        else
+            sudo -u "${TURNSTONE_USER}" bash -c "echo '' >> '${rc_file}'; echo '# Homebrew environment' >> '${rc_file}'; echo 'eval \"\$(${LOCAL_BREW_DIR}/bin/brew shellenv)\"' >> '${rc_file}'" 2>/dev/null || true
+        fi
+    fi
+done
+
+# Install all-smi via Homebrew
+log_info "Installing all-smi utility via Homebrew for user '${TURNSTONE_USER}'..."
+if [ "$(whoami)" = "${TURNSTONE_USER}" ]; then
+    eval "$(${LOCAL_BREW_DIR}/bin/brew shellenv)"
+    brew tap lablup/tap --quiet 2>/dev/null || true
+    brew install lablup/tap/all-smi || brew install all-smi
+else
+    sudo -u "${TURNSTONE_USER}" -H bash -c "
+        eval \"\$(${LOCAL_BREW_DIR}/bin/brew shellenv)\"
+        brew tap lablup/tap --quiet 2>/dev/null || true
+        brew install lablup/tap/all-smi || brew install all-smi
+    "
+fi
+
+ALL_SMI_BIN="${LOCAL_BREW_DIR}/bin/all-smi"
+if [ -x "${ALL_SMI_BIN}" ]; then
+    sudo mkdir -p /usr/local/bin 2>/dev/null || true
+    sudo ln -sfn "${ALL_SMI_BIN}" /usr/local/bin/all-smi 2>/dev/null || true
+    log_success "all-smi utility successfully installed at ${ALL_SMI_BIN} (symlinked to /usr/local/bin/all-smi)."
+fi
+
+# Configure Passwordless Sudo for all-smi
+log_info "Configuring passwordless sudo for '${TURNSTONE_USER}' to execute all-smi..."
+SUDOERS_FILE="/etc/sudoers.d/turnstone-all-smi"
+TMP_SUDOERS="$(mktemp -t sudoers-all-smi-XXXXXX 2>/dev/null || mktemp /tmp/sudoers-all-smi-XXXXXX)"
+cat > "${TMP_SUDOERS}" <<EOF
+# Allow ${TURNSTONE_USER} to execute all-smi with sudo without a password
+${TURNSTONE_USER} ALL=(ALL) NOPASSWD: ${ALL_SMI_BIN}, /usr/local/bin/all-smi
+EOF
+chmod 0440 "${TMP_SUDOERS}"
+
+if command -v visudo &>/dev/null; then
+    if sudo visudo -cf "${TMP_SUDOERS}" 2>/dev/null || visudo -cf "${TMP_SUDOERS}" 2>/dev/null; then
+        sudo mkdir -p /etc/sudoers.d 2>/dev/null || true
+        sudo cp "${TMP_SUDOERS}" "${SUDOERS_FILE}"
+        sudo chmod 0440 "${SUDOERS_FILE}"
+        log_success "Passwordless sudo configured and validated: ${SUDOERS_FILE}"
+    else
+        log_warn "visudo validation failed on temporary sudoers rule; skipping sudoers file installation."
+    fi
+else
+    sudo mkdir -p /etc/sudoers.d 2>/dev/null || true
+    sudo cp "${TMP_SUDOERS}" "${SUDOERS_FILE}"
+    sudo chmod 0440 "${SUDOERS_FILE}"
+    log_success "Passwordless sudo configured: ${SUDOERS_FILE}"
+fi
+rm -f "${TMP_SUDOERS}"
 
 # Step 4: Configure ~/.config/turnstone/config.toml
 CONFIG_DIR="$HOME/.config/turnstone"
@@ -508,6 +616,8 @@ cat > "${SERVER_PLIST}" <<EOF
         <string>${MOUNT_POINT}</string>
         <key>TURNSTONE_SMB_MOUNT</key>
         <string>${MOUNT_POINT}</string>
+        <key>TURNSTONE_WORKSPACE</key>
+        <string>${MOUNT_POINT}</string>
     </dict>
     <key>ProgramArguments</key>
     <array>
@@ -543,3 +653,6 @@ echo -e "Advertise URL: http://${LAN_IP}:8080"
 echo -e "PostgreSQL Backend: ${POSTGRES_USER}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}"
 echo -e "MLX Server API: http://127.0.0.1:8000/v1 (384k Context Window)"
 echo -e "SMB Storage Mount: ${MOUNT_POINT} (${SMB_PATH})"
+echo -e "Homebrew Prefix: ${LOCAL_BREW_DIR}"
+echo -e "all-smi Utility: ${ALL_SMI_BIN} (sudo NOPASSWD enabled)"
+
