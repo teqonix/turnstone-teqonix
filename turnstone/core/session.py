@@ -9755,6 +9755,39 @@ class ChatSession:
     # _MAX_RETRIES above.
     _MID_STREAM_RETRIES = 2
     _RETRY_BASE_DELAY = 1.0  # seconds
+    _RETRY_MAX_DELAY = 30.0  # seconds ceiling on exponential backoff
+
+    def _get_max_retries(self) -> int:
+        """Effective creation-ladder retry budget.
+
+        Reads from ``health.failure_threshold`` setting when configured in
+        ConfigStore or HealthTrackerRegistry, falling back to ``self._MAX_RETRIES``.
+        Direct instance overrides (e.g. ``session._MAX_RETRIES = 0`` in tests)
+        take precedence.
+        """
+        if "_MAX_RETRIES" in self.__dict__:
+            return self.__dict__["_MAX_RETRIES"]
+        cs = getattr(self, "_config_store", None)
+        if cs is not None:
+            try:
+                val = cs.get("health.failure_threshold")
+                if isinstance(val, int) and val > 0:
+                    return val
+            except Exception:
+                log.debug("health.failure_threshold read failed", exc_info=True)
+        if self._health_registry is not None:
+            val = getattr(self._health_registry, "_failure_threshold", None)
+            if isinstance(val, int) and val > 0:
+                return val
+        return self._MAX_RETRIES
+
+    # Chunked-compaction tuning (see _summarize_blocks / _summary_input_budget_chars).
+    _SUMMARY_SAFETY_MARGIN = 0.05  # fraction of context_window held back
+    _SUMMARY_BUDGET_FRACTION = 0.75  # derate for the uncalibrated _chars_per_token
+    _MAX_SUMMARY_DEPTH = 5  # recursion ceiling before bailing
+    _MIN_SUMMARY_BUDGET_CHARS = 2000  # floor so a tiny window still makes progress
+    _MIN_SUMMARY_OUTPUT_TOKENS = 512  # floor on summary output even on a tiny window
+    _MIN_CARRY_BUDGET_CHARS = 2000  # floor on verbatim carry (ask quote / wind-down spill)
 
     def _get_health_tracker(self) -> BackendHealthTracker | None:
         """Get the health tracker for this session's current backend.
@@ -9973,9 +10006,9 @@ class ChatSession:
         creation, summary, task_agent, mid-stream re-issue): stop on a
         non-retryable error class, a deterministic context-overflow (retrying
         an identical oversized payload is pointless), or ladder exhaustion.
-        *max_retries* overrides the creation ladder's ``_MAX_RETRIES`` for
+        *max_retries* overrides the creation ladder's effective retry cap for
         loops with their own cap (``_MID_STREAM_RETRIES``)."""
-        cap = self._MAX_RETRIES if max_retries is None else max_retries
+        cap = self._get_max_retries() if max_retries is None else max_retries
         return not lane_error_is_retryable(lane, exc) or _is_ctx_overflow(exc) or attempt == cap
 
     def _model_turn_with_retry(
@@ -10021,7 +10054,8 @@ class ChatSession:
             safe_url,
         )
         last_err: Exception | None = None
-        for attempt in range(self._MAX_RETRIES + 1):
+        max_retries = self._get_max_retries()
+        for attempt in range(max_retries + 1):
             self._check_cancelled(my_generation)
             ref = _CancelRef(self, my_generation, on_first_append=consumer.on_stream_armed)
             # Attachment fallbacks can make their own model call (perception)
@@ -10096,7 +10130,7 @@ class ChatSession:
                 log.warning(
                     "API error (attempt %d/%d): %s (cause=%s) provider=%s model=%s base_url=%s",
                     attempt + 1,
-                    self._MAX_RETRIES + 1,
+                    max_retries + 1,
                     ename,
                     cause_name,
                     diagnostics.provider_type,
@@ -10106,7 +10140,7 @@ class ChatSession:
                 log.debug(
                     "API error details (attempt %d/%d)",
                     attempt + 1,
-                    self._MAX_RETRIES + 1,
+                    max_retries + 1,
                     exc_info=True,
                 )
                 if self._stop_retrying(e, attempt, lane):
@@ -10115,7 +10149,7 @@ class ChatSession:
                     # immediately rather than burn backoff sleeps.
                     raise
                 last_err = e
-                delay = self._RETRY_BASE_DELAY * (2**attempt)
+                delay = min(self._RETRY_BASE_DELAY * (2**attempt), self._RETRY_MAX_DELAY)
                 if not self._publish_for_generation(
                     my_generation,
                     functools.partial(
@@ -14907,7 +14941,7 @@ class ChatSession:
                     last_stream_death = e
                     # Delay from the PRE-increment attempt index — the same
                     # convention as the sibling ladders' range loops.
-                    delay = self._RETRY_BASE_DELAY * (2**attempt)
+                    delay = min(self._RETRY_BASE_DELAY * (2**attempt), self._RETRY_MAX_DELAY)
                     attempt += 1
                     cause = type(e.__cause__).__name__ if e.__cause__ else type(e).__name__
                     log.warning(
@@ -25498,7 +25532,8 @@ class ChatSession:
             # invariant across attempts (the retry path only sleeps and
             # re-sends).
             last_err: Exception | None = None
-            for attempt in range(self._MAX_RETRIES + 1):
+            max_retries = self._get_max_retries()
+            for attempt in range(max_retries + 1):
                 try:
                     cancel_scope.check()
                     agent_result = model_turn(
@@ -25561,7 +25596,7 @@ class ChatSession:
                         # context-limit handler below, no backoff.
                         raise
                     last_err = e
-                    delay = self._RETRY_BASE_DELAY * (2**attempt)
+                    delay = min(self._RETRY_BASE_DELAY * (2**attempt), self._RETRY_MAX_DELAY)
                     self.ui.on_info(f"[{label} retrying in {delay:.0f}s: {ename}]")
                     # Cancel-aware backoff: a Stop mid-agent-retry aborts
                     # the run instead of burning the delay + one more call.
