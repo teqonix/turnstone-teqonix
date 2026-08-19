@@ -750,7 +750,8 @@ cat > "${MLX_PLIST}" <<EOF
     <array>
         <string>${VENV_DIR}/bin/python</string>
         <string>-m</string>
-        <string>mlx_lm.server</string>
+        <string>mlx_lm</string>
+        <string>server</string>
         <string>--model</string>
         <string>mlx-community/Qwen3-Coder-Next-6bit</string>
         <string>--host</string>
@@ -775,7 +776,7 @@ log_success "MLX Server system daemon loaded."
 
 # Step 6b: Setup Ollama Launchd Daemon (Multi-Model Swapping Engine on Port 11434)
 OLLAMA_PLIST="${SYSTEM_DAEMONS_DIR}/com.turnstone.ollama.plist"
-log_info "Step 6b: Configuring Ollama system daemon on port 11434..."
+log_info "Step 6b: Configuring Ollama system daemon on port 11434 (Memory Capped: 50GB)..."
 
 cat > "${OLLAMA_PLIST}" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -803,9 +804,21 @@ cat > "${OLLAMA_PLIST}" <<EOF
         <key>OLLAMA_MODELS</key>
         <string>${USER_HOME}/.ollama/models</string>
         <key>OLLAMA_KEEP_ALIVE</key>
-        <string>1h</string>
+        <string>5m</string>
         <key>OLLAMA_NUM_PARALLEL</key>
         <string>1</string>
+        <key>OLLAMA_MAX_LOADED_MODELS</key>
+        <string>1</string>
+    </dict>
+    <key>HardResourceLimits</key>
+    <dict>
+        <key>ResidentSetSize</key>
+        <integer>53687091200</integer>
+    </dict>
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>ResidentSetSize</key>
+        <integer>53687091200</integer>
     </dict>
     <key>ProgramArguments</key>
     <array>
@@ -858,6 +871,9 @@ run_as_target_user "
 
     echo 'Pulling Gemma 4 31B model into Ollama...'
     ollama pull gemma4:31b-8bit 2>/dev/null || ollama pull gemma4:31b 2>/dev/null || ollama pull gemma4:latest 2>/dev/null || ollama pull gemma:31b 2>/dev/null || true
+
+    echo 'Pulling Ornith Latest model into Ollama...'
+    ollama pull ornith:latest 2>/dev/null || true
 "
 log_success "Ollama models pulled successfully."
 
