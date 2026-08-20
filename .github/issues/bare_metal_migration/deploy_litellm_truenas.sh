@@ -594,6 +594,7 @@ model_list:
       api_key: "dummy"
       max_parallel_requests: 1
       rpm: 300
+      order: 1
 
   - model_name: "gemma-4-31b"
     litellm_params:
@@ -602,6 +603,7 @@ model_list:
       api_key: "dummy"
       max_parallel_requests: 1
       rpm: 300
+      order: 2
 
   - model_name: "gemma-4-31b"
     litellm_params:
@@ -610,6 +612,7 @@ model_list:
       api_key: "dummy"
       max_parallel_requests: 1
       rpm: 300
+      order: 3
 
   # ---------------------------------------------------------------------------
   # 2. Qwen 3.8 27B (High Precision Reasoning / Coding)
@@ -622,6 +625,7 @@ model_list:
       api_key: "dummy"
       max_parallel_requests: 1
       rpm: 300
+      order: 1
 
   - model_name: "qwen-3.8-27b"
     litellm_params:
@@ -630,6 +634,7 @@ model_list:
       api_key: "dummy"
       max_parallel_requests: 1
       rpm: 300
+      order: 2
 
   - model_name: "qwen-3.8-27b"
     litellm_params:
@@ -638,6 +643,7 @@ model_list:
       api_key: "dummy"
       max_parallel_requests: 1
       rpm: 300
+      order: 3
 
   # ---------------------------------------------------------------------------
   # 3. Qwen 3 Coder Next (Deep 128k Context Coding Model)
@@ -661,8 +667,9 @@ model_list:
       model: "openai/Nemotron-3-Nano-30B-A3B-GGUF"
       api_base: "${NODE_RYZEN_TWO}"
       api_key: "dummy"
-      max_parallel_requests: 3
+      max_parallel_requests: 1
       rpm: 600
+      order: 1
 
   - model_name: "nemotron-3-nano"
     litellm_params:
@@ -671,6 +678,7 @@ model_list:
       api_key: "dummy"
       max_parallel_requests: 1
       rpm: 300
+      order: 2
 
   # ---------------------------------------------------------------------------
   # 5. Ornith Latest (Fast Agentic Model / Tool Calling)

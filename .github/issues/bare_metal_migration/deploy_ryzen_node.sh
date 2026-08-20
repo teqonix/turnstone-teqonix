@@ -512,7 +512,12 @@ chmod +x "${VENV_DIR}/bin"/* 2>/dev/null || true
 log_success "Virtualenv created and permissions secured at ${VENV_DIR}."
 
 # Step 5b: Install Local Homebrew & all-smi Hardware Monitor for Turnstone User
-LOCAL_BREW_DIR="${USER_HOME}/.linuxbrew"
+if [ -d "/home/linuxbrew/.linuxbrew" ]; then
+    LOCAL_BREW_DIR="/home/linuxbrew/.linuxbrew"
+else
+    LOCAL_BREW_DIR="${USER_HOME}/.linuxbrew"
+fi
+
 log_info "Checking local Homebrew installation in ${LOCAL_BREW_DIR}..."
 if [ ! -x "${LOCAL_BREW_DIR}/bin/brew" ]; then
     log_info "Installing standalone Homebrew into ${LOCAL_BREW_DIR} for '${TURNSTONE_USER_DEBIAN}'..."
@@ -555,7 +560,7 @@ SUDOERS_FILE="/etc/sudoers.d/turnstone-all-smi"
 mkdir -p /etc/sudoers.d
 cat > "${SUDOERS_FILE}" <<EOF
 # Allow ${TURNSTONE_USER_DEBIAN} to execute all-smi with sudo without a password
-${TURNSTONE_USER_DEBIAN} ALL=(ALL) NOPASSWD: ${ALL_SMI_BIN}, /usr/local/bin/all-smi
+${TURNSTONE_USER_DEBIAN} ALL=(ALL) NOPASSWD: ${ALL_SMI_BIN}, /usr/local/bin/all-smi, /home/linuxbrew/.linuxbrew/bin/all-smi
 EOF
 chmod 0440 "${SUDOERS_FILE}"
 
@@ -569,6 +574,32 @@ if command -v visudo &>/dev/null; then
 else
     log_success "Passwordless sudo configured: ${SUDOERS_FILE}"
 fi
+
+# Configure all-smi alias in shell profiles
+ALL_SMI_TARGET="${ALL_SMI_BIN}"
+if [ ! -x "${ALL_SMI_TARGET}" ]; then
+    if [ -x "/home/linuxbrew/.linuxbrew/bin/all-smi" ]; then
+        ALL_SMI_TARGET="/home/linuxbrew/.linuxbrew/bin/all-smi"
+    elif [ -x "/usr/local/bin/all-smi" ]; then
+        ALL_SMI_TARGET="/usr/local/bin/all-smi"
+    else
+        ALL_SMI_TARGET="/home/linuxbrew/.linuxbrew/bin/all-smi"
+    fi
+fi
+
+for rc_file in "${USER_HOME}/.bashrc" "${USER_HOME}/.profile"; do
+    if [ ! -f "${rc_file}" ]; then
+        touch "${rc_file}"
+        chown "${TURNSTONE_USER_DEBIAN}:${TURNSTONE_USER_DEBIAN}" "${rc_file}" 2>/dev/null || true
+    fi
+    if ! grep -qE 'alias all-smi=' "${rc_file}" 2>/dev/null; then
+        echo "" >> "${rc_file}"
+        echo "# all-smi hardware monitor alias with sudo" >> "${rc_file}"
+        echo "alias all-smi=\"sudo ${ALL_SMI_TARGET}\"" >> "${rc_file}"
+        chown "${TURNSTONE_USER_DEBIAN}:${TURNSTONE_USER_DEBIAN}" "${rc_file}" 2>/dev/null || true
+    fi
+done
+log_success "all-smi alias configured in ${USER_HOME}/.bashrc (alias all-smi=\"sudo ${ALL_SMI_TARGET}\")."
 
 # Step 5c: Install Rust / Cargo Toolchain & Jujutsu (jj-cli) for Turnstone User
 CARGO_DIR="${USER_HOME}/.cargo"
