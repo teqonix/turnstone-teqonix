@@ -163,39 +163,6 @@ parse_smb_path() {
     fi
 }
 
-find_secret_by_user() {
-    local target_user="$1"
-    [ -z "${target_user}" ] && return 0
-
-    local search_dirs=("${SCRIPT_DIR}/secrets" "${REPO_ROOT}/secrets")
-    local sanitized_user
-    sanitized_user=$(echo "${target_user}" | tr '-' '_')
-
-    for sdir in "${search_dirs[@]}"; do
-        if [ -d "${sdir}" ]; then
-            if [ -f "${sdir}/postgres_${sanitized_user}.secret" ]; then
-                echo "${sdir}/postgres_${sanitized_user}.secret"
-                return 0
-            elif [ -f "${sdir}/postgres_${target_user}.secret" ]; then
-                echo "${sdir}/postgres_${target_user}.secret"
-                return 0
-            elif [ -f "${sdir}/${target_user}.secret" ]; then
-                echo "${sdir}/${target_user}.secret"
-                return 0
-            fi
-
-            for f in "${sdir}"/*.secret "${sdir}"/*.env; do
-                [ -f "${f}" ] || continue
-                if grep -qE "://(${target_user}|${target_user}:)" "${f}" 2>/dev/null || \
-                   grep -qE "^[[:space:]]*(POSTGRES_USER|POSTGRES_ADMIN_USER)=[\"']?${target_user}[\"']?[[:space:]]*$" "${f}" 2>/dev/null; then
-                    echo "${f}"
-                    return 0
-                fi
-            done
-        fi
-    done
-}
-
 parse_connection_uri() {
     local raw_url="$1"
     raw_url=$(echo "${raw_url}" | tr -d '\r' | xargs)
@@ -221,7 +188,9 @@ parse_connection_uri() {
         fi
         
         local h="${hostport%%:*}"
-        [ -n "${h}" ] && POSTGRES_HOST="${h}"
+        if [ -n "${h}" ] && [ "${h}" != "localhost" ] && [ "${h}" != "127.0.0.1" ]; then
+            POSTGRES_HOST="${h}"
+        fi
 
         if [[ "${hostport}" == *":"* ]]; then
             local pt="${hostport#*:}"
@@ -230,37 +199,189 @@ parse_connection_uri() {
     fi
 }
 
-load_secrets() {
-    local target_file=""
+auto_load_all_secrets() {
+    local calling_user="${SUDO_USER:-$(whoami)}"
+    local calling_user_home
+    calling_user_home="$(getent passwd "${calling_user}" 2>/dev/null | cut -d: -f6 || echo "${HOME}")"
 
-    if [ -n "${SECRET_FILE}" ] && [ -f "${SECRET_FILE}" ]; then
-        target_file="${SECRET_FILE}"
-    elif [ -n "${POSTGRES_USER}" ]; then
-        local matched
-        matched=$(find_secret_by_user "${POSTGRES_USER}")
-        if [ -n "${matched}" ]; then
-            target_file="${matched}"
+    local search_dirs=(
+        "${SCRIPT_DIR}/secrets"
+        "${REPO_ROOT}/secrets"
+        "${REPO_ROOT}/.github/issues/bare_metal_migration/secrets"
+        "${SCRIPT_DIR}"
+        "${calling_user_home}/nerd_projects/turnstone-teqonix/.github/issues/bare_metal_migration/secrets"
+        "${calling_user_home}/nerd_projects/turnstone-teqonix/secrets"
+        "${HOME}/nerd_projects/turnstone-teqonix/.github/issues/bare_metal_migration/secrets"
+        "${HOME}/nerd_projects/turnstone-teqonix/secrets"
+        "/etc/turnstone"
+    )
+
+    # 1. PostgreSQL Secret Discovery & Parsing
+    if [ -z "${POSTGRES_PASSWORD:-}" ]; then
+        local pg_candidates=(
+            "turnstone_np_postgres.secret"
+            "turnstone_postgres.secret"
+            "postgres_turnstone_np.secret"
+            "turnstone_np.secret"
+            "turnstone.secret"
+            "postgres_admin.secret"
+            "postgres.secret"
+        )
+        if [ -n "${POSTGRES_USER:-}" ]; then
+            local sanitized_user
+            sanitized_user=$(echo "${POSTGRES_USER}" | tr '-' '_')
+            pg_candidates=("postgres_${sanitized_user}.secret" "postgres_${POSTGRES_USER}.secret" "${POSTGRES_USER}.secret" "${pg_candidates[@]}")
+        fi
+
+        local matched_pg=""
+        if [ -n "${SECRET_FILE:-}" ] && [ -s "${SECRET_FILE}" ]; then
+            matched_pg="${SECRET_FILE}"
+        fi
+
+        if [ -z "${matched_pg}" ]; then
+            for sdir in "${search_dirs[@]}"; do
+                [ -d "$sdir" ] || continue
+                for cand in "${pg_candidates[@]}"; do
+                    if [ -s "${sdir}/${cand}" ]; then
+                        matched_pg="${sdir}/${cand}"
+                        break 2
+                    fi
+                done
+                for f in "${sdir}"/*postgres*.secret "${sdir}"/*postgres*.env; do
+                    if [ -s "$f" ]; then
+                        matched_pg="$f"
+                        break 2
+                    fi
+                done
+            done
+        fi
+
+        if [ -n "${matched_pg}" ] && [ -f "${matched_pg}" ]; then
+            log_info "Auto-discovered PostgreSQL secret file: '${matched_pg}'"
+            local first_line
+            first_line=$(grep -v '^[[:space:]]*#' "${matched_pg}" | grep -v '^[[:space:]]*$' | tr -d '\r' | head -n 1 || true)
+            if [[ "${first_line}" == *"://"* ]] || [[ "${first_line}" == *"@"* ]]; then
+                parse_connection_uri "${first_line}"
+            elif [[ "${first_line}" == *"="* ]]; then
+                set +e
+                source "${matched_pg}"
+                set -e
+                POSTGRES_USER="${POSTGRES_USER:-${POSTGRES_ADMIN_USER:-turnstone-np}}"
+                POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-${POSTGRES_ADMIN_PASS:-}}"
+                [ -n "${PGHOST:-}" ] && POSTGRES_HOST="${PGHOST}"
+                [ -n "${PGPORT:-}" ] && POSTGRES_PORT="${PGPORT}"
+                [ -n "${PGDATABASE:-}" ] && POSTGRES_DB="${PGDATABASE}"
+            elif [ -n "${first_line}" ]; then
+                POSTGRES_PASSWORD="${first_line}"
+            fi
         fi
     fi
 
-    if [ -n "${target_file}" ] && [ -f "${target_file}" ]; then
-        log_info "Sourcing database connection credentials from '${target_file}'..."
-        local first_line
-        first_line=$(grep -v '^[[:space:]]*#' "${target_file}" | grep -v '^[[:space:]]*$' | tr -d '\r' | head -n 1 || true)
-        
-        if [[ "${first_line}" == *"://"* ]] || [[ "${first_line}" == *"@"* ]]; then
-            parse_connection_uri "${first_line}"
-        elif [[ "${first_line}" == *"="* ]]; then
-            set +e
-            source "${target_file}"
-            set -e
-            POSTGRES_USER="${POSTGRES_USER:-${POSTGRES_ADMIN_USER:-turnstone}}"
-            POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-${POSTGRES_ADMIN_PASS:-}}"
-            POSTGRES_HOST="${POSTGRES_HOST:-${PGHOST:-}}"
-            POSTGRES_PORT="${POSTGRES_PORT:-${PGPORT:-}}"
-            POSTGRES_DB="${POSTGRES_DB:-turnstone}"
+    # Normalize PostgreSQL parameters for worker node
+    if [ -z "${POSTGRES_HOST:-}" ] || [ "${POSTGRES_HOST}" = "localhost" ] || [ "${POSTGRES_HOST}" = "127.0.0.1" ]; then
+        POSTGRES_HOST="turnstone-postgres.lan"
+    fi
+    POSTGRES_USER="${POSTGRES_USER:-turnstone-np}"
+    POSTGRES_PORT="${POSTGRES_PORT:-5432}"
+    POSTGRES_DB="${POSTGRES_DB:-turnstone}"
+
+    # 2. SMB Storage Secret Discovery & Parsing
+    if [ -z "${SMB_PASSWORD:-}" ] || [ -z "${SMB_USER:-}" ] || [ -z "${SMB_PATH:-}" ]; then
+        local smb_candidates=(
+            "turnstone_np_smb.secret"
+            "turnstone_smb.secret"
+            "smb.secret"
+            "silo_14.secret"
+            "silo-14.secret"
+        )
+        local matched_smb=""
+        for sdir in "${search_dirs[@]}"; do
+            [ -d "$sdir" ] || continue
+            for cand in "${smb_candidates[@]}"; do
+                if [ -s "${sdir}/${cand}" ]; then
+                    matched_smb="${sdir}/${cand}"
+                    break 2
+                fi
+            done
+            for f in "${sdir}"/*smb*.secret "${sdir}"/*smb*.env; do
+                if [ -s "$f" ]; then
+                    matched_smb="$f"
+                    break 2
+                fi
+            done
+        done
+
+        if [ -n "${matched_smb}" ] && [ -f "${matched_smb}" ]; then
+            log_info "Auto-discovered SMB secret file: '${matched_smb}'"
+            local smb_line
+            smb_line=$(grep -v '^[[:space:]]*#' "${matched_smb}" | grep -v '^[[:space:]]*$' | tr -d '\r' | head -n 1 || true)
+            if [ -n "${smb_line}" ]; then
+                if [[ "${smb_line}" == *"://"* ]] || [[ "${smb_line}" == *"@"* ]] || [[ "${smb_line}" == *"\\"* ]] || [[ "${smb_line}" =~ ^smb ]]; then
+                    parse_smb_path "${smb_line}"
+                elif [[ "${smb_line}" == *"="* ]]; then
+                    set +e
+                    source "${matched_smb}"
+                    set -e
+                    SMB_USER="${SMB_USER:-turnstone-np}"
+                    SMB_PASSWORD="${SMB_PASSWORD:-${SMB_PASS:-}}"
+                    SMB_PATH="${SMB_PATH:-}"
+                else
+                    SMB_PASSWORD="${smb_line}"
+                fi
+            fi
         fi
     fi
+
+    SERVER_HOSTNAME="${SERVER_HOSTNAME:-silo-14.lan}"
+    SHARE_NAME="${SHARE_NAME:-ai-playground}"
+    SMB_USER="${SMB_USER:-turnstone-np}"
+    REMOTE_USERNAME="${SMB_USER}"
+    SMB_PATH="${SMB_PATH:-smb://${SERVER_HOSTNAME}/${SHARE_NAME}}"
+
+    # 3. JWT Secret Discovery & Parsing
+    if [ -z "${JWT_SECRET:-}" ]; then
+        local jwt_candidates=(
+            "jwt_secret.secret"
+            "turnstone_jwt.secret"
+            "jwt.secret"
+            "coordinator.secret"
+            "coordinator_turnstone.secret"
+        )
+        local matched_jwt=""
+        for sdir in "${search_dirs[@]}"; do
+            [ -d "$sdir" ] || continue
+            for cand in "${jwt_candidates[@]}"; do
+                if [ -s "${sdir}/${cand}" ]; then
+                    matched_jwt="${sdir}/${cand}"
+                    break 2
+                fi
+            done
+            for f in "${sdir}"/*jwt*.secret "${sdir}"/*jwt*.env; do
+                if [ -s "$f" ]; then
+                    matched_jwt="$f"
+                    break 2
+                fi
+            done
+        done
+
+        if [ -n "${matched_jwt}" ] && [ -f "${matched_jwt}" ]; then
+            log_info "Auto-discovered JWT secret file: '${matched_jwt}'"
+            local jwt_line
+            jwt_line=$(grep -v '^[[:space:]]*#' "${matched_jwt}" | grep -v '^[[:space:]]*$' | tr -d '\r' | head -n 1 || true)
+            if [[ "${jwt_line}" == *"="* ]]; then
+                JWT_SECRET="${jwt_line#*=}"
+                JWT_SECRET="${JWT_SECRET#\"}"
+                JWT_SECRET="${JWT_SECRET%\"}"
+                JWT_SECRET="${JWT_SECRET#\'}"
+                JWT_SECRET="${JWT_SECRET%\'}"
+            else
+                JWT_SECRET="${jwt_line}"
+            fi
+        fi
+    fi
+
+    # 4. Coordinator Host
+    COORDINATOR_IP="${COORDINATOR_IP:-turnstone-coordinator-nerd-projects.lan}"
 }
 
 echo -e "${BLUE}=================================================================${NC}"
@@ -275,37 +396,18 @@ if [ "$EUID" -ne 0 ]; then
 fi
 log_success "Permissions verified."
 
-# Step 2: Prompt / Environment Inputs
+# Step 2: Auto-Load Secrets & Prompt for Missing Inputs
+auto_load_all_secrets
+
 if [ -z "${NODE_ID}" ]; then
-    read -rp "Enter Node ID (e.g. ryzen-halo-1 or ryzen-halo-2): " NODE_ID
-fi
-
-if [ -z "${SECRET_FILE}" ]; then
-    if [ -z "${POSTGRES_USER}" ]; then
-        read -rp "Enter PostgreSQL username [default: turnstone-np]: " INPUT_USER
-        POSTGRES_USER="${INPUT_USER:-turnstone-np}"
-    fi
-
-    MATCHED_SECRET=$(find_secret_by_user "${POSTGRES_USER}")
-    if [ -n "${MATCHED_SECRET}" ]; then
-        log_info "Found matching secret file '${MATCHED_SECRET}' for PostgreSQL user '${POSTGRES_USER}'."
-        SECRET_FILE="${MATCHED_SECRET}"
+    local_host="$(hostname -s 2>/dev/null || echo "")"
+    if [[ "${local_host}" =~ ^(ryzen-halo-[0-9]+|ryzen-[a-zA-Z0-9_-]+)$ ]]; then
+        NODE_ID="${local_host}"
+        log_info "Auto-detected Node ID from hostname: '${NODE_ID}'"
+    else
+        read -rp "Enter Node ID (e.g. ryzen-halo-1 or ryzen-halo-2): " NODE_ID
     fi
 fi
-
-load_secrets
-
-if [ -z "${COORDINATOR_IP}" ]; then
-    read -rp "Enter Coordinator VM IP Address / Hostname [default: turnstone-coordinator-nerd-projects.lan]: " INPUT_COORD
-    COORDINATOR_IP="${INPUT_COORD:-turnstone-coordinator-nerd-projects.lan}"
-fi
-if [ -z "${POSTGRES_HOST}" ]; then
-    read -rp "Enter PostgreSQL DB Host IP / Hostname [default: turnstone-postgres.lan]: " INPUT_PGHOST
-    POSTGRES_HOST="${INPUT_PGHOST:-turnstone-postgres.lan}"
-fi
-POSTGRES_USER="${POSTGRES_USER:-turnstone-np}"
-POSTGRES_PORT="${POSTGRES_PORT:-5432}"
-POSTGRES_DB="${POSTGRES_DB:-turnstone}"
 
 if [ -z "${POSTGRES_PASSWORD}" ]; then
     read -r -s -p "Enter PostgreSQL Password for user '${POSTGRES_USER}'@'${POSTGRES_HOST}': " POSTGRES_PASSWORD
@@ -316,21 +418,6 @@ if [ -z "${JWT_SECRET}" ]; then
     read -rp "Enter TURNSTONE_JWT_SECRET from Coordinator setup: " JWT_SECRET
 fi
 
-if [ -z "${SMB_PATH}" ]; then
-    read -rp "Enter remote SMB storage path + protocol [default: smb://silo-14.lan/ai-playground]: " INPUT_SMB_PATH
-    SMB_PATH="${INPUT_SMB_PATH:-smb://silo-14.lan/ai-playground}"
-fi
-
-parse_smb_path "${SMB_PATH}"
-SERVER_HOSTNAME="${SERVER_HOSTNAME:-silo-14.lan}"
-SHARE_NAME="${SHARE_NAME:-ai-playground}"
-
-if [ -z "${SMB_USER}" ]; then
-    read -rp "Enter SMB username to connect as [default: turnstone-np]: " INPUT_SMB_USER
-    SMB_USER="${INPUT_SMB_USER:-turnstone-np}"
-fi
-REMOTE_USERNAME="${SMB_USER}"
-
 if [ -z "${SMB_PASSWORD}" ]; then
     read -r -s -p "Enter SMB Password for '${REMOTE_USERNAME}'@'${SERVER_HOSTNAME}': " SMB_PASSWORD
     echo ""
@@ -338,7 +425,10 @@ fi
 
 MOUNT_POINT="/home/${TURNSTONE_USER_DEBIAN}/${SERVER_HOSTNAME}/${SHARE_NAME}"
 
-LAN_IP=$(hostname -I | awk '{print $1}')
+LAN_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || hostname -i 2>/dev/null | awk '{print $1}' || echo "127.0.0.1")
+[ -z "${LAN_IP}" ] && LAN_IP="127.0.0.1"
+
+log_success "Configured credentials for PostgreSQL (${POSTGRES_USER}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}) and SMB (${SMB_PATH})."
 
 # Step 3: Check and Install RyzenAdj Power Management Utility
 log_info "Step 3: Checking for ryzenadj power management utility..."
@@ -480,6 +570,78 @@ else
     log_success "Passwordless sudo configured: ${SUDOERS_FILE}"
 fi
 
+# Step 5c: Install Rust / Cargo Toolchain & Jujutsu (jj-cli) for Turnstone User
+CARGO_DIR="${USER_HOME}/.cargo"
+CARGO_BIN="${CARGO_DIR}/bin/cargo"
+JJ_BIN="${CARGO_DIR}/bin/jj"
+BINSTALL_BIN="${CARGO_DIR}/bin/cargo-binstall"
+
+log_info "Step 5c: Checking Rust / Cargo toolchain and Jujutsu (jj-cli) for '${TURNSTONE_USER_DEBIAN}'..."
+
+# 1. Install Rust & Cargo via rustup if not present
+if [ ! -x "${CARGO_BIN}" ] && ! command -v cargo &>/dev/null; then
+    log_info "Installing Rust and Cargo toolchain via rustup for '${TURNSTONE_USER_DEBIAN}'..."
+    sudo -u "${TURNSTONE_USER_DEBIAN}" -H bash -c "
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile default --no-modify-path
+    "
+    log_success "Rust & Cargo toolchain installed."
+else
+    log_success "Rust & Cargo is already installed."
+fi
+
+# 2. Persist Cargo environment in shell profiles
+for rc_file in "${USER_HOME}/.bashrc" "${USER_HOME}/.profile"; do
+    if [ ! -f "${rc_file}" ]; then
+        touch "${rc_file}"
+        chown "${TURNSTONE_USER_DEBIAN}:${TURNSTONE_USER_DEBIAN}" "${rc_file}" 2>/dev/null || true
+    fi
+    if ! grep -qF ".cargo/bin" "${rc_file}" 2>/dev/null; then
+        echo "" >> "${rc_file}"
+        echo "# Rust / Cargo environment" >> "${rc_file}"
+        echo "export PATH=\"\${HOME}/.cargo/bin:\$PATH\"" >> "${rc_file}"
+        echo "[ -f \"\${HOME}/.cargo/env\" ] && source \"\${HOME}/.cargo/env\"" >> "${rc_file}"
+    fi
+done
+
+# 3. Install cargo-binstall for binary crate distribution
+if [ ! -x "${BINSTALL_BIN}" ] && ! command -v cargo-binstall &>/dev/null; then
+    log_info "Installing cargo-binstall binary provider for '${TURNSTONE_USER_DEBIAN}'..."
+    sudo -u "${TURNSTONE_USER_DEBIAN}" -H bash -c "
+        export PATH=\"${CARGO_DIR}/bin:\$PATH\"
+        curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash || \
+        cargo install cargo-binstall --locked || true
+    "
+fi
+
+# 4. Install Jujutsu (jj-cli) using cargo binstall
+if [ ! -x "${JJ_BIN}" ] && ! command -v jj &>/dev/null; then
+    log_info "Installing Jujutsu (jj-cli) via cargo binstall for '${TURNSTONE_USER_DEBIAN}'..."
+    sudo -u "${TURNSTONE_USER_DEBIAN}" -H bash -c "
+        export PATH=\"${CARGO_DIR}/bin:\$PATH\"
+        if [ -x \"${BINSTALL_BIN}\" ] || command -v cargo-binstall &>/dev/null; then
+            cargo binstall -y --strategies crate-meta-data jj-cli || cargo install --locked jj-cli
+        else
+            cargo install --locked jj-cli
+        fi
+    "
+else
+    log_success "Jujutsu (jj) is already installed."
+fi
+
+# 5. Ensure permissions and create symlinks in /usr/local/bin
+chown -R "${TURNSTONE_USER_DEBIAN}:${TURNSTONE_USER_DEBIAN}" "${CARGO_DIR}" "${USER_HOME}/.rustup" 2>/dev/null || true
+mkdir -p /usr/local/bin
+for bin_tool in cargo rustc rustup cargo-binstall jj; do
+    if [ -x "${CARGO_DIR}/bin/${bin_tool}" ]; then
+        ln -sfn "${CARGO_DIR}/bin/${bin_tool}" "/usr/local/bin/${bin_tool}"
+    fi
+done
+
+if [ -x "${JJ_BIN}" ] || command -v jj &>/dev/null; then
+    JJ_VER="$(sudo -u "${TURNSTONE_USER_DEBIAN}" -H bash -c "export PATH=\"${CARGO_DIR}/bin:\$PATH\"; jj --version 2>/dev/null" || echo "installed")"
+    log_success "Jujutsu VCS ready: ${JJ_VER} (symlinked to /usr/local/bin/jj)."
+fi
+
 # Step 6: Configure /etc/turnstone/config.toml Secrets
 log_info "Step 6: Writing secrets configuration to /etc/turnstone/config.toml..."
 mkdir -p /etc/turnstone
@@ -562,6 +724,7 @@ EOF
 mkdir -p /etc/systemd/system/turnstone-server.service.d
 cat > /etc/systemd/system/turnstone-server.service.d/node.conf <<EOF
 [Service]
+Environment="PATH=/opt/turnstone-venv/bin:${CARGO_DIR}/bin:${LOCAL_BREW_DIR}/bin:/usr/local/bin:/usr/bin:/bin"
 Environment="TURNSTONE_NODE_ID=${NODE_ID}"
 Environment="TURNSTONE_ADVERTISE_URL=http://${LAN_IP}:8080"
 Environment="TURNSTONE_CONSOLE_URL=http://${COORDINATOR_IP}:8090"
@@ -598,4 +761,7 @@ echo -e "Lemonade Backend: ${LEMONADE_URL}"
 echo -e "SMB Storage Mount: ${MOUNT_POINT} (${SMB_PATH})"
 echo -e "Homebrew Prefix: ${LOCAL_BREW_DIR}"
 echo -e "all-smi Utility: ${ALL_SMI_BIN} (sudo NOPASSWD enabled)"
+echo -e "Rust / Cargo: ${CARGO_DIR}/bin/cargo (symlinked to /usr/local/bin/cargo)"
+echo -e "Jujutsu (jj): ${JJ_BIN} (symlinked to /usr/local/bin/jj)"
+
 

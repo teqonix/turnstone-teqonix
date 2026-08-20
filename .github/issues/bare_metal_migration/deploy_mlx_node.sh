@@ -568,6 +568,67 @@ else
 fi
 rm -f "${TMP_SUDOERS}"
 
+# Step 3c: Install Rust / Cargo Toolchain & Jujutsu (jj-cli) for Turnstone User
+CARGO_DIR="${USER_HOME}/.cargo"
+CARGO_BIN="${CARGO_DIR}/bin/cargo"
+JJ_BIN="${CARGO_DIR}/bin/jj"
+BINSTALL_BIN="${CARGO_DIR}/bin/cargo-binstall"
+
+log_info "Step 3c: Checking Rust / Cargo toolchain and Jujutsu (jj-cli) for user '${TURNSTONE_USER}'..."
+
+# 1. Install Rust & Cargo via rustup if not present
+run_as_target_user "
+    export PATH=\"\${HOME}/.cargo/bin:\$PATH\"
+    if ! command -v cargo &>/dev/null && [ ! -x \"\${HOME}/.cargo/bin/cargo\" ]; then
+        echo 'Installing Rust and Cargo toolchain via rustup...'
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile default --no-modify-path
+        rustup default stable
+    fi
+"
+
+# 2. Persist Cargo environment across future shell sessions
+CARGO_PATH_CMD="export PATH=\"${CARGO_DIR}/bin:\$PATH\""
+for rc_file in "${USER_HOME}/.zprofile" "${USER_HOME}/.zshrc" "${USER_HOME}/.bash_profile" "${USER_HOME}/.bashrc"; do
+    run_as_target_user "touch '${rc_file}'"
+    if ! grep -qF ".cargo/bin" "${rc_file}" 2>/dev/null; then
+        run_as_target_user "printf '\n# Rust / Cargo environment\n%s\n[ -f \"%s/.cargo/env\" ] && source \"%s/.cargo/env\"\n' '${CARGO_PATH_CMD}' '${USER_HOME}' '${USER_HOME}' >> '${rc_file}'"
+    fi
+done
+
+# 3. Install cargo-binstall for binary crate distribution
+run_as_target_user "
+    export PATH=\"\${HOME}/.cargo/bin:\$PATH\"
+    if ! command -v cargo-binstall &>/dev/null && [ ! -x \"\${HOME}/.cargo/bin/cargo-binstall\" ]; then
+        echo 'Installing cargo-binstall binary provider...'
+        curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash || \
+        cargo install cargo-binstall --locked || true
+    fi
+"
+
+# 4. Install Jujutsu (jj-cli) using cargo binstall
+run_as_target_user "
+    export PATH=\"\${HOME}/.cargo/bin:\$PATH\"
+    if ! command -v jj &>/dev/null && [ ! -x \"\${HOME}/.cargo/bin/jj\" ]; then
+        echo 'Installing Jujutsu (jj-cli) via cargo binstall...'
+        if [ -x \"\${HOME}/.cargo/bin/cargo-binstall\" ] || command -v cargo-binstall &>/dev/null; then
+            cargo binstall -y --strategies crate-meta-data jj-cli || cargo install --locked jj-cli
+        else
+            cargo install --locked jj-cli
+        fi
+    fi
+"
+
+# 5. Create global symlinks in /usr/local/bin
+sudo mkdir -p /usr/local/bin 2>/dev/null || true
+for tool_bin in cargo rustc rustup cargo-binstall jj; do
+    if [ -x "${CARGO_DIR}/bin/${tool_bin}" ]; then
+        sudo ln -sfn "${CARGO_DIR}/bin/${tool_bin}" "/usr/local/bin/${tool_bin}" 2>/dev/null || true
+    fi
+done
+
+JJ_VER="$(run_as_target_user "export PATH=\"\${HOME}/.cargo/bin:\$PATH\"; jj --version 2>/dev/null || echo 'installed'")"
+log_success "Rust / Cargo and Jujutsu (jj-cli) verified: ${JJ_VER} (symlinked to /usr/local/bin/jj)."
+
 # Step 4: Configure ~/.config/turnstone/config.toml
 CONFIG_DIR="${USER_HOME}/.config/turnstone"
 CONFIG_FILE="${CONFIG_DIR}/config.toml"
@@ -744,7 +805,7 @@ cat > "${MLX_PLIST}" <<EOF
         <key>HOME</key>
         <string>${USER_HOME}</string>
         <key>PATH</key>
-        <string>${VENV_DIR}/bin:${USER_HOME}/.local/bin:${LOCAL_BREW_DIR}/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <string>${VENV_DIR}/bin:${USER_HOME}/.local/bin:${CARGO_DIR}/bin:${LOCAL_BREW_DIR}/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
     <key>ProgramArguments</key>
     <array>
@@ -796,7 +857,7 @@ cat > "${OLLAMA_PLIST}" <<EOF
         <key>HOME</key>
         <string>${USER_HOME}</string>
         <key>PATH</key>
-        <string>${VENV_DIR}/bin:${USER_HOME}/.local/bin:${LOCAL_BREW_DIR}/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <string>${VENV_DIR}/bin:${USER_HOME}/.local/bin:${CARGO_DIR}/bin:${LOCAL_BREW_DIR}/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>OLLAMA_HOST</key>
         <string>0.0.0.0:11434</string>
         <key>OLLAMA_ORIGINS</key>
@@ -899,7 +960,7 @@ cat > "${SERVER_PLIST}" <<EOF
         <key>HOME</key>
         <string>${USER_HOME}</string>
         <key>PATH</key>
-        <string>${VENV_DIR}/bin:${USER_HOME}/.local/bin:${LOCAL_BREW_DIR}/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <string>${VENV_DIR}/bin:${USER_HOME}/.local/bin:${CARGO_DIR}/bin:${LOCAL_BREW_DIR}/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>TURNSTONE_NODE_ID</key>
         <string>${NODE_ID}</string>
         <key>TURNSTONE_ADVERTISE_URL</key>
@@ -1026,6 +1087,8 @@ echo -e "Ollama Server API (Dynamic): http://127.0.0.1:11434/v1 (Qwen3.8 27B, Ge
 echo -e "SMB Storage Mount: ${MOUNT_POINT} (${SMB_PATH})"
 echo -e "Homebrew Prefix: ${LOCAL_BREW_DIR}"
 echo -e "all-smi Utility: ${ALL_SMI_BIN} (sudo NOPASSWD enabled)"
+echo -e "Rust / Cargo: ${CARGO_DIR}/bin/cargo (symlinked to /usr/local/bin/cargo)"
+echo -e "Jujutsu (jj): ${JJ_BIN} (symlinked to /usr/local/bin/jj)"
 
 if [ "${DEPLOY_HAS_ERROR}" = true ]; then
     log_error "One or more inference services failed health checks. Please review the logs above."
