@@ -9,10 +9,12 @@
 # Configured Cluster Nodes:
 #   1. postgres    -> postgres@turnstone-postgres.lan:~/nerd_projects/turnstone-teqonix
 #   2. coordinator -> turnstone@turnstone-coordinator-nerd-projects.lan:~/nerd_projects/turnstone-teqonix
-#   3. ai-core-one -> turnstone@amd-ai-core-one.lan:~/nerd_projects/turnstone-teqonix
-#   4. ai-core-two -> turnstone@amd-ai-core-two.lan:~/nerd_projects/turnstone-teqonix
-#   5. mbp-ai-core -> turnstone@mbp-ai-core.lan:~/nerd_projects/turnstone-teqonix
-#   6. litellm     -> turnstone@litellm-proxy.lan:~/nerd_projects/turnstone-teqonix
+#   3. worker-one  -> turnstone@turnstone-worker-one.lan:~/nerd_projects/turnstone-teqonix
+#   4. worker-two  -> turnstone@turnstone-worker-two.lan:~/nerd_projects/turnstone-teqonix
+#   5. ai-core-one -> turnstone@amd-ai-core-one.lan:~/nerd_projects/turnstone-teqonix
+#   6. ai-core-two -> turnstone@amd-ai-core-two.lan:~/nerd_projects/turnstone-teqonix
+#   7. mbp-ai-core -> turnstone@mbp-ai-core.lan:~/nerd_projects/turnstone-teqonix
+#   8. litellm     -> turnstone@litellm-proxy.lan:~/nerd_projects/turnstone-teqonix
 #
 # Usage:
 #   ./sync_repo.sh                      # Sync to ALL cluster nodes (default)
@@ -59,12 +61,14 @@ fi
 
 # Target Cluster Nodes Definition
 # Format: KEY | HOST | USER | DEST_REL_PATH | DESCRIPTION
-NODE_KEYS=("postgres" "coordinator" "ai-core-one" "ai-core-two" "mbp-ai-core" "litellm")
+NODE_KEYS=("postgres" "coordinator" "worker-one" "worker-two" "ai-core-one" "ai-core-two" "mbp-ai-core" "litellm")
 
 node_host() {
     case "$1" in
         postgres) echo "turnstone-postgres.lan" ;;
         coordinator) echo "turnstone-coordinator-nerd-projects.lan" ;;
+        worker-one|turnstone-worker-one|turnstone-worker-one.lan) echo "turnstone-worker-one.lan" ;;
+        worker-two|turnstone-worker-two|turnstone-worker-two.lan) echo "turnstone-worker-two.lan" ;;
         ai-core-one) echo "amd-ai-core-one.lan" ;;
         ai-core-two) echo "amd-ai-core-two.lan" ;;
         mbp-ai-core) echo "mbp-ai-core.lan" ;;
@@ -76,14 +80,14 @@ node_host() {
 node_user() {
     case "$1" in
         postgres) echo "postgres" ;;
-        coordinator|ai-core-one|ai-core-two|mbp-ai-core|litellm|litellm-proxy) echo "turnstone" ;;
+        coordinator|worker-one|worker-two|turnstone-worker-one|turnstone-worker-two|ai-core-one|ai-core-two|mbp-ai-core|litellm|litellm-proxy) echo "turnstone" ;;
         *) echo "" ;;
     esac
 }
 
 node_dest() {
     case "$1" in
-        postgres|coordinator|ai-core-one|ai-core-two|mbp-ai-core|litellm|litellm-proxy) echo "~/nerd_projects/turnstone-teqonix" ;;
+        postgres|coordinator|worker-one|worker-two|turnstone-worker-one|turnstone-worker-two|ai-core-one|ai-core-two|mbp-ai-core|litellm|litellm-proxy) echo "~/nerd_projects/turnstone-teqonix" ;;
         *) echo "" ;;
     esac
 }
@@ -92,9 +96,11 @@ node_desc() {
     case "$1" in
         postgres) echo "PostgreSQL Database Node (turnstone-postgres.lan)" ;;
         coordinator) echo "Coordinator Stack Node (turnstone-coordinator-nerd-projects.lan)" ;;
-        ai-core-one) echo "Ryzen AI Halo Worker Node #1 (amd-ai-core-one.lan)" ;;
-        ai-core-two) echo "Ryzen AI Halo Worker Node #2 (amd-ai-core-two.lan)" ;;
-        mbp-ai-core) echo "Apple M5 Max MLX Worker Node (mbp-ai-core.lan)" ;;
+        worker-one|turnstone-worker-one) echo "Turnstone Debian 12 Worker Node #1 (turnstone-worker-one.lan)" ;;
+        worker-two|turnstone-worker-two) echo "Turnstone Debian 12 Worker Node #2 (turnstone-worker-two.lan)" ;;
+        ai-core-one) echo "Ryzen AI Halo Inference Node #1 (amd-ai-core-one.lan)" ;;
+        ai-core-two) echo "Ryzen AI Halo Inference Node #2 (amd-ai-core-two.lan)" ;;
+        mbp-ai-core) echo "Apple M5 Max MLX Inference Node (mbp-ai-core.lan)" ;;
         litellm|litellm-proxy) echo "LiteLLM Proxy Load Balancer Node (litellm-proxy.lan)" ;;
         *) echo "" ;;
     esac
@@ -120,13 +126,15 @@ ${BOLD}TARGETS:${NC}
   all           Sync to ALL cluster nodes (Default)
   postgres      Sync to postgres@turnstone-postgres.lan
   coordinator   Sync to turnstone@turnstone-coordinator-nerd-projects.lan
+  worker-one    Sync to turnstone@turnstone-worker-one.lan
+  worker-two    Sync to turnstone@turnstone-worker-two.lan
   ai-core-one   Sync to turnstone@amd-ai-core-one.lan
   ai-core-two   Sync to turnstone@amd-ai-core-two.lan
   mbp-ai-core   Sync to turnstone@mbp-ai-core.lan
   litellm       Sync to turnstone@litellm-proxy.lan
 
 ${BOLD}OPTIONS:${NC}
-  -t, --target <node>    Specify target node ('postgres', 'coordinator', 'ai-core-one', 'ai-core-two', 'mbp-ai-core', 'litellm', or 'all')
+  -t, --target <node>    Specify target node ('postgres', 'coordinator', 'worker-one', 'worker-two', 'ai-core-one', 'ai-core-two', 'mbp-ai-core', 'litellm', or 'all')
   -i, --interactive      Prompt for node selection interactively
   -n, --dry-run          Perform a trial run with no changes made to remote
   -d, --delete           Delete extraneous files from destination directories
@@ -208,7 +216,7 @@ parse_args() {
                     exit 1
                 fi
                 ;;
-            all|postgres|coordinator|turnstone-postgres|turnstone-postgres.lan|turnstone-coordinator|turnstone-coordinator-nerd-projects.lan|ai-core-one|amd-ai-core-one|amd-ai-core-one.lan|ai-core-two|amd-ai-core-two|amd-ai-core-two.lan|mbp-ai-core|mbp-ai-core.lan|litellm|litellm-proxy|litellm-proxy.lan|1|2|3|4|5|6)
+            all|postgres|coordinator|turnstone-postgres|turnstone-postgres.lan|turnstone-coordinator|turnstone-coordinator-nerd-projects.lan|worker-one|turnstone-worker-one|turnstone-worker-one.lan|worker-two|turnstone-worker-two|turnstone-worker-two.lan|ai-core-one|amd-ai-core-one|amd-ai-core-one.lan|ai-core-two|amd-ai-core-two|amd-ai-core-two.lan|mbp-ai-core|mbp-ai-core.lan|litellm|litellm-proxy|litellm-proxy.lan|1|2|3|4|5|6|7|8)
                 TARGET_CHOICE="$1"
                 shift
                 ;;
@@ -226,7 +234,7 @@ resolve_targets() {
     local choice="$1"
     case "$choice" in
         all)
-            SELECTED_TARGETS=("postgres" "coordinator" "ai-core-one" "ai-core-two" "mbp-ai-core" "litellm")
+            SELECTED_TARGETS=("postgres" "coordinator" "worker-one" "worker-two" "ai-core-one" "ai-core-two" "mbp-ai-core" "litellm")
             ;;
         postgres|turnstone-postgres|turnstone-postgres.lan|1)
             SELECTED_TARGETS=("postgres")
@@ -234,16 +242,22 @@ resolve_targets() {
         coordinator|turnstone-coordinator|turnstone-coordinator-nerd-projects.lan|2)
             SELECTED_TARGETS=("coordinator")
             ;;
-        ai-core-one|amd-ai-core-one|amd-ai-core-one.lan|3)
+        worker-one|turnstone-worker-one|turnstone-worker-one.lan|3)
+            SELECTED_TARGETS=("worker-one")
+            ;;
+        worker-two|turnstone-worker-two|turnstone-worker-two.lan|4)
+            SELECTED_TARGETS=("worker-two")
+            ;;
+        ai-core-one|amd-ai-core-one|amd-ai-core-one.lan|5)
             SELECTED_TARGETS=("ai-core-one")
             ;;
-        ai-core-two|amd-ai-core-two|amd-ai-core-two.lan|4)
+        ai-core-two|amd-ai-core-two|amd-ai-core-two.lan|6)
             SELECTED_TARGETS=("ai-core-two")
             ;;
-        mbp-ai-core|mbp-ai-core.lan|5)
+        mbp-ai-core|mbp-ai-core.lan|7)
             SELECTED_TARGETS=("mbp-ai-core")
             ;;
-        litellm|litellm-proxy|litellm-proxy.lan|6)
+        litellm|litellm-proxy|litellm-proxy.lan|8)
             SELECTED_TARGETS=("litellm")
             ;;
         *)
@@ -258,21 +272,25 @@ prompt_interactive() {
     echo "1) All Cluster Nodes"
     echo "2) postgres    (turnstone-postgres.lan)"
     echo "3) coordinator (turnstone-coordinator-nerd-projects.lan)"
-    echo "4) ai-core-one  (amd-ai-core-one.lan)"
-    echo "5) ai-core-two  (amd-ai-core-two.lan)"
-    echo "6) mbp-ai-core  (mbp-ai-core.lan)"
-    echo "7) litellm      (litellm-proxy.lan)"
+    echo "4) worker-one  (turnstone-worker-one.lan)"
+    echo "5) worker-two  (turnstone-worker-two.lan)"
+    echo "6) ai-core-one (amd-ai-core-one.lan)"
+    echo "7) ai-core-two (amd-ai-core-two.lan)"
+    echo "8) mbp-ai-core (mbp-ai-core.lan)"
+    echo "9) litellm     (litellm-proxy.lan)"
     echo
-    read -rp "Select target node [1-7] (Default: 1): " choice
+    read -rp "Select target node [1-9] (Default: 1): " choice
     choice="${choice:-1}"
     case "$choice" in
         1|all) TARGET_CHOICE="all" ;;
         2|postgres) TARGET_CHOICE="postgres" ;;
         3|coordinator) TARGET_CHOICE="coordinator" ;;
-        4|ai-core-one|amd-ai-core-one) TARGET_CHOICE="ai-core-one" ;;
-        5|ai-core-two|amd-ai-core-two) TARGET_CHOICE="ai-core-two" ;;
-        6|mbp-ai-core) TARGET_CHOICE="mbp-ai-core" ;;
-        7|litellm|litellm-proxy) TARGET_CHOICE="litellm" ;;
+        4|worker-one|turnstone-worker-one) TARGET_CHOICE="worker-one" ;;
+        5|worker-two|turnstone-worker-two) TARGET_CHOICE="worker-two" ;;
+        6|ai-core-one|amd-ai-core-one) TARGET_CHOICE="ai-core-one" ;;
+        7|ai-core-two|amd-ai-core-two) TARGET_CHOICE="ai-core-two" ;;
+        8|mbp-ai-core) TARGET_CHOICE="mbp-ai-core" ;;
+        9|litellm|litellm-proxy) TARGET_CHOICE="litellm" ;;
         *)
             log_error "Invalid selection: $choice"
             exit 1
@@ -303,6 +321,12 @@ find_secret_for_node() {
             ;;
         coordinator)
             candidate_names=("coordinator.secret" "coordinator_turnstone.secret" "turnstone.secret")
+            ;;
+        worker-one|turnstone-worker-one)
+            candidate_names=("turnstone_worker_one.secret" "worker_one.secret" "turnstone_worker.secret" "turnstone.secret")
+            ;;
+        worker-two|turnstone-worker-two)
+            candidate_names=("turnstone_worker_two.secret" "worker_two.secret" "turnstone_worker.secret" "turnstone.secret")
             ;;
         *)
             candidate_names=("${key}.secret" "${key}_turnstone.secret")
