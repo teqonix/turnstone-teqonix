@@ -39,6 +39,7 @@ POSTGRES_DB="${POSTGRES_DB:-}"
 NODE_ID="${NODE_ID:-}"
 COORDINATOR_IP="${COORDINATOR_IP:-}"
 JWT_SECRET="${JWT_SECRET:-}"
+HF_TOKEN="${HF_TOKEN:-}"
 LEMONADE_URL="${LEMONADE_URL:-http://127.0.0.1:8000/v1}"
 TURNSTONE_USER_DEBIAN="${TURNSTONE_USER_DEBIAN:-turnstone}"
 SMB_PATH="${SMB_PATH:-}"
@@ -52,6 +53,7 @@ usage() {
     echo "Options:"
     echo "  -u, --user, --postgres-user <user> PostgreSQL username (e.g. turnstone-np, postgres)"
     echo "  -s, --secret-file <path>           Path to secret file containing DB connection string or env vars"
+    echo "  -t, --hf-token <token>             Hugging Face access token (HF_TOKEN)"
     echo "  -n, --node-id <id>                 Node ID (e.g. ryzen-halo-1, ryzen-halo-2)"
     echo "  -c, --coordinator <ip>             Coordinator VM IP address or hostname"
     echo "      --smb-path <path>              Remote SMB path + protocol (e.g. smb://silo-14.lan/ai-playground)"
@@ -71,6 +73,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         -s|--secret-file)
             SECRET_FILE="$2"
+            shift 2
+            ;;
+        -t|--hf-token|--huggingface-token)
+            HF_TOKEN="$2"
             shift 2
             ;;
         -n|--node-id)
@@ -209,6 +215,7 @@ auto_load_all_secrets() {
         "${REPO_ROOT}/secrets"
         "${REPO_ROOT}/.github/issues/bare_metal_migration/secrets"
         "${SCRIPT_DIR}"
+        "/secrets"
         "${calling_user_home}/nerd_projects/turnstone-teqonix/.github/issues/bare_metal_migration/secrets"
         "${calling_user_home}/nerd_projects/turnstone-teqonix/secrets"
         "${HOME}/nerd_projects/turnstone-teqonix/.github/issues/bare_metal_migration/secrets"
@@ -219,13 +226,9 @@ auto_load_all_secrets() {
     # 1. PostgreSQL Secret Discovery & Parsing
     if [ -z "${POSTGRES_PASSWORD:-}" ]; then
         local pg_candidates=(
-            "turnstone_np_postgres.secret"
             "turnstone_postgres.secret"
-            "postgres_turnstone_np.secret"
-            "turnstone_np.secret"
-            "turnstone.secret"
-            "postgres_admin.secret"
-            "postgres.secret"
+            "postgres_turnstone_admin.secret"
+            "postgres_turnstone.secret"
         )
         if [ -n "${POSTGRES_USER:-}" ]; then
             local sanitized_user
@@ -316,7 +319,7 @@ auto_load_all_secrets() {
             local smb_line
             smb_line=$(grep -v '^[[:space:]]*#' "${matched_smb}" | grep -v '^[[:space:]]*$' | tr -d '\r' | head -n 1 || true)
             if [ -n "${smb_line}" ]; then
-                if [[ "${smb_line}" == *"://"* ]] || [[ "${smb_line}" == *"@"* ]] || [[ "${smb_line}" == *"\\"* ]] || [[ "${smb_line}" =~ ^smb ]]; then
+                if [[ "${smb_line}" == *"://"* ]] || [[ "${smb_line}" == *"@"* ]] || [[ "${smb_line}" =~ ^smb ]]; then
                     parse_smb_path "${smb_line}"
                 elif [[ "${smb_line}" == *"="* ]]; then
                     set +e
@@ -380,7 +383,56 @@ auto_load_all_secrets() {
         fi
     fi
 
-    # 4. Coordinator Host
+    # 4. Hugging Face Secret Discovery & Parsing
+    if [ -z "${HF_TOKEN:-}" ]; then
+        local hf_candidates=(
+            "hugging_face_access_token.secret"
+            "huggingface_access_token.secret"
+            "hugging_face_token.secret"
+            "huggingface_token.secret"
+            "hf_access_token.secret"
+            "hf_token.secret"
+            "hugging_face.secret"
+            "huggingface.secret"
+            "hf.secret"
+            "hugging_face_access_token.env"
+            "huggingface.env"
+            "hf.env"
+        )
+        local matched_hf=""
+        for sdir in "${search_dirs[@]}"; do
+            [ -d "$sdir" ] || continue
+            for cand in "${hf_candidates[@]}"; do
+                if [ -s "${sdir}/${cand}" ]; then
+                    matched_hf="${sdir}/${cand}"
+                    break 2
+                fi
+            done
+            for f in "${sdir}"/*hugging*.secret "${sdir}"/*hf*.secret "${sdir}"/*hugging*.env "${sdir}"/*hf*.env; do
+                if [ -s "$f" ]; then
+                    matched_hf="$f"
+                    break 2
+                fi
+            done
+        done
+
+        if [ -n "${matched_hf}" ] && [ -f "${matched_hf}" ]; then
+            log_info "Auto-discovered Hugging Face secret file: '${matched_hf}'"
+            local hf_line
+            hf_line=$(grep -v '^[[:space:]]*#' "${matched_hf}" | grep -v '^[[:space:]]*$' | tr -d '\r' | head -n 1 || true)
+            if [[ "${hf_line}" == *"="* ]]; then
+                HF_TOKEN="${hf_line#*=}"
+                HF_TOKEN="${HF_TOKEN#\"}"
+                HF_TOKEN="${HF_TOKEN%\"}"
+                HF_TOKEN="${HF_TOKEN#\'}"
+                HF_TOKEN="${HF_TOKEN%\'}"
+            else
+                HF_TOKEN="${hf_line}"
+            fi
+        fi
+    fi
+
+    # 5. Coordinator Host
     COORDINATOR_IP="${COORDINATOR_IP:-turnstone-coordinator-nerd-projects.lan}"
 }
 
@@ -421,6 +473,16 @@ fi
 if [ -z "${SMB_PASSWORD}" ]; then
     read -r -s -p "Enter SMB Password for '${REMOTE_USERNAME}'@'${SERVER_HOSTNAME}': " SMB_PASSWORD
     echo ""
+fi
+
+if [ -z "${HF_TOKEN}" ]; then
+    read -r -s -p "Enter Hugging Face Access Token (HF_TOKEN) [or press Enter to skip]: " HF_TOKEN
+    echo ""
+fi
+
+if [ -n "${HF_TOKEN}" ]; then
+    export HF_TOKEN
+    export HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}"
 fi
 
 MOUNT_POINT="/home/${TURNSTONE_USER_DEBIAN}/${SERVER_HOSTNAME}/${SHARE_NAME}"
@@ -498,17 +560,26 @@ fi
 log_info "Creating virtual environment at ${VENV_DIR} using system ${SYSTEM_PYTHON}..."
 uv venv "${VENV_DIR}" --python "${SYSTEM_PYTHON}"
 
-log_info "Installing turnstone package into virtualenv..."
+log_info "Installing turnstone and huggingface_hub packages into virtualenv..."
 if [ -f "${REPO_ROOT}/pyproject.toml" ]; then
+    uv pip install --python "${VENV_DIR}" 'huggingface_hub[cli]'
     uv pip install --python "${VENV_DIR}" --reinstall "${REPO_ROOT}"
 else
-    uv pip install --python "${VENV_DIR}" turnstone
+    uv pip install --python "${VENV_DIR}" turnstone 'huggingface_hub[cli]'
 fi
 
 # Fix ownership and execution permissions for turnstone user
 chown -R "${TURNSTONE_USER_DEBIAN}:${TURNSTONE_USER_DEBIAN}" "${VENV_DIR}" 2>/dev/null || chown -R "${TURNSTONE_USER_DEBIAN}" "${VENV_DIR}"
 chmod -R a+rX "${VENV_DIR}"
 chmod +x "${VENV_DIR}/bin"/* 2>/dev/null || true
+
+# Symlink binaries to /usr/local/bin
+mkdir -p /usr/local/bin
+for tool_bin in turnstone-server hf huggingface-cli; do
+    if [ -x "${VENV_DIR}/bin/${tool_bin}" ]; then
+        ln -sfn "${VENV_DIR}/bin/${tool_bin}" "/usr/local/bin/${tool_bin}" 2>/dev/null || true
+    fi
+done
 log_success "Virtualenv created and permissions secured at ${VENV_DIR}."
 
 # Step 5b: Install Local Homebrew & all-smi Hardware Monitor for Turnstone User
@@ -673,6 +744,46 @@ if [ -x "${JJ_BIN}" ] || command -v jj &>/dev/null; then
     log_success "Jujutsu VCS ready: ${JJ_VER} (symlinked to /usr/local/bin/jj)."
 fi
 
+# Step 5d: Persist Hugging Face Access Token in Turnstone User Environment
+if [ -n "${HF_TOKEN}" ]; then
+    log_info "Step 5d: Persisting Hugging Face access token for user '${TURNSTONE_USER_DEBIAN}'..."
+    for rc_file in "${USER_HOME}/.bashrc" "${USER_HOME}/.profile"; do
+        if [ ! -f "${rc_file}" ]; then
+            touch "${rc_file}"
+            chown "${TURNSTONE_USER_DEBIAN}:${TURNSTONE_USER_DEBIAN}" "${rc_file}" 2>/dev/null || true
+        fi
+        if ! grep -qF "HF_TOKEN" "${rc_file}" 2>/dev/null; then
+            echo "" >> "${rc_file}"
+            echo "# Hugging Face Hub Access Token" >> "${rc_file}"
+            echo "export HF_TOKEN=\"${HF_TOKEN}\"" >> "${rc_file}"
+            echo "export HUGGING_FACE_HUB_TOKEN=\"${HF_TOKEN}\"" >> "${rc_file}"
+            chown "${TURNSTONE_USER_DEBIAN}:${TURNSTONE_USER_DEBIAN}" "${rc_file}" 2>/dev/null || true
+        fi
+    done
+
+    mkdir -p "${USER_HOME}/.cache/huggingface" "${USER_HOME}/.huggingface"
+    echo -n "${HF_TOKEN}" > "${USER_HOME}/.cache/huggingface/token"
+    echo -n "${HF_TOKEN}" > "${USER_HOME}/.huggingface/token"
+    chmod 600 "${USER_HOME}/.cache/huggingface/token" "${USER_HOME}/.huggingface/token" 2>/dev/null || true
+    chown -R "${TURNSTONE_USER_DEBIAN}:${TURNSTONE_USER_DEBIAN}" "${USER_HOME}/.cache/huggingface" "${USER_HOME}/.huggingface" 2>/dev/null || true
+    log_success "Hugging Face credentials persisted in shell profile and cache."
+fi
+
+# Step 5e: Download and Verify Mistral-Nemo-Base-2407 Judge Model
+log_info "Step 5e: Checking / downloading judge model 'itlwas/Mistral-Nemo-Base-2407-Q4_K_M-GGUF' via Hugging Face..."
+sudo -u "${TURNSTONE_USER_DEBIAN}" -H bash -c "
+    export PATH=\"${VENV_DIR}/bin:${CARGO_DIR}/bin:${LOCAL_BREW_DIR}/bin:/usr/local/bin:/usr/bin:/bin:\$PATH\"
+    export HF_TOKEN=\"${HF_TOKEN}\"
+    export HUGGING_FACE_HUB_TOKEN=\"${HF_TOKEN}\"
+    if command -v huggingface-cli &>/dev/null; then
+        if [ -n \"${HF_TOKEN}\" ]; then
+            huggingface-cli login --token \"${HF_TOKEN}\" 2>/dev/null || true
+        fi
+        huggingface-cli download itlwas/Mistral-Nemo-Base-2407-Q4_K_M-GGUF --local-dir-use-symlinks False 2>/dev/null || true
+    fi
+"
+log_success "Judge model verified (itlwas/Mistral-Nemo-Base-2407-Q4_K_M-GGUF)."
+
 # Step 6: Configure /etc/turnstone/config.toml Secrets
 log_info "Step 6: Writing secrets configuration to /etc/turnstone/config.toml..."
 mkdir -p /etc/turnstone
@@ -766,13 +877,64 @@ Environment="TURNSTONE_DB_URL=postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_P
 Environment="TURNSTONE_STORAGE_DIR=${MOUNT_POINT}"
 Environment="TURNSTONE_SMB_MOUNT=${MOUNT_POINT}"
 Environment="TURNSTONE_WORKSPACE=${MOUNT_POINT}"
+Environment="HF_TOKEN=${HF_TOKEN}"
+Environment="HUGGING_FACE_HUB_TOKEN=${HF_TOKEN}"
 EOF
+
+# Step 8b: Configure lemon.d / Lemonade Systemctl Config Drop-ins
+if [ -n "${HF_TOKEN}" ]; then
+    log_info "Step 8b: Configuring lemon.d / lemonade systemctl environment drop-ins with HF_TOKEN..."
+    for svc in lemonade lemon lemon-server lemonade-server; do
+        mkdir -p "/etc/systemd/system/${svc}.service.d"
+        cat > "/etc/systemd/system/${svc}.service.d/hf.conf" <<EOF
+[Service]
+Environment="HF_TOKEN=${HF_TOKEN}"
+Environment="HUGGING_FACE_HUB_TOKEN=${HF_TOKEN}"
+EOF
+    done
+
+    # User-level drop-ins in case lemonade runs as user service
+    USER_SYSTEMD_DIR="${USER_HOME}/.config/systemd/user"
+    for svc in lemonade lemon lemon-server lemonade-server; do
+        mkdir -p "${USER_SYSTEMD_DIR}/${svc}.service.d"
+        cat > "${USER_SYSTEMD_DIR}/${svc}.service.d/hf.conf" <<EOF
+[Service]
+Environment="HF_TOKEN=${HF_TOKEN}"
+Environment="HUGGING_FACE_HUB_TOKEN=${HF_TOKEN}"
+EOF
+    done
+    chown -R "${TURNSTONE_USER_DEBIAN}:${TURNSTONE_USER_DEBIAN}" "${USER_HOME}/.config" 2>/dev/null || true
+
+    # Support /etc/lemon.d and /etc/lemonade.d directory configs
+    mkdir -p /etc/lemon.d /etc/lemonade.d
+    cat > /etc/lemon.d/hf_token.env <<EOF
+HF_TOKEN="${HF_TOKEN}"
+HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}"
+EOF
+    cat > /etc/lemonade.d/hf_token.env <<EOF
+HF_TOKEN="${HF_TOKEN}"
+HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}"
+EOF
+    chmod 600 /etc/lemon.d/hf_token.env /etc/lemonade.d/hf_token.env 2>/dev/null || true
+    chown -R "${TURNSTONE_USER_DEBIAN}:${TURNSTONE_USER_DEBIAN}" /etc/lemon.d /etc/lemonade.d 2>/dev/null || true
+    log_success "lemon.d systemctl environment drop-ins configured."
+fi
 
 # Step 9: Reload and Restart Systemd Service
 log_info "Step 9: Enabling and restarting turnstone-server service..."
 systemctl daemon-reload
 systemctl enable turnstone-server.service
 systemctl restart turnstone-server.service
+
+# Restart active lemon / lemonade services if present
+if [ -n "${HF_TOKEN}" ]; then
+    for svc in lemonade.service lemon.service lemon-server.service lemonade-server.service; do
+        if systemctl is-active --quiet "${svc}" 2>/dev/null; then
+            systemctl restart "${svc}" 2>/dev/null || true
+            log_info "Restarted active ${svc} with updated HF_TOKEN."
+        fi
+    done
+fi
 
 sleep 2
 if systemctl is-active --quiet turnstone-server.service; then
@@ -794,5 +956,10 @@ echo -e "Homebrew Prefix: ${LOCAL_BREW_DIR}"
 echo -e "all-smi Utility: ${ALL_SMI_BIN} (sudo NOPASSWD enabled)"
 echo -e "Rust / Cargo: ${CARGO_DIR}/bin/cargo (symlinked to /usr/local/bin/cargo)"
 echo -e "Jujutsu (jj): ${JJ_BIN} (symlinked to /usr/local/bin/jj)"
+if [ -n "${HF_TOKEN}" ]; then
+    echo -e "Hugging Face Token: [CONFIGURED] (${HF_TOKEN:0:4}...${HF_TOKEN: -4})"
+else
+    echo -e "Hugging Face Token: [NONE]"
+fi
 
 
