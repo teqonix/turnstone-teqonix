@@ -296,7 +296,7 @@ find_secret_for_node() {
             candidate_names=("litellm_turnstone.secret" "litellm.secret" "litellm_proxy.secret")
             ;;
         postgres)
-            candidate_names=("postgres_admin.secret" "postgres.secret" "postgres_postgres.secret")
+            candidate_names=("turnstone_postgres.secret" "postgres_turnstone_admin.secret" "postgres_turnstone.secret")
             ;;
         coordinator)
             candidate_names=("coordinator.secret" "coordinator_turnstone.secret" "turnstone.secret")

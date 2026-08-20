@@ -22,7 +22,7 @@ This directory contains the complete deployment and migration tooling for transi
 ┌──────────────────────────┐             ┌──────────────────────────┐             ┌──────────────────────────┐
 │  LLM Node 1: M5 Max MBP  │             │ LLM Node 2: Ryzen Halo 1 │             │ LLM Node 3: Ryzen Halo 2 │
 │ - Engine: Apple MLX      │             │ - Engine: Lemonade ROCm  │             │ - Engine: Lemonade ROCm  │
-│ - Model: qwen3-coder-next│             │ - Model: gemma-4-31b     │             │ - Model: nemotron-3-nano │
+│ - Model: qwen3-coder-next│             │ - Model: gemma-4-31b     │             │ - Model: Mistral-Nemo    │
 │ - Context: 384k Tokens   │             │ - Context: 384k Tokens   │             │ - Context: 384k Tokens   │
 │ - Role: Burst Coding     │             │ - Role: Orchestrator     │             │ - Role: Judge / Eval     │
 └──────────────────────────┘             └──────────────────────────┘             └──────────────────────────┘

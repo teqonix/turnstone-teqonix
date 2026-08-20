@@ -43,6 +43,7 @@ SMB_PATH="${SMB_PATH:-}"
 SMB_USER="${SMB_USER:-}"
 SMB_PASSWORD="${SMB_PASSWORD:-}"
 TURNSTONE_USER="${TURNSTONE_USER:-}"
+HF_TOKEN="${HF_TOKEN:-}"
 
 usage() {
     echo "Usage: $0 [OPTIONS]"
@@ -50,6 +51,7 @@ usage() {
     echo "Options:"
     echo "  -u, --user, --postgres-user <user> PostgreSQL username (e.g. turnstone-np, postgres)"
     echo "  -s, --secret-file <path>           Path to secret file containing DB connection string or env vars"
+    echo "  -t, --hf-token <token>             Hugging Face access token (HF_TOKEN)"
     echo "  -c, --coordinator <ip>             Coordinator VM IP address or hostname"
     echo "      --smb-path <path>              Remote SMB path + protocol (e.g. smb://silo-14.lan/ai-playground)"
     echo "      --smb-user <user>              SMB username (e.g. turnstone-np)"
@@ -67,6 +69,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         -s|--secret-file)
             SECRET_FILE="$2"
+            shift 2
+            ;;
+        -t|--hf-token|--huggingface-token)
+            HF_TOKEN="$2"
             shift 2
             ;;
         -c|--coordinator)
@@ -193,21 +199,20 @@ auto_load_all_secrets() {
         "${REPO_ROOT}/secrets"
         "${REPO_ROOT}/.github/issues/bare_metal_migration/secrets"
         "${SCRIPT_DIR}"
+        "/secrets"
         "${USER_HOME}/nerd_projects/turnstone-teqonix/.github/issues/bare_metal_migration/secrets"
         "${USER_HOME}/nerd_projects/turnstone-teqonix/secrets"
+        "${HOME}/nerd_projects/turnstone-teqonix/.github/issues/bare_metal_migration/secrets"
+        "${HOME}/nerd_projects/turnstone-teqonix/secrets"
         "/etc/turnstone"
     )
 
     # 1. PostgreSQL Secret Discovery & Parsing
     if [ -z "${POSTGRES_PASSWORD:-}" ]; then
         local pg_candidates=(
-            "turnstone_np_postgres.secret"
             "turnstone_postgres.secret"
-            "postgres_turnstone_np.secret"
-            "turnstone_np.secret"
-            "turnstone.secret"
-            "postgres_admin.secret"
-            "postgres.secret"
+            "postgres_turnstone_admin.secret"
+            "postgres_turnstone.secret"
         )
         local matched_pg=""
         for sdir in "${search_dirs[@]}"; do
@@ -327,7 +332,56 @@ auto_load_all_secrets() {
         fi
     fi
 
-    # 4. Coordinator Host
+    # 4. Hugging Face Secret Discovery & Parsing
+    if [ -z "${HF_TOKEN:-}" ]; then
+        local hf_candidates=(
+            "hugging_face_access_token.secret"
+            "huggingface_access_token.secret"
+            "hugging_face_token.secret"
+            "huggingface_token.secret"
+            "hf_access_token.secret"
+            "hf_token.secret"
+            "hugging_face.secret"
+            "huggingface.secret"
+            "hf.secret"
+            "hugging_face_access_token.env"
+            "huggingface.env"
+            "hf.env"
+        )
+        local matched_hf=""
+        for sdir in "${search_dirs[@]}"; do
+            [ -d "$sdir" ] || continue
+            for cand in "${hf_candidates[@]}"; do
+                if [ -f "${sdir}/${cand}" ]; then
+                    matched_hf="${sdir}/${cand}"
+                    break 2
+                fi
+            done
+            for f in "${sdir}"/*hugging*.secret "${sdir}"/*hf*.secret "${sdir}"/*hugging*.env "${sdir}"/*hf*.env; do
+                if [ -f "$f" ]; then
+                    matched_hf="$f"
+                    break 2
+                fi
+            done
+        done
+
+        if [ -n "${matched_hf}" ] && [ -f "${matched_hf}" ]; then
+            log_info "Auto-discovered Hugging Face secret file: '${matched_hf}'"
+            local hf_line
+            hf_line=$(grep -v '^[[:space:]]*#' "${matched_hf}" | grep -v '^[[:space:]]*$' | tr -d '\r' | head -n 1 || true)
+            if [[ "${hf_line}" == *"="* ]]; then
+                HF_TOKEN="${hf_line#*=}"
+                HF_TOKEN="${HF_TOKEN#\"}"
+                HF_TOKEN="${HF_TOKEN%\"}"
+                HF_TOKEN="${HF_TOKEN#\'}"
+                HF_TOKEN="${HF_TOKEN%\'}"
+            else
+                HF_TOKEN="${hf_line}"
+            fi
+        fi
+    fi
+
+    # 5. Coordinator Host
     COORDINATOR_IP="${COORDINATOR_IP:-turnstone-coordinator-nerd-projects.lan}"
 }
 
@@ -403,6 +457,16 @@ fi
 if [ -z "${SMB_PASSWORD}" ]; then
     read -r -s -p "Enter SMB Password for '${REMOTE_USERNAME}'@'${SERVER_HOSTNAME}': " SMB_PASSWORD
     echo ""
+fi
+
+if [ -z "${HF_TOKEN}" ]; then
+    read -r -s -p "Enter Hugging Face Access Token (HF_TOKEN) [or press Enter to skip]: " HF_TOKEN
+    echo ""
+fi
+
+if [ -n "${HF_TOKEN}" ]; then
+    export HF_TOKEN
+    export HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}"
 fi
 
 MOUNT_POINT="/mnt/${SERVER_HOSTNAME}/${REMOTE_USERNAME}/${SHARE_NAME}"
@@ -500,7 +564,7 @@ if [ ! -x "${LOCAL_BREW_DIR}/bin/brew" ]; then
     run_as_target_user "rm -rf '${LOCAL_BREW_DIR}' && git clone --depth=1 https://github.com/Homebrew/brew '${LOCAL_BREW_DIR}'"
 fi
 
-# Persist Virtualenv, Local bin, and Homebrew environment across all future shell sessions
+# Persist Virtualenv, Local bin, Homebrew, and Hugging Face environment across all future shell sessions
 ENV_EXPORT_CMD="export PATH=\"${VENV_DIR}/bin:${USER_HOME}/.local/bin:\$PATH\""
 BREW_ENV_CMD="eval \"\$(${LOCAL_BREW_DIR}/bin/brew shellenv)\""
 for rc_file in "${USER_HOME}/.zprofile" "${USER_HOME}/.zshrc" "${USER_HOME}/.bash_profile" "${USER_HOME}/.bashrc"; do
@@ -511,7 +575,17 @@ for rc_file in "${USER_HOME}/.zprofile" "${USER_HOME}/.zshrc" "${USER_HOME}/.bas
     if ! grep -qF "${LOCAL_BREW_DIR}/bin/brew shellenv" "${rc_file}" 2>/dev/null; then
         run_as_target_user "printf '\n# Homebrew environment\n%s\n' '${BREW_ENV_CMD}' >> '${rc_file}'"
     fi
+    if [ -n "${HF_TOKEN}" ] && ! grep -qF "HF_TOKEN" "${rc_file}" 2>/dev/null; then
+        run_as_target_user "printf '\n# Hugging Face Hub Access Token\nexport HF_TOKEN=\"%s\"\nexport HUGGING_FACE_HUB_TOKEN=\"%s\"\n' '${HF_TOKEN}' '${HF_TOKEN}' >> '${rc_file}'"
+    fi
 done
+
+if [ -n "${HF_TOKEN}" ]; then
+    run_as_target_user "mkdir -p '${USER_HOME}/.cache/huggingface' '${USER_HOME}/.huggingface'"
+    run_as_target_user "printf '%s' '${HF_TOKEN}' > '${USER_HOME}/.cache/huggingface/token'"
+    run_as_target_user "printf '%s' '${HF_TOKEN}' > '${USER_HOME}/.huggingface/token'"
+    run_as_target_user "chmod 600 '${USER_HOME}/.cache/huggingface/token' '${USER_HOME}/.huggingface/token' 2>/dev/null || true"
+fi
 
 # Install all-smi and Ollama via Homebrew
 log_info "Installing all-smi utility and Ollama engine via Homebrew for user '${TURNSTONE_USER}'..."
@@ -806,6 +880,10 @@ cat > "${MLX_PLIST}" <<EOF
         <string>${USER_HOME}</string>
         <key>PATH</key>
         <string>${VENV_DIR}/bin:${USER_HOME}/.local/bin:${CARGO_DIR}/bin:${LOCAL_BREW_DIR}/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HF_TOKEN</key>
+        <string>${HF_TOKEN}</string>
+        <key>HUGGING_FACE_HUB_TOKEN</key>
+        <string>${HF_TOKEN}</string>
     </dict>
     <key>ProgramArguments</key>
     <array>
@@ -837,7 +915,7 @@ log_success "MLX Server system daemon loaded."
 
 # Step 6b: Setup Ollama Launchd Daemon (Multi-Model Swapping Engine on Port 11434)
 OLLAMA_PLIST="${SYSTEM_DAEMONS_DIR}/com.turnstone.ollama.plist"
-log_info "Step 6b: Configuring Ollama system daemon on port 11434 (Memory Capped: 50GB)..."
+log_info "Step 6b: Configuring Ollama system daemon on port 11434 (Memory Capped: 40GB)..."
 
 cat > "${OLLAMA_PLIST}" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -858,6 +936,10 @@ cat > "${OLLAMA_PLIST}" <<EOF
         <string>${USER_HOME}</string>
         <key>PATH</key>
         <string>${VENV_DIR}/bin:${USER_HOME}/.local/bin:${CARGO_DIR}/bin:${LOCAL_BREW_DIR}/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HF_TOKEN</key>
+        <string>${HF_TOKEN}</string>
+        <key>HUGGING_FACE_HUB_TOKEN</key>
+        <string>${HF_TOKEN}</string>
         <key>OLLAMA_HOST</key>
         <string>0.0.0.0:11434</string>
         <key>OLLAMA_ORIGINS</key>
@@ -874,12 +956,12 @@ cat > "${OLLAMA_PLIST}" <<EOF
     <key>HardResourceLimits</key>
     <dict>
         <key>ResidentSetSize</key>
-        <integer>53687091200</integer>
+        <integer>42949672960</integer>
     </dict>
     <key>SoftResourceLimits</key>
     <dict>
         <key>ResidentSetSize</key>
-        <integer>53687091200</integer>
+        <integer>42949672960</integer>
     </dict>
     <key>ProgramArguments</key>
     <array>
@@ -904,17 +986,23 @@ log_success "Ollama system daemon loaded."
 # Step 6c: Download and Associate Models with Servers
 log_info "Step 6c: Verifying & downloading models for MLX and Ollama..."
 
-# 1. MLX Model: mlx-community/Qwen3-Coder-Next-6bit
-log_info "Checking / downloading MLX model 'mlx-community/Qwen3-Coder-Next-6bit' via Hugging Face..."
+# 1. MLX & Hugging Face Models: Qwen3-Coder-Next & Mistral-Nemo-Base-2407
+log_info "Checking / downloading models via Hugging Face ('mlx-community/Qwen3-Coder-Next-6bit' & 'mistralai/Mistral-Nemo-Base-2407')..."
 run_as_target_user "
     export PATH=\"${VENV_DIR}/bin:${USER_HOME}/.local/bin:\$PATH\"
+    export HF_TOKEN=\"${HF_TOKEN}\"
+    export HUGGING_FACE_HUB_TOKEN=\"${HF_TOKEN}\"
     if command -v huggingface-cli &>/dev/null; then
+        if [ -n \"${HF_TOKEN}\" ]; then
+            huggingface-cli login --token \"${HF_TOKEN}\" 2>/dev/null || true
+        fi
         huggingface-cli download mlx-community/Qwen3-Coder-Next-6bit --local-dir-use-symlinks False 2>/dev/null || true
+        huggingface-cli download mistralai/Mistral-Nemo-Base-2407 --local-dir-use-symlinks False 2>/dev/null || true
     fi
 "
-log_success "MLX model verified (mlx-community/Qwen3-Coder-Next-6bit)."
+log_success "MLX and Hugging Face models verified (Qwen3-Coder-Next-6bit, Mistral-Nemo-Base-2407)."
 
-# 2. Ollama Models: Qwen3.8 27B & Gemma 4 31B
+# 2. Ollama Models: Qwen3.8 27B, Gemma 4 31B, Mistral Nemo 12B, & Ornith
 log_info "Waiting for Ollama daemon to initialize..."
 for i in {1..20}; do
     if curl -s http://127.0.0.1:11434/api/tags &>/dev/null; then
@@ -923,7 +1011,7 @@ for i in {1..20}; do
     sleep 1
 done
 
-log_info "Pulling Ollama models (Qwen 3.8 27B and Gemma 4 31B)..."
+log_info "Pulling Ollama models (Qwen 3.8 27B, Gemma 4 31B, Mistral Nemo 12B, Ornith)..."
 run_as_target_user "
     eval \"\$(${LOCAL_BREW_DIR}/bin/brew shellenv)\"
     export OLLAMA_HOST=127.0.0.1:11434
@@ -933,10 +1021,17 @@ run_as_target_user "
     echo 'Pulling Gemma 4 31B model into Ollama...'
     ollama pull gemma4:31b-8bit 2>/dev/null || ollama pull gemma4:31b 2>/dev/null || ollama pull gemma4:latest 2>/dev/null || ollama pull gemma:31b 2>/dev/null || true
 
+    echo 'Pulling Mistral Nemo 12B judge model into Ollama...'
+    ollama pull mistral-nemo:12b 2>/dev/null || ollama pull mistral-nemo:latest 2>/dev/null || ollama pull mistral-nemo 2>/dev/null || true
+    # Constrain context window from unconstrained 256k (which allocates ~40GB KV cache) down to 32k
+    echo -e "FROM mistral-nemo:12b\nPARAMETER num_ctx 32768" > /tmp/Modelfile.mistral-nemo
+    ollama create mistral-nemo:12b -f /tmp/Modelfile.mistral-nemo 2>/dev/null || true
+    rm -f /tmp/Modelfile.mistral-nemo
+
     echo 'Pulling Ornith Latest model into Ollama...'
     ollama pull ornith:latest 2>/dev/null || true
 "
-log_success "Ollama models pulled successfully."
+log_success "Ollama models pulled and context parameters tuned successfully."
 
 # Step 7: Setup Turnstone Server Launchd Daemon
 SERVER_PLIST="${SYSTEM_DAEMONS_DIR}/com.turnstone.server.plist"
@@ -981,6 +1076,10 @@ cat > "${SERVER_PLIST}" <<EOF
         <string>${MOUNT_POINT}</string>
         <key>TURNSTONE_WORKSPACE</key>
         <string>${MOUNT_POINT}</string>
+        <key>HF_TOKEN</key>
+        <string>${HF_TOKEN}</string>
+        <key>HUGGING_FACE_HUB_TOKEN</key>
+        <string>${HF_TOKEN}</string>
     </dict>
     <key>ProgramArguments</key>
     <array>
@@ -1089,6 +1188,11 @@ echo -e "Homebrew Prefix: ${LOCAL_BREW_DIR}"
 echo -e "all-smi Utility: ${ALL_SMI_BIN} (sudo NOPASSWD enabled)"
 echo -e "Rust / Cargo: ${CARGO_DIR}/bin/cargo (symlinked to /usr/local/bin/cargo)"
 echo -e "Jujutsu (jj): ${JJ_BIN} (symlinked to /usr/local/bin/jj)"
+if [ -n "${HF_TOKEN}" ]; then
+    echo -e "Hugging Face Token: [CONFIGURED] (${HF_TOKEN:0:4}...${HF_TOKEN: -4})"
+else
+    echo -e "Hugging Face Token: [NONE]"
+fi
 
 if [ "${DEPLOY_HAS_ERROR}" = true ]; then
     log_error "One or more inference services failed health checks. Please review the logs above."
