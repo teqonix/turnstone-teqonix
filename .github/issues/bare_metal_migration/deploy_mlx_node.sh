@@ -859,7 +859,7 @@ log_success "SMB storage configured for startup mount at ${MOUNT_POINT}."
 
 # Step 6: Setup MLX Launchd Daemon (mlx-lm.server - Pinned to Qwen3-Coder-Next-6bit)
 MLX_PLIST="${SYSTEM_DAEMONS_DIR}/com.turnstone.mlx-server.plist"
-log_info "Step 6: Configuring MLX Server system daemon (pinned: mlx-community/Qwen3-Coder-Next-6bit)..."
+log_info "Step 6: Configuring MLX Server system daemon (pinned: mlx-community/Qwen3.8-27B-4bit)..."
 
 cat > "${MLX_PLIST}" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -892,7 +892,7 @@ cat > "${MLX_PLIST}" <<EOF
         <string>mlx_lm</string>
         <string>server</string>
         <string>--model</string>
-        <string>mlx-community/Qwen3-Coder-Next-6bit</string>
+        <string>mlx-community/Qwen3.8-27B-4bit</string>
         <string>--host</string>
         <string>0.0.0.0</string>
         <string>--port</string>
@@ -986,8 +986,8 @@ log_success "Ollama system daemon loaded."
 # Step 6c: Download and Associate Models with Servers
 log_info "Step 6c: Verifying & downloading models for MLX and Ollama..."
 
-# 1. MLX & Hugging Face Models: Qwen3-Coder-Next & Mistral-Nemo-Base-2407
-log_info "Checking / downloading models via Hugging Face ('mlx-community/Qwen3-Coder-Next-6bit' & 'mistralai/Mistral-Nemo-Base-2407')..."
+# 1. MLX & Hugging Face Models: Qwen3.8-27B-4bit & Mistral-Nemo-Base-2407
+log_info "Checking / downloading models via Hugging Face ('mlx-community/Qwen3.8-27B-4bit' & 'mistralai/Mistral-Nemo-Base-2407')..."
 run_as_target_user "
     export PATH=\"${VENV_DIR}/bin:${USER_HOME}/.local/bin:\$PATH\"
     export HF_TOKEN=\"${HF_TOKEN}\"
@@ -996,11 +996,11 @@ run_as_target_user "
         if [ -n \"${HF_TOKEN}\" ]; then
             huggingface-cli login --token \"${HF_TOKEN}\" 2>/dev/null || true
         fi
-        huggingface-cli download mlx-community/Qwen3-Coder-Next-6bit --local-dir-use-symlinks False 2>/dev/null || true
+        huggingface-cli download mlx-community/Qwen3.8-27B-4bit --local-dir-use-symlinks False 2>/dev/null || true
         huggingface-cli download mistralai/Mistral-Nemo-Base-2407 --local-dir-use-symlinks False 2>/dev/null || true
     fi
 "
-log_success "MLX and Hugging Face models verified (Qwen3-Coder-Next-6bit, Mistral-Nemo-Base-2407)."
+log_success "MLX and Hugging Face models verified (Qwen3.8-27B-4bit, Mistral-Nemo-Base-2407)."
 
 # 2. Ollama Models: Qwen3.8 27B, Gemma 4 31B, Mistral Nemo 12B, & Ornith
 log_info "Waiting for Ollama daemon to initialize..."
