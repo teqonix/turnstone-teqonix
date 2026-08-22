@@ -50,7 +50,7 @@ LITELLM_USER="turnstone"
 LITELLM_DIR="/etc/litellm"
 LITELLM_CONFIG="${LITELLM_DIR}/config.yaml"
 VENV_DIR="/opt/litellm-venv"
-NUM_WORKERS="${NUM_WORKERS:-4}"
+NUM_WORKERS="${NUM_WORKERS:-1}"
 
 # Database and Secrets Configuration
 DEFAULT_SECRET_FILE="${SCRIPT_DIR}/secrets/postgres_litellm_admin.secret"
@@ -98,7 +98,7 @@ Options:
   --db-url, --database-url <url> PostgreSQL connection URL (e.g. postgresql://postgres:pass@litellm-proxy.lan:5432)
   --no-postgres                  Skip local PostgreSQL server installation / configuration
   --destructive                  Destroy existing PostgreSQL instance & LiteLLM Proxy, deploying fresh
-  -w, --workers <num>            Number of Uvicorn workers (default: 4)
+  -w, --workers <num>            Number of Uvicorn workers (default: 1)
   --node-ryzen-1 <url>           URL for Ryzen AI Halo Node 1 (default: http://amd-ai-core-one.lan:13305/v1)
   --node-ryzen-2 <url>           URL for Ryzen AI Halo Node 2 (default: http://amd-ai-core-two.lan:13305/v1)
   --node-mbp-mlx <url>           URL for MacBook Pro MLX Server (default: http://mbp-ai-core.lan:8000/v1)
@@ -905,7 +905,130 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# Step 7: Write LiteLLM Cluster Configuration YAML
+# Step 7a: Write Custom Python Router (HardwareGroupRouter)
+# -----------------------------------------------------------------------------
+log_info "Writing Custom Python Router to ${LITELLM_DIR}/hardware_group_router_litellm.py..."
+cat > "${LITELLM_DIR}/hardware_group_router_litellm.py" << 'EOF'
+import litellm
+from litellm.integrations.custom_logger import CustomLogger
+from litellm.types.router import RoutingContext
+from typing import Optional, List, Dict, Union
+import random
+import threading
+import logging
+
+logger = logging.getLogger(__name__)
+
+class ActiveRequestTracker:
+    def __init__(self):
+        self.node_loads = {"NODE_RYZEN_ONE": 0, "NODE_RYZEN_TWO": 0, "NODE_MBP": 0, "UNKNOWN": 0}
+        self.lock = threading.Lock()
+
+    def increment(self, node: str):
+        if node in self.node_loads:
+            with self.lock:
+                self.node_loads[node] += 1
+
+    def decrement(self, node: str):
+        if node in self.node_loads:
+            with self.lock:
+                self.node_loads[node] = max(0, self.node_loads[node] - 1)
+
+    def get_loads(self):
+        with self.lock:
+            return self.node_loads.copy()
+
+tracker = ActiveRequestTracker()
+
+def get_node_from_api_base(api_base: str) -> str:
+    if not api_base:
+        return "UNKNOWN"
+    if "amd-ai-core-one.lan" in api_base:
+        return "NODE_RYZEN_ONE"
+    elif "amd-ai-core-two.lan" in api_base:
+        return "NODE_RYZEN_TWO"
+    elif "mbp-ai-core.lan" in api_base:
+        return "NODE_MBP"
+    return "UNKNOWN"
+
+class HardwareGroupTrackerLogger(CustomLogger):
+    def log_pre_api_call(self, kwargs, completion_kwargs):
+        api_base = kwargs.get("api_base") or (kwargs.get("litellm_params") or {}).get("api_base")
+        node = get_node_from_api_base(api_base)
+        tracker.increment(node)
+
+    def log_success_event(self, kwargs, response_obj, start_time, end_time):
+        api_base = kwargs.get("api_base") or (kwargs.get("litellm_params") or {}).get("api_base")
+        node = get_node_from_api_base(api_base)
+        tracker.decrement(node)
+
+    def log_failure_event(self, kwargs, response_obj, start_time, end_time):
+        api_base = kwargs.get("api_base") or (kwargs.get("litellm_params") or {}).get("api_base")
+        node = get_node_from_api_base(api_base)
+        tracker.decrement(node)
+
+if not getattr(litellm, "callbacks", None):
+    litellm.callbacks = []
+litellm.callbacks.append(HardwareGroupTrackerLogger())
+
+class HardwareGroupPlugin:
+    async def run(self, context: RoutingContext) -> RoutingContext:
+        deployments = context.candidate_models
+        if not deployments:
+            return context
+
+        node_deployments = {"NODE_RYZEN_ONE": [], "NODE_RYZEN_TWO": [], "NODE_MBP": [], "UNKNOWN": []}
+
+        for deployment in deployments:
+            litellm_params = deployment.get("litellm_params", {})
+            api_base = litellm_params.get("api_base", "")
+            node = get_node_from_api_base(api_base)
+            node_deployments[node].append(deployment)
+
+        current_loads = tracker.get_loads()
+        logger.info(f"HardwareGroupPlugin loads: {current_loads}")
+
+        mbp_deployments = node_deployments.get("NODE_MBP", [])
+        if mbp_deployments and current_loads["NODE_MBP"] == 0:
+            context.candidate_models = [mbp_deployments[0]]
+            return context
+
+        ryzen_one = node_deployments.get("NODE_RYZEN_ONE", [])
+        ryzen_two = node_deployments.get("NODE_RYZEN_TWO", [])
+        
+        valid_fallback_nodes = []
+        if ryzen_one:
+            valid_fallback_nodes.append("NODE_RYZEN_ONE")
+        if ryzen_two:
+            valid_fallback_nodes.append("NODE_RYZEN_TWO")
+            
+        if not valid_fallback_nodes:
+            if mbp_deployments:
+                context.candidate_models = [mbp_deployments[0]]
+                return context
+            context.candidate_models = [deployments[0]]
+            return context
+            
+        least_busy_node = valid_fallback_nodes[0]
+        min_load = current_loads[least_busy_node]
+        
+        for node in valid_fallback_nodes[1:]:
+            if current_loads[node] < min_load:
+                min_load = current_loads[node]
+                least_busy_node = node
+
+        if len(valid_fallback_nodes) == 2 and current_loads["NODE_RYZEN_ONE"] == current_loads["NODE_RYZEN_TWO"]:
+            least_busy_node = random.choice(["NODE_RYZEN_ONE", "NODE_RYZEN_TWO"])
+            
+        context.candidate_models = [node_deployments[least_busy_node][0]]
+        return context
+
+hardware_group_plugin = HardwareGroupPlugin()
+EOF
+chown "${LITELLM_USER}:${LITELLM_USER}" "${LITELLM_DIR}/hardware_group_router_litellm.py" 2>/dev/null || true
+
+# -----------------------------------------------------------------------------
+# Step 7b: Write LiteLLM Cluster Configuration YAML
 # -----------------------------------------------------------------------------
 cat > "${LITELLM_CONFIG}" <<EOF
 # =============================================================================
@@ -920,7 +1043,7 @@ model_list:
   # ---------------------------------------------------------------------------
   - model_name: "gemma-4-31b"
     litellm_params:
-      model: "openai/Gemma-4-31B-it-GGUF"
+      model: "openai/gemma-4-31B-it-GGUF-UD-Q4_K_XL"
       api_base: "${NODE_RYZEN_ONE}"
       api_key: "dummy"
       rpm: 300
@@ -928,7 +1051,7 @@ model_list:
 
   - model_name: "gemma-4-31b"
     litellm_params:
-      model: "openai/Gemma-4-31B-it-GGUF"
+      model: "openai/gemma-4-31B-it-GGUF-UD-Q4_K_XL"
       api_base: "${NODE_RYZEN_TWO}"
       api_key: "dummy"
       rpm: 300
@@ -949,7 +1072,7 @@ model_list:
   # ---------------------------------------------------------------------------
   - model_name: "qwen-3.8-27b"
     litellm_params:
-      model: "openai/mlx-community/Qwen3.8-27B-bf16"
+      model: "openai/mlx-community/Qwen3.8-27B-4bit"
       api_base: "${NODE_MBP_MLX}"
       api_key: "dummy"
       rpm: 120
@@ -961,7 +1084,7 @@ model_list:
   # ---------------------------------------------------------------------------
   - model_name: "qwen-3.8-27b"
     litellm_params:
-      model: "openai/Qwen3.8-27B-GGUF-Q8_0"
+      model: "openai/Qwen3.8-27B-GGUF-Q4_0"
       api_base: "${NODE_RYZEN_ONE}"
       api_key: "dummy"
       rpm: 300
@@ -969,7 +1092,7 @@ model_list:
 
   - model_name: "qwen-3.8-27b"
     litellm_params:
-      model: "openai/Qwen3.8-27B-GGUF-Q8_0"
+      model: "openai/Qwen3.8-27B-GGUF-Q4_0"
       api_base: "${NODE_RYZEN_TWO}"
       api_key: "dummy"
       rpm: 300
@@ -1002,7 +1125,9 @@ model_list:
       order: 3
 
 router_settings:
-  routing_strategy: "${ROUTING_STRATEGY}"
+  routing_strategy: "simple-shuffle"
+  plugins:
+    - hardware_group_router_litellm.hardware_group_plugin
   routing_strategy_args:
     ttl: 30
   num_retries: 10
