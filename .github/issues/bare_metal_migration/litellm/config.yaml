@@ -1,0 +1,116 @@
+# =============================================================================
+# Turnstone LiteLLM Load Balancer Configuration (Debian Trixie Container)
+# Load Balancing: MBP Activity Prioritization + Least-Busy queue balancing
+# =============================================================================
+
+model_list:
+  # ---------------------------------------------------------------------------
+  # 1. Gemma 4 31B (General Reasoning / Orchestrator)
+  # Balanced across Node 1, Node 2, & Node 3 Ollama (gemma4:31b-mlx)
+  # ---------------------------------------------------------------------------
+  - model_name: "gemma-4-31b"
+    litellm_params:
+      model: "openai/gemma-4-31B-it-GGUF-UD-Q4_K_XL"
+      api_base: "${NODE_RYZEN_ONE}"
+      api_key: "dummy"
+      rpm: 300
+      order: 1
+
+  - model_name: "gemma-4-31b"
+    litellm_params:
+      model: "openai/gemma-4-31B-it-GGUF-UD-Q4_K_XL"
+      api_base: "${NODE_RYZEN_TWO}"
+      api_key: "dummy"
+      rpm: 300
+      order: 2
+
+  - model_name: "gemma-4-31b"
+    litellm_params:
+      model: "openai/gemma4:31b"
+      api_base: "${NODE_MBP_OLLAMA}"
+      api_key: "dummy"
+      rpm: 300
+      order: 3
+
+  # --------------------------------------------------------------------------- 
+  # 2. Qwen 3.8 27B (Deep 128k Context Coding Model)
+  # Primary: MacBook Pro M5 MLX Server (Port 8000)
+  # Fallback: MacBook Pro M5 Ollama (Port 11434)
+  # ---------------------------------------------------------------------------
+  - model_name: "qwen-3.8-27b"
+    litellm_params:
+      model: "openai/mlx-community/Qwen3.8-27B-4bit"
+      api_base: "${NODE_MBP_MLX}"
+      api_key: "dummy"
+      rpm: 120
+      order: 1
+
+  # ---------------------------------------------------------------------------
+  # 3. Qwen 3.8 27B (High Precision Reasoning / Coding)
+  # Balanced across Node 1, Node 2, & Node 3 Ollama (qwen3.8:27b)
+  # ---------------------------------------------------------------------------
+  - model_name: "qwen-3.8-27b"
+    litellm_params:
+      model: "openai/Qwen3.8-27B-GGUF-Q4_0"
+      api_base: "${NODE_RYZEN_ONE}"
+      api_key: "dummy"
+      rpm: 300
+      order: 2
+
+  - model_name: "qwen-3.8-27b"
+    litellm_params:
+      model: "openai/Qwen3.8-27B-GGUF-Q4_0"
+      api_base: "${NODE_RYZEN_TWO}"
+      api_key: "dummy"
+      rpm: 300
+      order: 3
+
+
+  # ---------------------------------------------------------------------------
+  # 5. Ornith Latest (Fast Agentic Model / Tool Calling)
+  # Hosted on MacBook Pro M5 Ollama (ornith:latest)
+  # ---------------------------------------------------------------------------
+  - model_name: "ornith-1.5-9b"
+    litellm_params:
+      model: "openai/ornith-1.5:9b"
+      api_base: "${NODE_MBP_OLLAMA}"
+      api_key: "dummy"
+      order: 1
+
+  - model_name: "ornith-1.5-9b"
+    litellm_params:
+      model: "openai/Ornith-1.5-9B-GGUF-Q8_0"
+      api_base: "${NODE_RYZEN_ONE}"
+      api_key: "dummy"
+      order: 2
+
+  - model_name: "ornith-1.5-9b"
+    litellm_params:
+      model: "openai/Ornith-1.5-9B-GGUF-Q8_0"
+      api_base: "${NODE_RYZEN_TWO}"
+      api_key: "dummy"
+      order: 3
+
+router_settings:
+  routing_strategy: "simple-shuffle"
+  plugins:
+    - hardware_group_router_litellm.hardware_group_plugin
+  routing_strategy_args:
+    ttl: 30
+  num_retries: 10
+  timeout: 600
+  allowed_fails: 4
+  cooldown_time: 30
+
+general_settings:
+  master_key: "${MASTER_KEY}"
+  database_url: "${DATABASE_URL}"
+  store_model_in_db: true
+  store_prompts_in_spend_logs: true
+  maximum_spend_logs_retention_period: "21d"
+  drop_params: true
+
+litellm_settings:
+  drop_params: true
+  set_verbose: false
+  telemetry: false

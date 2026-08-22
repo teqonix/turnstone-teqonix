@@ -905,250 +905,49 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# Step 7a: Write Custom Python Router (HardwareGroupRouter)
+# Step 7a: Fetch and Configure LiteLLM Router and Config
 # -----------------------------------------------------------------------------
-log_info "Writing Custom Python Router to ${LITELLM_DIR}/hardware_group_router_litellm.py..."
-cat > "${LITELLM_DIR}/hardware_group_router_litellm.py" << 'EOF'
-import litellm
-from litellm.integrations.custom_logger import CustomLogger
-from litellm.types.router import RoutingContext
-from typing import Optional, List, Dict, Union
-import random
-import threading
-import logging
+log_info "Fetching LiteLLM Router and Configuration files..."
 
-logger = logging.getLogger(__name__)
-
-class ActiveRequestTracker:
-    def __init__(self):
-        self.node_loads = {"NODE_RYZEN_ONE": 0, "NODE_RYZEN_TWO": 0, "NODE_MBP": 0, "UNKNOWN": 0}
-        self.lock = threading.Lock()
-
-    def increment(self, node: str):
-        if node in self.node_loads:
-            with self.lock:
-                self.node_loads[node] += 1
-
-    def decrement(self, node: str):
-        if node in self.node_loads:
-            with self.lock:
-                self.node_loads[node] = max(0, self.node_loads[node] - 1)
-
-    def get_loads(self):
-        with self.lock:
-            return self.node_loads.copy()
-
-tracker = ActiveRequestTracker()
-
-def get_node_from_api_base(api_base: str) -> str:
-    if not api_base:
-        return "UNKNOWN"
-    if "amd-ai-core-one.lan" in api_base:
-        return "NODE_RYZEN_ONE"
-    elif "amd-ai-core-two.lan" in api_base:
-        return "NODE_RYZEN_TWO"
-    elif "mbp-ai-core.lan" in api_base:
-        return "NODE_MBP"
-    return "UNKNOWN"
-
-class HardwareGroupTrackerLogger(CustomLogger):
-    def log_pre_api_call(self, kwargs, completion_kwargs):
-        api_base = kwargs.get("api_base") or (kwargs.get("litellm_params") or {}).get("api_base")
-        node = get_node_from_api_base(api_base)
-        tracker.increment(node)
-
-    def log_success_event(self, kwargs, response_obj, start_time, end_time):
-        api_base = kwargs.get("api_base") or (kwargs.get("litellm_params") or {}).get("api_base")
-        node = get_node_from_api_base(api_base)
-        tracker.decrement(node)
-
-    def log_failure_event(self, kwargs, response_obj, start_time, end_time):
-        api_base = kwargs.get("api_base") or (kwargs.get("litellm_params") or {}).get("api_base")
-        node = get_node_from_api_base(api_base)
-        tracker.decrement(node)
-
-if not getattr(litellm, "callbacks", None):
-    litellm.callbacks = []
-litellm.callbacks.append(HardwareGroupTrackerLogger())
-
-class HardwareGroupPlugin:
-    async def run(self, context: RoutingContext) -> RoutingContext:
-        deployments = context.candidate_models
-        if not deployments:
-            return context
-
-        node_deployments = {"NODE_RYZEN_ONE": [], "NODE_RYZEN_TWO": [], "NODE_MBP": [], "UNKNOWN": []}
-
-        for deployment in deployments:
-            litellm_params = deployment.get("litellm_params", {})
-            api_base = litellm_params.get("api_base", "")
-            node = get_node_from_api_base(api_base)
-            node_deployments[node].append(deployment)
-
-        current_loads = tracker.get_loads()
-        logger.info(f"HardwareGroupPlugin loads: {current_loads}")
-
-        mbp_deployments = node_deployments.get("NODE_MBP", [])
-        if mbp_deployments and current_loads["NODE_MBP"] == 0:
-            context.candidate_models = [mbp_deployments[0]]
-            return context
-
-        ryzen_one = node_deployments.get("NODE_RYZEN_ONE", [])
-        ryzen_two = node_deployments.get("NODE_RYZEN_TWO", [])
-        
-        valid_fallback_nodes = []
-        if ryzen_one:
-            valid_fallback_nodes.append("NODE_RYZEN_ONE")
-        if ryzen_two:
-            valid_fallback_nodes.append("NODE_RYZEN_TWO")
-            
-        if not valid_fallback_nodes:
-            if mbp_deployments:
-                context.candidate_models = [mbp_deployments[0]]
-                return context
-            context.candidate_models = [deployments[0]]
-            return context
-            
-        least_busy_node = valid_fallback_nodes[0]
-        min_load = current_loads[least_busy_node]
-        
-        for node in valid_fallback_nodes[1:]:
-            if current_loads[node] < min_load:
-                min_load = current_loads[node]
-                least_busy_node = node
-
-        if len(valid_fallback_nodes) == 2 and current_loads["NODE_RYZEN_ONE"] == current_loads["NODE_RYZEN_TWO"]:
-            least_busy_node = random.choice(["NODE_RYZEN_ONE", "NODE_RYZEN_TWO"])
-            
-        context.candidate_models = [node_deployments[least_busy_node][0]]
-        return context
-
-hardware_group_plugin = HardwareGroupPlugin()
+fetch_and_install_file() {
+    local filename="$1"
+    local dest="$2"
+    local interpolate="${3:-false}"
+    
+    local local_path="${SCRIPT_DIR}/litellm/${filename}"
+    local remote_url="https://raw.githubusercontent.com/teqonix/turnstone-teqonix/main/.github/issues/bare_metal_migration/litellm/${filename}"
+    
+    local tmp_file="/tmp/${filename}"
+    
+    if [ -f "${local_path}" ]; then
+        log_info "Found local ${filename}, copying..."
+        cp "${local_path}" "${tmp_file}"
+    else
+        log_info "Fetching ${filename} from remote..."
+        curl -sSfL "${remote_url}" -o "${tmp_file}" || {
+            log_error "Failed to fetch ${filename}"
+            exit 1
+        }
+    fi
+    
+    if [ "${interpolate}" = true ]; then
+        log_info "Interpolating variables in ${filename}..."
+        export NODE_RYZEN_ONE NODE_RYZEN_TWO NODE_MBP_OLLAMA NODE_MBP_MLX MASTER_KEY DATABASE_URL
+        eval "cat <<EOF
+$(cat "${tmp_file}")
 EOF
+" > "${dest}"
+    else
+        cp "${tmp_file}" "${dest}"
+    fi
+    
+    rm -f "${tmp_file}"
+}
+
+fetch_and_install_file "hardware_group_router_litellm.py" "${LITELLM_DIR}/hardware_group_router_litellm.py" false
 chown "${LITELLM_USER}:${LITELLM_USER}" "${LITELLM_DIR}/hardware_group_router_litellm.py" 2>/dev/null || true
 
-# -----------------------------------------------------------------------------
-# Step 7b: Write LiteLLM Cluster Configuration YAML
-# -----------------------------------------------------------------------------
-cat > "${LITELLM_CONFIG}" <<EOF
-# =============================================================================
-# Turnstone LiteLLM Load Balancer Configuration (Debian Trixie Container)
-# Load Balancing: MBP Activity Prioritization + Least-Busy queue balancing
-# =============================================================================
-
-model_list:
-  # ---------------------------------------------------------------------------
-  # 1. Gemma 4 31B (General Reasoning / Orchestrator)
-  # Balanced across Node 1, Node 2, & Node 3 Ollama (gemma4:31b-mlx)
-  # ---------------------------------------------------------------------------
-  - model_name: "gemma-4-31b"
-    litellm_params:
-      model: "openai/gemma-4-31B-it-GGUF-UD-Q4_K_XL"
-      api_base: "${NODE_RYZEN_ONE}"
-      api_key: "dummy"
-      rpm: 300
-      order: 1
-
-  - model_name: "gemma-4-31b"
-    litellm_params:
-      model: "openai/gemma-4-31B-it-GGUF-UD-Q4_K_XL"
-      api_base: "${NODE_RYZEN_TWO}"
-      api_key: "dummy"
-      rpm: 300
-      order: 2
-
-  - model_name: "gemma-4-31b"
-    litellm_params:
-      model: "openai/gemma4:31b"
-      api_base: "${NODE_MBP_OLLAMA}"
-      api_key: "dummy"
-      rpm: 300
-      order: 3
-
-  # --------------------------------------------------------------------------- 
-  # 2. Qwen 3.8 27B (Deep 128k Context Coding Model)
-  # Primary: MacBook Pro M5 MLX Server (Port 8000)
-  # Fallback: MacBook Pro M5 Ollama (Port 11434)
-  # ---------------------------------------------------------------------------
-  - model_name: "qwen-3.8-27b"
-    litellm_params:
-      model: "openai/mlx-community/Qwen3.8-27B-4bit"
-      api_base: "${NODE_MBP_MLX}"
-      api_key: "dummy"
-      rpm: 120
-      order: 1
-
-  # ---------------------------------------------------------------------------
-  # 3. Qwen 3.8 27B (High Precision Reasoning / Coding)
-  # Balanced across Node 1, Node 2, & Node 3 Ollama (qwen3.8:27b)
-  # ---------------------------------------------------------------------------
-  - model_name: "qwen-3.8-27b"
-    litellm_params:
-      model: "openai/Qwen3.8-27B-GGUF-Q4_0"
-      api_base: "${NODE_RYZEN_ONE}"
-      api_key: "dummy"
-      rpm: 300
-      order: 2
-
-  - model_name: "qwen-3.8-27b"
-    litellm_params:
-      model: "openai/Qwen3.8-27B-GGUF-Q4_0"
-      api_base: "${NODE_RYZEN_TWO}"
-      api_key: "dummy"
-      rpm: 300
-      order: 3
-
-
-  # ---------------------------------------------------------------------------
-  # 5. Ornith Latest (Fast Agentic Model / Tool Calling)
-  # Hosted on MacBook Pro M5 Ollama (ornith:latest)
-  # ---------------------------------------------------------------------------
-  - model_name: "ornith-1.5-9b"
-    litellm_params:
-      model: "openai/ornith-1.5:9b"
-      api_base: "${NODE_MBP_OLLAMA}"
-      api_key: "dummy"
-      order: 1
-
-  - model_name: "ornith-1.5-9b"
-    litellm_params:
-      model: "openai/Ornith-1.5-9B-GGUF-Q8_0"
-      api_base: "${NODE_RYZEN_ONE}"
-      api_key: "dummy"
-      order: 2
-
-  - model_name: "ornith-1.5-9b"
-    litellm_params:
-      model: "openai/Ornith-1.5-9B-GGUF-Q8_0"
-      api_base: "${NODE_RYZEN_TWO}"
-      api_key: "dummy"
-      order: 3
-
-router_settings:
-  routing_strategy: "simple-shuffle"
-  plugins:
-    - hardware_group_router_litellm.hardware_group_plugin
-  routing_strategy_args:
-    ttl: 30
-  num_retries: 10
-  timeout: 600
-  allowed_fails: 4
-  cooldown_time: 30
-
-general_settings:
-  master_key: "${MASTER_KEY}"
-  database_url: "${DATABASE_URL}"
-  store_model_in_db: true
-  store_prompts_in_spend_logs: true
-  maximum_spend_logs_retention_period: "21d"
-  drop_params: true
-
-litellm_settings:
-  drop_params: true
-  set_verbose: false
-  telemetry: false
-EOF
-
+fetch_and_install_file "config.yaml" "${LITELLM_CONFIG}" true
 chown -R "${LITELLM_USER}:${LITELLM_USER}" "${LITELLM_DIR}"
 chmod 600 "${LITELLM_CONFIG}"
 log_success "Configuration created at ${LITELLM_CONFIG}."
