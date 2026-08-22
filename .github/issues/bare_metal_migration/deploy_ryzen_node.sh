@@ -575,7 +575,7 @@ chmod +x "${VENV_DIR}/bin"/* 2>/dev/null || true
 
 # Symlink binaries to /usr/local/bin
 mkdir -p /usr/local/bin
-for tool_bin in turnstone-server hf huggingface-cli; do
+for tool_bin in turnstone-server hf; do
     if [ -x "${VENV_DIR}/bin/${tool_bin}" ]; then
         ln -sfn "${VENV_DIR}/bin/${tool_bin}" "/usr/local/bin/${tool_bin}" 2>/dev/null || true
     fi
@@ -775,11 +775,13 @@ sudo -u "${TURNSTONE_USER_DEBIAN}" -H bash -c "
     export PATH=\"${VENV_DIR}/bin:${CARGO_DIR}/bin:${LOCAL_BREW_DIR}/bin:/usr/local/bin:/usr/bin:/bin:\$PATH\"
     export HF_TOKEN=\"${HF_TOKEN}\"
     export HUGGING_FACE_HUB_TOKEN=\"${HF_TOKEN}\"
-    if command -v huggingface-cli &>/dev/null; then
+    if command -v hf &>/dev/null; then
         if [ -n \"${HF_TOKEN}\" ]; then
-            huggingface-cli login --token \"${HF_TOKEN}\" 2>/dev/null || true
+            hf login --token \"${HF_TOKEN}\" 2>/dev/null || true
         fi
-        huggingface-cli download itlwas/Mistral-Nemo-Base-2407-Q4_K_M-GGUF --local-dir-use-symlinks False 2>/dev/null || true
+        hf download unsloth/Qwen3.8-27B-GGUF:Q4_0 --local-dir-use-symlinks False 2>/dev/null || true
+        hf download openai/Ornith-1.5-9B-GGUF-Q8_0 --local-dir-use-symlinks False 2>/dev/null || true
+        hf download unsloth/gemma-4-31B-it-GGUF:UD-Q4_K_XL --local-dir-use-symlinks False 2>/dev/null || true
     fi
 "
 log_success "Judge model verified (itlwas/Mistral-Nemo-Base-2407-Q4_K_M-GGUF)."

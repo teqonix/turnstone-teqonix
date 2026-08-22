@@ -547,7 +547,7 @@ ln -sfn '${MLX_WRAPPER}' '${VENV_DIR}/bin/mlx_lm' 2>/dev/null || true
 
 # Create global symlinks in /usr/local/bin for all users
 sudo mkdir -p /usr/local/bin 2>/dev/null || true
-for tool_bin in mlx-lm mlx_lm mlx_lm.server mlx_lm.generate mlx_lm.convert mlx_lm.lora mlx_lm.fuse turnstone-server hf huggingface-cli; do
+for tool_bin in mlx-lm mlx_lm mlx_lm.server mlx_lm.generate mlx_lm.convert mlx_lm.lora mlx_lm.fuse turnstone-server hf; do
     if [ -x "${VENV_DIR}/bin/${tool_bin}" ]; then
         sudo ln -sfn "${VENV_DIR}/bin/${tool_bin}" "/usr/local/bin/${tool_bin}" 2>/dev/null || true
     fi
@@ -992,12 +992,12 @@ run_as_target_user "
     export PATH=\"${VENV_DIR}/bin:${USER_HOME}/.local/bin:\$PATH\"
     export HF_TOKEN=\"${HF_TOKEN}\"
     export HUGGING_FACE_HUB_TOKEN=\"${HF_TOKEN}\"
-    if command -v huggingface-cli &>/dev/null; then
+    if command -v hf &>/dev/null; then
         if [ -n \"${HF_TOKEN}\" ]; then
-            huggingface-cli login --token \"${HF_TOKEN}\" 2>/dev/null || true
+            hf login --token \"${HF_TOKEN}\" 2>/dev/null || true
         fi
-        huggingface-cli download mlx-community/Qwen3.8-27B-4bit --local-dir-use-symlinks False 2>/dev/null || true
-        huggingface-cli download mistralai/Mistral-Nemo-Base-2407 --local-dir-use-symlinks False 2>/dev/null || true
+        hf download mlx-community/Qwen3.8-27B-4bit --local-dir-use-symlinks False 2>/dev/null || true
+        hf download mistralai/Mistral-Nemo-Base-2407 --local-dir-use-symlinks False 2>/dev/null || true
     fi
 "
 log_success "MLX and Hugging Face models verified (Qwen3.8-27B-4bit, Mistral-Nemo-Base-2407)."
@@ -1015,11 +1015,8 @@ log_info "Pulling Ollama models (Qwen 3.8 27B, Gemma 4 31B, Mistral Nemo 12B, Or
 run_as_target_user "
     eval \"\$(${LOCAL_BREW_DIR}/bin/brew shellenv)\"
     export OLLAMA_HOST=127.0.0.1:11434
-    echo 'Pulling Qwen 3.8 27B model into Ollama...'
-    ollama pull qwen3.8:27b-8bit 2>/dev/null || ollama pull qwen3.8:27b 2>/dev/null || ollama pull qwen3.8:latest 2>/dev/null || ollama pull qwen2.5:32b 2>/dev/null || true
-
     echo 'Pulling Gemma 4 31B model into Ollama...'
-    ollama pull gemma4:31b-8bit 2>/dev/null || ollama pull gemma4:31b 2>/dev/null || ollama pull gemma4:latest 2>/dev/null || ollama pull gemma:31b 2>/dev/null || true
+    ollama pull gemma4:31b 2>/dev/null || true
 
     echo 'Pulling Mistral Nemo 12B judge model into Ollama...'
     ollama pull mistral-nemo:12b 2>/dev/null || ollama pull mistral-nemo:latest 2>/dev/null || ollama pull mistral-nemo 2>/dev/null || true
@@ -1028,8 +1025,8 @@ run_as_target_user "
     ollama create mistral-nemo:12b -f /tmp/Modelfile.mistral-nemo 2>/dev/null || true
     rm -f /tmp/Modelfile.mistral-nemo
 
-    echo 'Pulling Ornith Latest model into Ollama...'
-    ollama pull ornith:latest 2>/dev/null || true
+    echo 'Pulling Ornith 1.5 9B model into Ollama...'
+    ollama pull ornith-1.5:9b 2>/dev/null || true
 "
 log_success "Ollama models pulled and context parameters tuned successfully."
 
