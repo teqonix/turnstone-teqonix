@@ -2,7 +2,6 @@ import litellm
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.types.router import RoutingContext
 from typing import Optional, List, Dict, Any
-import random
 import threading
 import logging
 import sys
@@ -29,6 +28,13 @@ if not logger.handlers:
 # Configuration & Weight Matrix (Capacity Budget: 100 per node)
 # ----------------------------------------------------------------------
 NODE_MAX_CAPACITY = 100
+
+# Priority ordered list: lowest index is highest priority
+NODE_PRIORITY_ORDER: List[str] = [
+    "NODE_MBP",  # Apple silicon is still the best price / performance; always use it first
+    "NODE_RYZEN_ONE",
+    "NODE_RYZEN_TWO"
+]
 
 MODEL_WEIGHTS: Dict[str, int] = {
     "gemma": 80,    # Heavy (80) - Mutual exclusion with Qwen and Gemma
@@ -114,6 +120,13 @@ def get_node_from_api_base(api_base: str) -> str:
         return "NODE_MBP"
     return "UNKNOWN"
 
+def select_highest_priority_node(candidates: List[str]) -> str:
+    """Pick the highest priority node from the candidates list according to NODE_PRIORITY_ORDER."""
+    for node in NODE_PRIORITY_ORDER:
+        if node in candidates:
+            return node
+    return candidates[0] if candidates else "UNKNOWN"
+
 class HardwareGroupTrackerLogger(CustomLogger):
     def _extract_call_info(self, kwargs: dict) -> tuple[Optional[str], str, int]:
         call_id = kwargs.get("litellm_call_id") or kwargs.get("call_id")
@@ -168,17 +181,17 @@ class HardwareGroupPlugin:
 
         # Step 1: Find eligible nodes that have capacity budget: current_load + weight <= NODE_MAX_CAPACITY
         eligible_nodes = []
-        for node in ["NODE_MBP", "NODE_RYZEN_ONE", "NODE_RYZEN_TWO"]:
+        for node in NODE_PRIORITY_ORDER:
             if node_deployments[node]:
                 if current_loads[node] + weight <= NODE_MAX_CAPACITY:
                     eligible_nodes.append(node)
 
-        # Step 2: If eligible nodes exist, pick the one with maximum remaining capacity margin (least-loaded)
+        # Step 2: If eligible nodes exist, pick the least-loaded node, tie-breaking by NODE_PRIORITY_ORDER
         if eligible_nodes:
             eligible_nodes.sort(key=lambda n: current_loads[n])
             min_load = current_loads[eligible_nodes[0]]
             candidates_with_min_load = [n for n in eligible_nodes if current_loads[n] == min_load]
-            chosen_node = random.choice(candidates_with_min_load)
+            chosen_node = select_highest_priority_node(candidates_with_min_load)
             
             logger.info(
                 f"[ROUTE] Model='{requested_model}' (Weight={weight}) -> Selected '{chosen_node}' "
@@ -188,17 +201,17 @@ class HardwareGroupPlugin:
             context.candidate_models = [node_deployments[chosen_node][0]]
             return context
 
-        # Step 3: If no node is below capacity, fallback to node with least current load
-        all_available_nodes = [n for n in ["NODE_RYZEN_ONE", "NODE_RYZEN_TWO", "NODE_MBP"] if node_deployments[n]]
+        # Step 3: If no node is below capacity, fallback to node with least current load, tie-breaking by priority
+        all_available_nodes = [n for n in NODE_PRIORITY_ORDER if node_deployments[n]]
         if all_available_nodes:
             all_available_nodes.sort(key=lambda n: current_loads[n])
             min_load = current_loads[all_available_nodes[0]]
             candidates_with_min_load = [n for n in all_available_nodes if current_loads[n] == min_load]
-            chosen_node = random.choice(candidates_with_min_load)
+            chosen_node = select_highest_priority_node(candidates_with_min_load)
             
             logger.warning(
                 f"[OVER-BUDGET ROUTE] Model='{requested_model}' (Weight={weight}) exceeds headroom on all nodes! "
-                f"Routing to least-loaded '{chosen_node}' | {tracker.format_loads()}"
+                f"Routing to '{chosen_node}' | {tracker.format_loads()}"
             )
             sys.stdout.flush()
             context.candidate_models = [node_deployments[chosen_node][0]]
