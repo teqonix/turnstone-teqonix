@@ -211,16 +211,16 @@ auto_load_all_secrets() {
     calling_user_home="$(getent passwd "${calling_user}" 2>/dev/null | cut -d: -f6 || echo "${HOME}")"
 
     local search_dirs=(
+        "/etc/turnstone/secrets"
+        "/etc/turnstone"
         "${SCRIPT_DIR}/secrets"
         "${REPO_ROOT}/secrets"
-        "${REPO_ROOT}/.github/issues/bare_metal_migration/secrets"
-        "${SCRIPT_DIR}"
+        "${calling_user_home}/.turnstone/secrets"
+        "${calling_user_home}/.turnstone"
+        "${calling_user_home}/.secrets"
+        "${HOME}/.turnstone/secrets"
+        "${HOME}/.turnstone"
         "/secrets"
-        "${calling_user_home}/nerd_projects/turnstone-teqonix/.github/issues/bare_metal_migration/secrets"
-        "${calling_user_home}/nerd_projects/turnstone-teqonix/secrets"
-        "${HOME}/nerd_projects/turnstone-teqonix/.github/issues/bare_metal_migration/secrets"
-        "${HOME}/nerd_projects/turnstone-teqonix/secrets"
-        "/etc/turnstone"
     )
 
     # 1. PostgreSQL Secret Discovery & Parsing
@@ -560,12 +560,12 @@ fi
 log_info "Creating virtual environment at ${VENV_DIR} using system ${SYSTEM_PYTHON}..."
 uv venv "${VENV_DIR}" --python "${SYSTEM_PYTHON}"
 
-log_info "Installing turnstone and huggingface_hub packages into virtualenv..."
+log_info "Installing turnstone, fastapi, uvicorn, httpx, and huggingface_hub packages into virtualenv..."
 if [ -f "${REPO_ROOT}/pyproject.toml" ]; then
-    uv pip install --python "${VENV_DIR}" 'huggingface_hub[cli]'
+    uv pip install --python "${VENV_DIR}" fastapi 'uvicorn[standard]' httpx pydantic 'huggingface_hub[cli]'
     uv pip install --python "${VENV_DIR}" --reinstall "${REPO_ROOT}"
 else
-    uv pip install --python "${VENV_DIR}" turnstone 'huggingface_hub[cli]'
+    uv pip install --python "${VENV_DIR}" turnstone fastapi 'uvicorn[standard]' httpx pydantic 'huggingface_hub[cli]'
 fi
 
 # Fix ownership and execution permissions for turnstone user
@@ -770,7 +770,7 @@ if [ -n "${HF_TOKEN}" ]; then
 fi
 
 # Step 5e: Download and Verify Mistral-Nemo-Base-2407 Judge Model
-log_info "Step 5e: Checking / downloading judge model 'itlwas/Mistral-Nemo-Base-2407-Q4_K_M-GGUF' via Hugging Face..."
+log_info "Step 5e: Checking / downloading models via Hugging Face..."
 sudo -u "${TURNSTONE_USER_DEBIAN}" -H bash -c "
     export PATH=\"${VENV_DIR}/bin:${CARGO_DIR}/bin:${LOCAL_BREW_DIR}/bin:/usr/local/bin:/usr/bin:/bin:\$PATH\"
     export HF_TOKEN=\"${HF_TOKEN}\"
@@ -784,7 +784,7 @@ sudo -u "${TURNSTONE_USER_DEBIAN}" -H bash -c "
         hf download unsloth/gemma-4-31B-it-GGUF:UD-Q4_K_XL --local-dir-use-symlinks False 2>/dev/null || true
     fi
 "
-log_success "Judge model verified (itlwas/Mistral-Nemo-Base-2407-Q4_K_M-GGUF)."
+log_success "Models verified."
 
 # Step 6: Configure /etc/turnstone/config.toml Secrets
 log_info "Step 6: Writing secrets configuration to /etc/turnstone/config.toml..."
@@ -841,69 +841,73 @@ ln -sfn "${MOUNT_POINT}" /data
 ln -sfn "${MOUNT_POINT}" /workspace
 log_success "SMB storage configured for startup mount at ${MOUNT_POINT} (symlinked to /data and /workspace)."
 
-# Step 8: Install Systemd Service Unit & Drop-in
-log_info "Step 8: Installing Systemd units..."
-
-cat > /etc/systemd/system/turnstone-server.service <<EOF
-[Unit]
-Description=Turnstone Server Node
-After=network.target network-online.target remote-fs.target
-Wants=network-online.target remote-fs.target
-RequiresMountsFor=${MOUNT_POINT}
-
-[Service]
-Type=simple
-User=${TURNSTONE_USER_DEBIAN}
-Group=${TURNSTONE_USER_DEBIAN}
-WorkingDirectory=${MOUNT_POINT}
-ExecStart=/opt/turnstone-venv/bin/turnstone-server --host 0.0.0.0 --port 8080 --config /etc/turnstone/config.toml
-Restart=always
-RestartSec=5s
-LimitNOFILE=65536
-
-[Install]
-WantedBy=multi-user.target
+# Helper: Modular File Fetch & Installation
+fetch_and_install_file() {
+    local filename="$1"
+    local dest="$2"
+    local interpolate="${3:-false}"
+    
+    local local_path="${SCRIPT_DIR}/ryzen_node_custom/${filename}"
+    local remote_url="https://raw.githubusercontent.com/teqonix/turnstone-teqonix/main/.github/issues/bare_metal_migration/ryzen_node_custom/${filename}"
+    local tmp_file="/tmp/${filename}"
+    
+    if [ -f "${local_path}" ]; then
+        log_info "Found local ${filename}, copying..."
+        cp "${local_path}" "${tmp_file}"
+    else
+        log_info "Fetching ${filename} from remote (${remote_url})..."
+        curl -sSfL "${remote_url}" -o "${tmp_file}" || {
+            log_error "Failed to fetch ${filename}"
+            exit 1
+        }
+    fi
+    
+    if [ "${interpolate}" = true ]; then
+        eval "cat <<EOF
+$(cat "${tmp_file}")
 EOF
+" > "${dest}"
+    else
+        cp "${tmp_file}" "${dest}"
+    fi
+    rm -f "${tmp_file}"
+}
+
+# Step 8: Install Systemd Service Units & Dynamic Lemonade Manager Sidecar
+log_info "Step 8: Installing Systemd units & Dynamic Lemonade Sidecar..."
+
+# 1. Install Dynamic Lemonade Manager (Port 13305)
+RYZEN_CUSTOM_DIR="/etc/turnstone/ryzen_node_custom"
+mkdir -p "${RYZEN_CUSTOM_DIR}"
+fetch_and_install_file "dynamic_lemonade_manager.py" "${RYZEN_CUSTOM_DIR}/dynamic_lemonade_manager.py" false
+chown -R "${TURNSTONE_USER_DEBIAN}:${TURNSTONE_USER_DEBIAN}" "${RYZEN_CUSTOM_DIR}"
+chmod +x "${RYZEN_CUSTOM_DIR}/dynamic_lemonade_manager.py"
+
+fetch_and_install_file "lemonade-manager.service" "/etc/systemd/system/lemonade-manager.service" true
+systemctl daemon-reload
+systemctl enable lemonade-manager.service
+systemctl restart lemonade-manager.service || true
+log_success "Dynamic Lemonade Manager service enabled and started on port 13305."
+
+# 2. Install Turnstone Server Service Unit
+fetch_and_install_file "turnstone-server.service" "/etc/systemd/system/turnstone-server.service" true
 
 mkdir -p /etc/systemd/system/turnstone-server.service.d
-cat > /etc/systemd/system/turnstone-server.service.d/node.conf <<EOF
-[Service]
-Environment="PATH=/opt/turnstone-venv/bin:${CARGO_DIR}/bin:${LOCAL_BREW_DIR}/bin:/usr/local/bin:/usr/bin:/bin"
-Environment="TURNSTONE_NODE_ID=${NODE_ID}"
-Environment="TURNSTONE_ADVERTISE_URL=http://${LAN_IP}:8080"
-Environment="TURNSTONE_CONSOLE_URL=http://${COORDINATOR_IP}:8090"
-Environment="TURNSTONE_SEARXNG_URL=http://${COORDINATOR_IP}:8081"
-Environment="TURNSTONE_CONFIG=/etc/turnstone/config.toml"
-Environment="TURNSTONE_DB_BACKEND=postgresql"
-Environment="TURNSTONE_DB_URL=postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}"
-Environment="TURNSTONE_STORAGE_DIR=${MOUNT_POINT}"
-Environment="TURNSTONE_SMB_MOUNT=${MOUNT_POINT}"
-Environment="TURNSTONE_WORKSPACE=${MOUNT_POINT}"
-Environment="HF_TOKEN=${HF_TOKEN}"
-Environment="HUGGING_FACE_HUB_TOKEN=${HF_TOKEN}"
-EOF
+fetch_and_install_file "node.conf" "/etc/systemd/system/turnstone-server.service.d/node.conf" true
 
 # Step 8b: Configure lemon.d / Lemonade Systemctl Config Drop-ins
 if [ -n "${HF_TOKEN}" ]; then
     log_info "Step 8b: Configuring lemon.d / lemonade systemctl environment drop-ins with HF_TOKEN..."
     for svc in lemonade lemon lemon-server lemonade-server; do
         mkdir -p "/etc/systemd/system/${svc}.service.d"
-        cat > "/etc/systemd/system/${svc}.service.d/hf.conf" <<EOF
-[Service]
-Environment="HF_TOKEN=${HF_TOKEN}"
-Environment="HUGGING_FACE_HUB_TOKEN=${HF_TOKEN}"
-EOF
+        fetch_and_install_file "hf.conf" "/etc/systemd/system/${svc}.service.d/hf.conf" true
     done
 
     # User-level drop-ins in case lemonade runs as user service
     USER_SYSTEMD_DIR="${USER_HOME}/.config/systemd/user"
     for svc in lemonade lemon lemon-server lemonade-server; do
         mkdir -p "${USER_SYSTEMD_DIR}/${svc}.service.d"
-        cat > "${USER_SYSTEMD_DIR}/${svc}.service.d/hf.conf" <<EOF
-[Service]
-Environment="HF_TOKEN=${HF_TOKEN}"
-Environment="HUGGING_FACE_HUB_TOKEN=${HF_TOKEN}"
-EOF
+        fetch_and_install_file "hf.conf" "${USER_SYSTEMD_DIR}/${svc}.service.d/hf.conf" true
     done
     chown -R "${TURNSTONE_USER_DEBIAN}:${TURNSTONE_USER_DEBIAN}" "${USER_HOME}/.config" 2>/dev/null || true
 

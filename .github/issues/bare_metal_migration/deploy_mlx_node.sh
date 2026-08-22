@@ -195,16 +195,18 @@ parse_connection_uri() {
 
 auto_load_all_secrets() {
     local search_dirs=(
+        "/etc/turnstone/secrets"
+        "/etc/turnstone"
+        "${CONFIG_DIR:-/etc/turnstone}/secrets"
+        "${CONFIG_DIR:-/etc/turnstone}"
         "${SCRIPT_DIR}/secrets"
         "${REPO_ROOT}/secrets"
-        "${REPO_ROOT}/.github/issues/bare_metal_migration/secrets"
-        "${SCRIPT_DIR}"
+        "${USER_HOME}/.turnstone/secrets"
+        "${USER_HOME}/.turnstone"
+        "${USER_HOME}/.secrets"
+        "${HOME}/.turnstone/secrets"
+        "${HOME}/.turnstone"
         "/secrets"
-        "${USER_HOME}/nerd_projects/turnstone-teqonix/.github/issues/bare_metal_migration/secrets"
-        "${USER_HOME}/nerd_projects/turnstone-teqonix/secrets"
-        "${HOME}/nerd_projects/turnstone-teqonix/.github/issues/bare_metal_migration/secrets"
-        "${HOME}/nerd_projects/turnstone-teqonix/secrets"
-        "/etc/turnstone"
     )
 
     # 1. PostgreSQL Secret Discovery & Parsing
@@ -469,7 +471,7 @@ if [ -n "${HF_TOKEN}" ]; then
     export HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}"
 fi
 
-MOUNT_POINT="/mnt/${SERVER_HOSTNAME}/${REMOTE_USERNAME}/${SHARE_NAME}"
+MOUNT_POINT="${USER_HOME}/mnt/${SERVER_HOSTNAME}/${REMOTE_USERNAME}/${SHARE_NAME}"
 log_success "Configured credentials for PostgreSQL (${POSTGRES_USER}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}) and SMB (${SMB_PATH})."
 
 NODE_ID="mbp-ai-core"
@@ -495,14 +497,14 @@ if [ ! -d "${VENV_DIR}" ]; then
     run_as_target_user "'${UV_BIN}' venv '${VENV_DIR}' --python 3.12"
 fi
 
-log_info "Installing mlx-lm, turnstone, psycopg, and huggingface_hub packages into virtualenv..."
+log_info "Installing mlx-lm, fastapi, uvicorn, httpx, turnstone, psycopg, and huggingface_hub packages into virtualenv..."
 if [ -f "${REPO_ROOT}/pyproject.toml" ]; then
-    run_as_target_user "'${UV_BIN}' pip install --python '${VENV_DIR}' mlx-lm 'psycopg[binary]' 'huggingface_hub[cli]'"
+    run_as_target_user "'${UV_BIN}' pip install --python '${VENV_DIR}' mlx-lm fastapi 'uvicorn[standard]' httpx pydantic 'psycopg[binary]' 'huggingface_hub[cli]'"
     run_as_target_user "'${UV_BIN}' pip install --python '${VENV_DIR}' --reinstall '${REPO_ROOT}'"
 else
-    run_as_target_user "'${UV_BIN}' pip install --python '${VENV_DIR}' mlx-lm turnstone 'psycopg[binary]' 'huggingface_hub[cli]'"
+    run_as_target_user "'${UV_BIN}' pip install --python '${VENV_DIR}' mlx-lm fastapi 'uvicorn[standard]' httpx pydantic turnstone 'psycopg[binary]' 'huggingface_hub[cli]'"
 fi
-log_success "MLX and Turnstone installed successfully."
+log_success "MLX, FastAPI server dependencies, and Turnstone installed successfully."
 
 # Step 3a: Create convenience CLI wrapper for mlx-lm / mlx_lm
 MLX_WRAPPER="${VENV_DIR}/bin/mlx-lm"
@@ -787,198 +789,75 @@ manage_launch_daemon() {
     sudo launchctl kickstart -k "system/${label}" 2>/dev/null || true
 }
 
+# Helper: Modular File Fetch & Installation
+fetch_and_install_file() {
+    local filename="$1"
+    local dest="$2"
+    local interpolate="${3:-false}"
+    
+    local local_path="${SCRIPT_DIR}/mlx_node_custom/${filename}"
+    local remote_url="https://raw.githubusercontent.com/teqonix/turnstone-teqonix/main/.github/issues/bare_metal_migration/mlx_node_custom/${filename}"
+    local tmp_file="/tmp/${filename}"
+    
+    if [ -f "${local_path}" ]; then
+        log_info "Found local ${filename}, copying..."
+        cp "${local_path}" "${tmp_file}"
+    else
+        log_info "Fetching ${filename} from remote (${remote_url})..."
+        curl -sSfL "${remote_url}" -o "${tmp_file}" || {
+            log_error "Failed to fetch ${filename}"
+            exit 1
+        }
+    fi
+    
+    if [ "${interpolate}" = true ]; then
+        eval "cat <<EOF
+$(cat "${tmp_file}")
+EOF
+" > "${dest}"
+    else
+        cp "${tmp_file}" "${dest}"
+    fi
+    rm -f "${tmp_file}"
+}
+
 # Step 5: Configure & Mount Remote SMB Storage at Startup
 log_info "Step 5: Configuring remote SMB mount at ${MOUNT_POINT}..."
 
-if [ ! -d "/mnt" ]; then
-    sudo mkdir -p "/System/Volumes/Data/mnt" 2>/dev/null || true
-    if [ -f "/etc/synthetic.conf" ]; then
-        if ! grep -q "^mnt" /etc/synthetic.conf 2>/dev/null; then
-            printf "mnt\t/System/Volumes/Data/mnt\n" | sudo tee -a /etc/synthetic.conf >/dev/null 2>&1 || true
-        fi
-    else
-        printf "mnt\t/System/Volumes/Data/mnt\n" | sudo tee /etc/synthetic.conf >/dev/null 2>&1 || true
-    fi
-    sudo /System/Library/Filesystems/apfs.fs/Contents/Resources/apfs_synthetic_links 2>/dev/null || true
-fi
-
-sudo mkdir -p "${MOUNT_POINT}" 2>/dev/null || mkdir -p "${MOUNT_POINT}" 2>/dev/null || true
+run_as_target_user "mkdir -p '${MOUNT_POINT}'" 2>/dev/null || mkdir -p "${MOUNT_POINT}" 2>/dev/null || true
 sudo chown -R "${TURNSTONE_USER}" "${MOUNT_POINT}" 2>/dev/null || true
 sudo chmod 775 "${MOUNT_POINT}" 2>/dev/null || true
 
 MOUNT_SCRIPT="${CONFIG_DIR}/mount_smb.sh"
-cat > "${MOUNT_SCRIPT}" <<EOF
-#!/usr/bin/env bash
-mkdir -p "${MOUNT_POINT}" 2>/dev/null || true
-if ! mount | grep -Fq "on ${MOUNT_POINT} "; then
-    mount_smbfs "//${REMOTE_USERNAME}:${SMB_PASSWORD}@${SERVER_HOSTNAME}/${SHARE_NAME}" "${MOUNT_POINT}" 2>/dev/null || true
-fi
-EOF
+fetch_and_install_file "mount_smb.sh" "${MOUNT_SCRIPT}" true
 sudo chown "${TURNSTONE_USER}" "${MOUNT_SCRIPT}" 2>/dev/null || true
 chmod 700 "${MOUNT_SCRIPT}"
 
 SMB_MOUNT_PLIST="${SYSTEM_DAEMONS_DIR}/com.turnstone.smb-mount.plist"
-cat > "${SMB_MOUNT_PLIST}" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.turnstone.smb-mount</string>
-    <key>UserName</key>
-    <string>${TURNSTONE_USER}</string>
-    <key>GroupName</key>
-    <string>staff</string>
-    <key>WorkingDirectory</key>
-    <string>${USER_HOME}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/bin/bash</string>
-        <string>${CONFIG_DIR}/mount_smb.sh</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <dict>
-        <key>SuccessfulExit</key>
-        <false/>
-        <key>NetworkState</key>
-        <true/>
-    </dict>
-    <key>StandardOutPath</key>
-    <string>${LAUNCH_LOGS_DIR}/smb-mount.log</string>
-    <key>StandardErrorPath</key>
-    <string>${LAUNCH_LOGS_DIR}/smb-mount.err</string>
-</dict>
-</plist>
-EOF
+fetch_and_install_file "com.turnstone.smb-mount.plist" "${SMB_MOUNT_PLIST}" true
 
 manage_launch_daemon "${SMB_MOUNT_PLIST}" "com.turnstone.smb-mount"
 run_as_target_user "bash '${MOUNT_SCRIPT}' 2>/dev/null || true"
 log_success "SMB storage configured for startup mount at ${MOUNT_POINT}."
 
-# Step 6: Setup MLX Launchd Daemon (mlx-lm.server - Pinned to Qwen3-Coder-Next-6bit)
-MLX_PLIST="${SYSTEM_DAEMONS_DIR}/com.turnstone.mlx-server.plist"
-log_info "Step 6: Configuring MLX Server system daemon (pinned: mlx-community/Qwen3.8-27B-4bit)..."
+# Step 6: Setup Dynamic MLX Server (FastAPI with Lazy Eviction & Metal Cache Clearing)
+MLX_CUSTOM_DIR="${CONFIG_DIR}/mlx_node_custom"
+mkdir -p "${MLX_CUSTOM_DIR}" 2>/dev/null || true
+fetch_and_install_file "dynamic_mlx_server.py" "${MLX_CUSTOM_DIR}/dynamic_mlx_server.py" false
+sudo chown -R "${TURNSTONE_USER}:staff" "${MLX_CUSTOM_DIR}" 2>/dev/null || true
+chmod +x "${MLX_CUSTOM_DIR}/dynamic_mlx_server.py" 2>/dev/null || true
 
-cat > "${MLX_PLIST}" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.turnstone.mlx-server</string>
-    <key>UserName</key>
-    <string>${TURNSTONE_USER}</string>
-    <key>GroupName</key>
-    <string>staff</string>
-    <key>WorkingDirectory</key>
-    <string>${USER_HOME}</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>HOME</key>
-        <string>${USER_HOME}</string>
-        <key>PATH</key>
-        <string>${VENV_DIR}/bin:${USER_HOME}/.local/bin:${CARGO_DIR}/bin:${LOCAL_BREW_DIR}/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-        <key>HF_TOKEN</key>
-        <string>${HF_TOKEN}</string>
-        <key>HUGGING_FACE_HUB_TOKEN</key>
-        <string>${HF_TOKEN}</string>
-    </dict>
-    <key>ProgramArguments</key>
-    <array>
-        <string>${VENV_DIR}/bin/python</string>
-        <string>-m</string>
-        <string>mlx_lm</string>
-        <string>server</string>
-        <string>--model</string>
-        <string>mlx-community/Qwen3.8-27B-4bit</string>
-        <string>--host</string>
-        <string>0.0.0.0</string>
-        <string>--port</string>
-        <string>8000</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>${LAUNCH_LOGS_DIR}/mlx-server.log</string>
-    <key>StandardErrorPath</key>
-    <string>${LAUNCH_LOGS_DIR}/mlx-server.err</string>
-</dict>
-</plist>
-EOF
+MLX_PLIST="${SYSTEM_DAEMONS_DIR}/com.turnstone.mlx-server.plist"
+log_info "Step 6: Configuring Dynamic MLX Server system daemon (port 8000)..."
+fetch_and_install_file "com.turnstone.mlx-server.plist" "${MLX_PLIST}" true
 
 manage_launch_daemon "${MLX_PLIST}" "com.turnstone.mlx-server" 8000
-log_success "MLX Server system daemon loaded."
+log_success "Dynamic MLX Server system daemon loaded."
 
 # Step 6b: Setup Ollama Launchd Daemon (Multi-Model Swapping Engine on Port 11434)
 OLLAMA_PLIST="${SYSTEM_DAEMONS_DIR}/com.turnstone.ollama.plist"
 log_info "Step 6b: Configuring Ollama system daemon on port 11434 (Memory Capped: 40GB)..."
-
-cat > "${OLLAMA_PLIST}" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.turnstone.ollama</string>
-    <key>UserName</key>
-    <string>${TURNSTONE_USER}</string>
-    <key>GroupName</key>
-    <string>staff</string>
-    <key>WorkingDirectory</key>
-    <string>${USER_HOME}</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>HOME</key>
-        <string>${USER_HOME}</string>
-        <key>PATH</key>
-        <string>${VENV_DIR}/bin:${USER_HOME}/.local/bin:${CARGO_DIR}/bin:${LOCAL_BREW_DIR}/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-        <key>HF_TOKEN</key>
-        <string>${HF_TOKEN}</string>
-        <key>HUGGING_FACE_HUB_TOKEN</key>
-        <string>${HF_TOKEN}</string>
-        <key>OLLAMA_HOST</key>
-        <string>0.0.0.0:11434</string>
-        <key>OLLAMA_ORIGINS</key>
-        <string>*</string>
-        <key>OLLAMA_MODELS</key>
-        <string>${USER_HOME}/.ollama/models</string>
-        <key>OLLAMA_KEEP_ALIVE</key>
-        <string>5m</string>
-        <key>OLLAMA_NUM_PARALLEL</key>
-        <string>1</string>
-        <key>OLLAMA_MAX_LOADED_MODELS</key>
-        <string>1</string>
-    </dict>
-    <key>HardResourceLimits</key>
-    <dict>
-        <key>ResidentSetSize</key>
-        <integer>42949672960</integer>
-    </dict>
-    <key>SoftResourceLimits</key>
-    <dict>
-        <key>ResidentSetSize</key>
-        <integer>42949672960</integer>
-    </dict>
-    <key>ProgramArguments</key>
-    <array>
-        <string>${LOCAL_BREW_DIR}/bin/ollama</string>
-        <string>serve</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>${LAUNCH_LOGS_DIR}/ollama.log</string>
-    <key>StandardErrorPath</key>
-    <string>${LAUNCH_LOGS_DIR}/ollama.err</string>
-</dict>
-</plist>
-EOF
+fetch_and_install_file "com.turnstone.ollama.plist" "${OLLAMA_PLIST}" true
 
 manage_launch_daemon "${OLLAMA_PLIST}" "com.turnstone.ollama" 11434
 log_success "Ollama system daemon loaded."
@@ -986,8 +865,8 @@ log_success "Ollama system daemon loaded."
 # Step 6c: Download and Associate Models with Servers
 log_info "Step 6c: Verifying & downloading models for MLX and Ollama..."
 
-# 1. MLX & Hugging Face Models: Qwen3.8-27B-4bit & Mistral-Nemo-Base-2407
-log_info "Checking / downloading models via Hugging Face ('mlx-community/Qwen3.8-27B-4bit' & 'mistralai/Mistral-Nemo-Base-2407')..."
+# 1. MLX & Hugging Face Models: Qwen3.8-27B-4bit, Gemma-4-31B-it-4bit & Mistral-Nemo-Base-2407
+log_info "Checking / downloading models via Hugging Face ('mlx-community/Qwen3.8-27B-4bit', 'mlx-community/gemma-4-31B-it-4bit', 'mistralai/Mistral-Nemo-Base-2407')..."
 run_as_target_user "
     export PATH=\"${VENV_DIR}/bin:${USER_HOME}/.local/bin:\$PATH\"
     export HF_TOKEN=\"${HF_TOKEN}\"
@@ -997,10 +876,11 @@ run_as_target_user "
             hf login --token \"${HF_TOKEN}\" 2>/dev/null || true
         fi
         hf download mlx-community/Qwen3.8-27B-4bit --local-dir-use-symlinks False 2>/dev/null || true
+        hf download mlx-community/gemma-4-31B-it-4bit --local-dir-use-symlinks False 2>/dev/null || true
         hf download mistralai/Mistral-Nemo-Base-2407 --local-dir-use-symlinks False 2>/dev/null || true
     fi
 "
-log_success "MLX and Hugging Face models verified (Qwen3.8-27B-4bit, Mistral-Nemo-Base-2407)."
+log_success "MLX and Hugging Face models verified (Qwen3.8-27B-4bit, Gemma-4-31B-it-4bit, Mistral-Nemo-Base-2407)."
 
 # 2. Ollama Models: Qwen3.8 27B, Gemma 4 31B, Mistral Nemo 12B, & Ornith
 log_info "Waiting for Ollama daemon to initialize..."
@@ -1033,72 +913,7 @@ log_success "Ollama models pulled and context parameters tuned successfully."
 # Step 7: Setup Turnstone Server Launchd Daemon
 SERVER_PLIST="${SYSTEM_DAEMONS_DIR}/com.turnstone.server.plist"
 log_info "Step 7: Configuring turnstone-server system daemon..."
-
-cat > "${SERVER_PLIST}" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.turnstone.server</string>
-    <key>UserName</key>
-    <string>${TURNSTONE_USER}</string>
-    <key>GroupName</key>
-    <string>staff</string>
-    <key>WorkingDirectory</key>
-    <string>${USER_HOME}</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>HOME</key>
-        <string>${USER_HOME}</string>
-        <key>PATH</key>
-        <string>${VENV_DIR}/bin:${USER_HOME}/.local/bin:${CARGO_DIR}/bin:${LOCAL_BREW_DIR}/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-        <key>TURNSTONE_NODE_ID</key>
-        <string>${NODE_ID}</string>
-        <key>TURNSTONE_ADVERTISE_URL</key>
-        <string>http://${LAN_IP}:8080</string>
-        <key>TURNSTONE_CONSOLE_URL</key>
-        <string>http://${COORDINATOR_IP}:8090</string>
-        <key>TURNSTONE_SEARXNG_URL</key>
-        <string>http://${COORDINATOR_IP}:8081</string>
-        <key>TURNSTONE_CONFIG</key>
-        <string>${CONFIG_FILE}</string>
-        <key>TURNSTONE_DB_BACKEND</key>
-        <string>postgresql</string>
-        <key>TURNSTONE_DB_URL</key>
-        <string>postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}</string>
-        <key>TURNSTONE_STORAGE_DIR</key>
-        <string>${MOUNT_POINT}</string>
-        <key>TURNSTONE_SMB_MOUNT</key>
-        <string>${MOUNT_POINT}</string>
-        <key>TURNSTONE_WORKSPACE</key>
-        <string>${MOUNT_POINT}</string>
-        <key>HF_TOKEN</key>
-        <string>${HF_TOKEN}</string>
-        <key>HUGGING_FACE_HUB_TOKEN</key>
-        <string>${HF_TOKEN}</string>
-    </dict>
-    <key>ProgramArguments</key>
-    <array>
-        <string>${VENV_DIR}/bin/turnstone-server</string>
-        <string>--host</string>
-        <string>0.0.0.0</string>
-        <string>--port</string>
-        <string>8080</string>
-        <string>--config</string>
-        <string>${CONFIG_FILE}</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>${LAUNCH_LOGS_DIR}/turnstone-server.log</string>
-    <key>StandardErrorPath</key>
-    <string>${LAUNCH_LOGS_DIR}/turnstone-server.err</string>
-</dict>
-</plist>
-EOF
+fetch_and_install_file "com.turnstone.server.plist" "${SERVER_PLIST}" true
 
 manage_launch_daemon "${SERVER_PLIST}" "com.turnstone.server" 8080
 log_success "Turnstone Server system daemon loaded and connected to PostgreSQL."
