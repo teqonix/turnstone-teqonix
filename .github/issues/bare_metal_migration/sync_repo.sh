@@ -284,9 +284,12 @@ prompt_interactive() {
 find_secret_for_node() {
     local key="$1"
     local search_dirs=(
+        "/etc/turnstone/secrets"
+        "/etc/turnstone"
+        "${HOME}/.turnstone/secrets"
+        "${HOME}/.turnstone"
         "${SCRIPT_DIR}/secrets"
         "${REPO_ROOT}/secrets"
-        "${REPO_ROOT}/.github/issues/bare_metal_migration/secrets"
         "${SCRIPT_DIR}"
     )
 
