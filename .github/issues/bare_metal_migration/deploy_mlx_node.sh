@@ -847,6 +847,16 @@ fetch_and_install_file "dynamic_mlx_server.py" "${MLX_CUSTOM_DIR}/dynamic_mlx_se
 sudo chown -R "${TURNSTONE_USER}:staff" "${MLX_CUSTOM_DIR}" 2>/dev/null || true
 chmod +x "${MLX_CUSTOM_DIR}/dynamic_mlx_server.py" 2>/dev/null || true
 
+log_info "Deploying models.json to ${CONFIG_DIR}..."
+if [ -f "${SCRIPT_DIR}/models.json" ]; then
+    cp "${SCRIPT_DIR}/models.json" "${CONFIG_DIR}/models.json"
+else
+    curl -sSfL "https://raw.githubusercontent.com/teqonix/turnstone-teqonix/main/.github/issues/bare_metal_migration/models.json" -o "${CONFIG_DIR}/models.json"
+fi
+sudo chown "${TURNSTONE_USER}:staff" "${CONFIG_DIR}/models.json" 2>/dev/null || true
+chmod 644 "${CONFIG_DIR}/models.json"
+chmod +x "${MLX_CUSTOM_DIR}/dynamic_mlx_server.py" 2>/dev/null || true
+
 MLX_PLIST="${SYSTEM_DAEMONS_DIR}/com.turnstone.mlx-server.plist"
 log_info "Step 6: Configuring Dynamic MLX Server system daemon (port 8000)..."
 fetch_and_install_file "com.turnstone.mlx-server.plist" "${MLX_PLIST}" true

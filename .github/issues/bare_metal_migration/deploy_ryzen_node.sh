@@ -946,6 +946,15 @@ fetch_and_install_file "dynamic_lemonade_manager.py" "${RYZEN_CUSTOM_DIR}/dynami
 chown -R "${TURNSTONE_USER_DEBIAN}:${TURNSTONE_USER_DEBIAN}" "${RYZEN_CUSTOM_DIR}"
 chmod +x "${RYZEN_CUSTOM_DIR}/dynamic_lemonade_manager.py"
 
+log_info "Deploying models.json to /etc/turnstone..."
+if [ -f "${SCRIPT_DIR}/models.json" ]; then
+    cp "${SCRIPT_DIR}/models.json" "/etc/turnstone/models.json"
+else
+    curl -sSfL "https://raw.githubusercontent.com/teqonix/turnstone-teqonix/main/.github/issues/bare_metal_migration/models.json" -o "/etc/turnstone/models.json"
+fi
+chown "${TURNSTONE_USER_DEBIAN}:${TURNSTONE_USER_DEBIAN}" "/etc/turnstone/models.json" 2>/dev/null || true
+chmod 644 "/etc/turnstone/models.json"
+
 # Ensure independent venv exists for lemonade manager
 if [ ! -x "${LEMONADE_MANAGER_VENV_DIR}/bin/python3" ] || [ ! -x "${LEMONADE_MANAGER_VENV_DIR}/bin/uvicorn" ]; then
     log_info "Creating independent virtual environment at ${LEMONADE_MANAGER_VENV_DIR}..."
