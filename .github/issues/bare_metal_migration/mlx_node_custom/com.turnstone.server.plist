@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.turnstone.server</string>
+    <key>UserName</key>
+    <string>${TURNSTONE_USER}</string>
+    <key>GroupName</key>
+    <string>staff</string>
+    <key>WorkingDirectory</key>
+    <string>${USER_HOME}</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>${USER_HOME}</string>
+        <key>PATH</key>
+        <string>${VENV_DIR}/bin:${USER_HOME}/.local/bin:${CARGO_DIR}/bin:${LOCAL_BREW_DIR}/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>TURNSTONE_NODE_ID</key>
+        <string>${NODE_ID}</string>
+        <key>TURNSTONE_ADVERTISE_URL</key>
+        <string>http://${LAN_IP}:8080</string>
+        <key>TURNSTONE_CONSOLE_URL</key>
+        <string>http://${COORDINATOR_IP}:8090</string>
+        <key>TURNSTONE_SEARXNG_URL</key>
+        <string>http://${COORDINATOR_IP}:8081</string>
+        <key>TURNSTONE_CONFIG</key>
+        <string>${CONFIG_FILE}</string>
+        <key>TURNSTONE_DB_BACKEND</key>
+        <string>postgresql</string>
+        <key>TURNSTONE_DB_URL</key>
+        <string>postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}</string>
+        <key>TURNSTONE_STORAGE_DIR</key>
+        <string>${MOUNT_POINT}</string>
+        <key>TURNSTONE_SMB_MOUNT</key>
+        <string>${MOUNT_POINT}</string>
+        <key>TURNSTONE_WORKSPACE</key>
+        <string>${MOUNT_POINT}</string>
+        <key>HF_TOKEN</key>
+        <string>${HF_TOKEN}</string>
+        <key>HUGGING_FACE_HUB_TOKEN</key>
+        <string>${HF_TOKEN}</string>
+    </dict>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${VENV_DIR}/bin/turnstone-server</string>
+        <string>--host</string>
+        <string>0.0.0.0</string>
+        <string>--port</string>
+        <string>8080</string>
+        <string>--config</string>
+        <string>${CONFIG_FILE}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>${LAUNCH_LOGS_DIR}/turnstone-server.log</string>
+    <key>StandardErrorPath</key>
+    <string>${LAUNCH_LOGS_DIR}/turnstone-server.err</string>
+</dict>
+</plist>

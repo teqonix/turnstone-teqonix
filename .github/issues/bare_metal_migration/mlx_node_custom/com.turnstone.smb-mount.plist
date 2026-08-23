@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.turnstone.smb-mount</string>
+    <key>UserName</key>
+    <string>${TURNSTONE_USER}</string>
+    <key>GroupName</key>
+    <string>staff</string>
+    <key>WorkingDirectory</key>
+    <string>${USER_HOME}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>${CONFIG_DIR}/mount_smb.sh</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>NetworkState</key>
+        <true/>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>${LAUNCH_LOGS_DIR}/smb-mount.log</string>
+    <key>StandardErrorPath</key>
+    <string>${LAUNCH_LOGS_DIR}/smb-mount.err</string>
+</dict>
+</plist>

@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.turnstone.ollama</string>
+    <key>UserName</key>
+    <string>${TURNSTONE_USER}</string>
+    <key>GroupName</key>
+    <string>staff</string>
+    <key>WorkingDirectory</key>
+    <string>${USER_HOME}</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>${USER_HOME}</string>
+        <key>PATH</key>
+        <string>${VENV_DIR}/bin:${USER_HOME}/.local/bin:${CARGO_DIR}/bin:${LOCAL_BREW_DIR}/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HF_TOKEN</key>
+        <string>${HF_TOKEN}</string>
+        <key>HUGGING_FACE_HUB_TOKEN</key>
+        <string>${HF_TOKEN}</string>
+        <key>OLLAMA_HOST</key>
+        <string>0.0.0.0:11434</string>
+        <key>OLLAMA_ORIGINS</key>
+        <string>*</string>
+        <key>OLLAMA_MODELS</key>
+        <string>${USER_HOME}/.ollama/models</string>
+        <key>OLLAMA_KEEP_ALIVE</key>
+        <string>5m</string>
+        <key>OLLAMA_NUM_PARALLEL</key>
+        <string>1</string>
+        <key>OLLAMA_MAX_LOADED_MODELS</key>
+        <string>1</string>
+    </dict>
+    <key>HardResourceLimits</key>
+    <dict>
+        <key>ResidentSetSize</key>
+        <integer>42949672960</integer>
+    </dict>
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>ResidentSetSize</key>
+        <integer>42949672960</integer>
+    </dict>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${LOCAL_BREW_DIR}/bin/ollama</string>
+        <string>serve</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>${LAUNCH_LOGS_DIR}/ollama.log</string>
+    <key>StandardErrorPath</key>
+    <string>${LAUNCH_LOGS_DIR}/ollama.err</string>
+</dict>
+</plist>
