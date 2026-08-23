@@ -16,6 +16,8 @@ model_list:
       api_key: "dummy"
       rpm: 120
       order: 1
+    model_info:
+      supports_reasoning: true
 
   - model_name: "gemma-4-31b"
     litellm_params:
@@ -24,6 +26,8 @@ model_list:
       api_key: "dummy"
       rpm: 300
       order: 2
+    model_info:
+      supports_reasoning: true
 
   - model_name: "gemma-4-31b"
     litellm_params:
@@ -32,6 +36,8 @@ model_list:
       api_key: "dummy"
       rpm: 300
       order: 3
+    model_info:
+      supports_reasoning: true
 
   # --------------------------------------------------------------------------- 
   # 2. Qwen 3.8 27B (Deep 128k Context Coding Model)
@@ -45,6 +51,8 @@ model_list:
       api_key: "dummy"
       rpm: 120
       order: 1
+    model_info:
+      supports_reasoning: true
 
   - model_name: "qwen-3.8-27b"
     litellm_params:
@@ -53,6 +61,8 @@ model_list:
       api_key: "dummy"
       rpm: 300
       order: 2
+    model_info:
+      supports_reasoning: true
 
   - model_name: "qwen-3.8-27b"
     litellm_params:
@@ -61,6 +71,8 @@ model_list:
       api_key: "dummy"
       rpm: 300
       order: 3
+    model_info:
+      supports_reasoning: true
 
   # ---------------------------------------------------------------------------
   # 3. Ornith 1.5 9B (Fast Agentic Model / Tool Calling)
