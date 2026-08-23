@@ -69,6 +69,7 @@ class DynamicMLXManager:
         self.tokenizer = None
         self.lock = asyncio.Lock()
         self.last_active_time: float = time.time()
+        self.in_flight_requests: int = 0
 
     def clear_cache(self):
         gc.collect()
@@ -116,9 +117,9 @@ class DynamicMLXManager:
             await asyncio.sleep(15)
             if self.model is not None:
                 idle_duration = time.time() - self.last_active_time
-                if idle_duration >= IDLE_TTL_SECONDS:
+                if idle_duration >= IDLE_TTL_SECONDS and self.in_flight_requests == 0:
                     async with self.lock:
-                        if self.model is not None and (time.time() - self.last_active_time >= IDLE_TTL_SECONDS):
+                        if self.model is not None and self.in_flight_requests == 0 and (time.time() - self.last_active_time >= IDLE_TTL_SECONDS):
                             logger.info(f"Idle TTL reached ({idle_duration:.0f}s >= {IDLE_TTL_SECONDS}s). Evicting idle model.")
                             await self.unload_current_model()
 
@@ -158,6 +159,7 @@ async def health():
     return {
         "status": "healthy",
         "active_model": manager.current_model_name,
+        "in_flight_requests": manager.in_flight_requests,
         "idle_seconds": int(time.time() - manager.last_active_time) if manager.model else 0
     }
 
@@ -177,91 +179,104 @@ async def list_models():
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest):
     manager.last_active_time = time.time()
-    model, tokenizer = await manager.get_or_load_model(req.model)
+    manager.in_flight_requests += 1
+    try:
+        model, tokenizer = await manager.get_or_load_model(req.model)
 
-    if not MLX_AVAILABLE or model is None or tokenizer is None:
-        # Stub response if MLX is not installed in local environment
-        content = f"[MLX Stub Response] Handled request for model '{req.model}'."
-        return {
-            "id": f"chatcmpl-{int(time.time())}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": req.model,
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": content},
-                "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20}
-        }
-
-    # Format messages using Jinja chat template if available on tokenizer
-    messages_dicts = [{"role": m.role, "content": m.content} for m in req.messages]
-    if hasattr(tokenizer, "apply_chat_template"):
-        prompt = tokenizer.apply_chat_template(messages_dicts, tokenize=False, add_generation_prompt=True)
-    else:
-        prompt = "\n".join([f"{m.role}: {m.content}" for m in req.messages]) + "\nassistant: "
-
-    sampler = make_sampler(temp=req.temperature, top_p=req.top_p)
-
-    if req.stream:
-        async def stream_generator():
-            created_ts = int(time.time())
-            for response in generate_step(
-                prompt=tokenizer.encode(prompt),
-                model=model,
-                temp=req.temperature,
-                top_p=req.top_p,
-                max_tokens=req.max_tokens or 2048,
-                sampler=sampler
-            ):
-                token, text = response
-                chunk = {
-                    "id": f"chatcmpl-{created_ts}",
-                    "object": "chat.completion.chunk",
-                    "created": created_ts,
-                    "model": req.model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"content": text},
-                        "finish_reason": None
-                    }]
-                }
-                yield f"data: {JSONResponse(content=chunk).body.decode('utf-8')}\n\n"
-                await asyncio.sleep(0)
-
-            yield "data: [DONE]\n\n"
-
-        return StreamingResponse(stream_generator(), media_type="text/event-stream")
-    else:
-        loop = asyncio.get_running_loop()
-        generated_text = await loop.run_in_executor(
-            None,
-            lambda: mlx_lm.generate(
-                model=model,
-                tokenizer=tokenizer,
-                prompt=prompt,
-                max_tokens=req.max_tokens or 2048,
-                temp=req.temperature,
-                top_p=req.top_p
-            )
-        )
-        return {
-            "id": f"chatcmpl-{int(time.time())}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": req.model,
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": generated_text},
-                "finish_reason": "stop"
-            }],
-            "usage": {
-                "prompt_tokens": len(tokenizer.encode(prompt)),
-                "completion_tokens": len(tokenizer.encode(generated_text)),
-                "total_tokens": len(tokenizer.encode(prompt)) + len(tokenizer.encode(generated_text))
+        if not MLX_AVAILABLE or model is None or tokenizer is None:
+            # Stub response if MLX is not installed in local environment
+            content = f"[MLX Stub Response] Handled request for model '{req.model}'."
+            return {
+                "id": f"chatcmpl-{int(time.time())}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": req.model,
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": content},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20}
             }
-        }
+
+        # Format messages using Jinja chat template if available on tokenizer
+        messages_dicts = [{"role": m.role, "content": m.content} for m in req.messages]
+        if hasattr(tokenizer, "apply_chat_template"):
+            prompt = tokenizer.apply_chat_template(messages_dicts, tokenize=False, add_generation_prompt=True)
+        else:
+            prompt = "\n".join([f"{m.role}: {m.content}" for m in req.messages]) + "\nassistant: "
+
+        sampler = make_sampler(temp=req.temperature, top_p=req.top_p)
+
+        if req.stream:
+            async def stream_generator():
+                try:
+                    created_ts = int(time.time())
+                    for response in generate_step(
+                        prompt=tokenizer.encode(prompt),
+                        model=model,
+                        temp=req.temperature,
+                        top_p=req.top_p,
+                        max_tokens=req.max_tokens or 2048,
+                        sampler=sampler
+                    ):
+                        token, text = response
+                        chunk = {
+                            "id": f"chatcmpl-{created_ts}",
+                            "object": "chat.completion.chunk",
+                            "created": created_ts,
+                            "model": req.model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"content": text},
+                                "finish_reason": None
+                            }]
+                        }
+                        yield f"data: {JSONResponse(content=chunk).body.decode('utf-8')}\n\n"
+                        await asyncio.sleep(0)
+
+                    yield "data: [DONE]\n\n"
+                finally:
+                    manager.in_flight_requests -= 1
+
+            return StreamingResponse(stream_generator(), media_type="text/event-stream")
+        else:
+            loop = asyncio.get_running_loop()
+            generated_text = await loop.run_in_executor(
+                None,
+                lambda: mlx_lm.generate(
+                    model=model,
+                    tokenizer=tokenizer,
+                    prompt=prompt,
+                    max_tokens=req.max_tokens or 2048,
+                    temp=req.temperature,
+                    top_p=req.top_p
+                )
+            )
+            return {
+                "id": f"chatcmpl-{int(time.time())}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": req.model,
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": generated_text},
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": len(tokenizer.encode(prompt)),
+                    "completion_tokens": len(tokenizer.encode(generated_text)),
+                    "total_tokens": len(tokenizer.encode(prompt)) + len(tokenizer.encode(generated_text))
+                }
+            }
+    except Exception:
+        manager.in_flight_requests -= 1
+        raise
+    finally:
+        # If it was NOT a streaming request, we decrement here. 
+        # For streaming, the stream_generator's finally block handles it.
+        if not req.stream:
+            manager.in_flight_requests -= 1
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
