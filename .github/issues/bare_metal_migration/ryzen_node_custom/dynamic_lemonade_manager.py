@@ -31,7 +31,10 @@ logging.basicConfig(
 logger = logging.getLogger("dynamic_lemonade_manager")
 
 # Configuration & Deployment Modes
-MANAGER_MODE = os.getenv("LEMONADE_MANAGER_MODE", "watchdog").strip().lower()
+MANAGER_MODE = os.getenv("LEMONADE_MANAGER_MODE", "proxy").strip().lower()
+if MANAGER_MODE == "watchdog":
+    logger.warning("Watchdog mode is deprecated and unsafe for active generations. Forcing 'proxy' mode.")
+    MANAGER_MODE = "proxy"
 LEMONADE_BACKEND_URL = os.getenv("LEMONADE_BACKEND_URL", "http://127.0.0.1:13305").rstrip("/")
 WATCHDOG_POLL_INTERVAL = int(os.getenv("LEMONADE_WATCHDOG_POLL_INTERVAL_SECONDS", "60"))
 IDLE_TTL_SECONDS = int(os.getenv("LEMONADE_IDLE_TTL_SECONDS", "180"))  # 3 minutes
@@ -129,6 +132,7 @@ class LemonadeLifecycleManager:
         self.last_poll_status: Optional[str] = None
         self.latest_system_stats: Dict[str, Any] = {}
         self.eviction_history: List[Dict[str, Any]] = []
+        self.in_flight_requests: int = 0
 
     async def init_client(self):
         self.http_client = httpx.AsyncClient(
@@ -336,9 +340,9 @@ class LemonadeLifecycleManager:
             await asyncio.sleep(15)
             if self.current_heavy_model is not None:
                 idle_duration = time.time() - self.last_active_time
-                if idle_duration >= IDLE_TTL_SECONDS:
+                if idle_duration >= IDLE_TTL_SECONDS and self.in_flight_requests == 0:
                     async with self.lock:
-                        if self.current_heavy_model is not None and (time.time() - self.last_active_time >= IDLE_TTL_SECONDS):
+                        if self.current_heavy_model is not None and self.in_flight_requests == 0 and (time.time() - self.last_active_time >= IDLE_TTL_SECONDS):
                             logger.info(f"[Proxy] Idle TTL reached ({idle_duration:.0f}s >= {IDLE_TTL_SECONDS}s). Evicting idle model.")
                             await self.evict_model(self.current_heavy_model, reason=f"Proxy Idle TTL ({idle_duration:.0f}s >= {IDLE_TTL_SECONDS}s)")
 
@@ -399,6 +403,7 @@ async def health():
         "last_poll_status": manager.last_poll_status,
         "all_models_loaded": active_models_summary,
         "current_heavy_model": manager.current_heavy_model,
+        "in_flight_requests": manager.in_flight_requests,
         "recent_evictions": manager.eviction_history[-10:]
     }
 
@@ -407,7 +412,10 @@ async def list_models(request: Request):
     try:
         req = manager.http_client.build_request("GET", f"{manager.backend_url}/v1/models")
         res = await manager.http_client.send(req)
-        return Response(content=res.content, status_code=res.status_code, headers=dict(res.headers))
+        headers = dict(res.headers)
+        headers.pop("content-length", None)
+        headers.pop("content-encoding", None)
+        return Response(content=res.content, status_code=res.status_code, headers=headers)
     except Exception as e:
         logger.warning(f"Error fetching /v1/models from lemond backend: {e}")
         return {
@@ -425,6 +433,7 @@ async def proxy_or_handle(path: str, request: Request):
         logger.debug(f"[Watchdog Notice] Proxy request received for /{path}. Direct port 13305 is primary.")
 
     body = None
+    is_generation_request = request.method in ["POST"] and ("completions" in path or "generate" in path)
     if request.method in ["POST", "PUT", "PATCH"]:
         try:
             body = await request.json()
@@ -434,6 +443,9 @@ async def proxy_or_handle(path: str, request: Request):
                     await manager.prepare_for_request(model_name)
         except Exception:
             body = await request.body()
+
+    if is_generation_request:
+        manager.in_flight_requests += 1
 
     headers = {k: v for k, v in request.headers.items() if k.lower() not in ["host", "content-length"]}
     target_url = f"{manager.backend_url}/{path.lstrip('/')}"
@@ -474,12 +486,21 @@ async def proxy_or_handle(path: str, request: Request):
                         yield chunk
                 finally:
                     await backend_res.aclose()
+                    if is_generation_request:
+                        manager.in_flight_requests -= 1
             return StreamingResponse(stream_generator(), status_code=backend_res.status_code, media_type="text/event-stream")
         else:
             content = await backend_res.aread()
             await backend_res.aclose()
-            return Response(content=content, status_code=backend_res.status_code, headers=dict(backend_res.headers))
+            if is_generation_request:
+                manager.in_flight_requests -= 1
+            headers = dict(backend_res.headers)
+            headers.pop("content-length", None)
+            headers.pop("content-encoding", None)
+            return Response(content=content, status_code=backend_res.status_code, headers=headers)
     except Exception as e:
+        if is_generation_request:
+            manager.in_flight_requests -= 1
         logger.error(f"Error proxying request to lemond ({target_url}): {e}")
         raise HTTPException(status_code=502, detail=f"Backend communication failure with lemond: {str(e)}")
 

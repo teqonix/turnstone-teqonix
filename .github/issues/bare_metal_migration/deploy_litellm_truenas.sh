@@ -71,8 +71,8 @@ POSTGRES_PORT="5432"
 POSTGRES_DB="postgres"
 
 # Node Endpoints (Defaults match Turnstone cluster hostnames & ports)
-NODE_RYZEN_ONE="${NODE_RYZEN_ONE:-http://amd-ai-core-one.lan:13305/v1}"
-NODE_RYZEN_TWO="${NODE_RYZEN_TWO:-http://amd-ai-core-two.lan:13305/v1}"
+NODE_RYZEN_ONE="${NODE_RYZEN_ONE:-http://amd-ai-core-one.lan:13306/v1}"
+NODE_RYZEN_TWO="${NODE_RYZEN_TWO:-http://amd-ai-core-two.lan:13306/v1}"
 NODE_MBP_MLX="${NODE_MBP_MLX:-http://mbp-ai-core.lan:8000/v1}"
 NODE_MBP_OLLAMA="${NODE_MBP_OLLAMA:-${NODE_MBP:-http://mbp-ai-core.lan:11434/v1}}"
 NODE_MBP="${NODE_MBP:-${NODE_MBP_OLLAMA}}"
