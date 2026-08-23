@@ -1,0 +1,30 @@
+# =============================================================================
+# Turnstone LiteLLM Load Balancer Configuration (Template)
+# Load Balancing: MBP Activity Prioritization + Least-Busy queue balancing
+# =============================================================================
+
+# model_list is generated dynamically by generate_config.py
+
+router_settings:
+  routing_strategy: "simple-shuffle"
+  plugins:
+    - hardware_group_router_litellm.hardware_group_plugin
+  routing_strategy_args:
+    ttl: 30
+  num_retries: 10
+  timeout: 600
+  allowed_fails: 4
+  cooldown_time: 30
+
+general_settings:
+  master_key: "${MASTER_KEY}"
+  database_url: "${DATABASE_URL}"
+  store_model_in_db: true
+  store_prompts_in_spend_logs: true
+  maximum_spend_logs_retention_period: "21d"
+  drop_params: true
+
+litellm_settings:
+  drop_params: true
+  set_verbose: false
+  telemetry: false

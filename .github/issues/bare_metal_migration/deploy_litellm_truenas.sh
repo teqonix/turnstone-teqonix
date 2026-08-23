@@ -947,7 +947,21 @@ EOF
 fetch_and_install_file "hardware_group_router_litellm.py" "${LITELLM_DIR}/hardware_group_router_litellm.py" false
 chown "${LITELLM_USER}:${LITELLM_USER}" "${LITELLM_DIR}/hardware_group_router_litellm.py" 2>/dev/null || true
 
-fetch_and_install_file "config.yaml" "${LITELLM_CONFIG}" true
+# Fetch models config and generator script
+fetch_and_install_file "config.yaml.template" "${LITELLM_DIR}/config.yaml.template" true
+fetch_and_install_file "../models.json" "${LITELLM_DIR}/models.json" false
+fetch_and_install_file "generate_config.py" "${LITELLM_DIR}/generate_config.py" false
+
+log_info "Generating dynamic LiteLLM config from models.json..."
+export MODELS_CONFIG_PATH="${LITELLM_DIR}/models.json"
+export CONFIG_TEMPLATE_PATH="${LITELLM_DIR}/config.yaml.template"
+export CONFIG_OUTPUT_PATH="${LITELLM_CONFIG}"
+export NODE_RYZEN_ONE="${NODE_RYZEN_ONE}"
+export NODE_RYZEN_TWO="${NODE_RYZEN_TWO}"
+export NODE_MBP_MLX="${NODE_MBP_MLX}"
+export NODE_MBP_OLLAMA="${NODE_MBP_OLLAMA}"
+"${VENV_DIR}/bin/python3" "${LITELLM_DIR}/generate_config.py"
+
 chown -R "${LITELLM_USER}:${LITELLM_USER}" "${LITELLM_DIR}"
 chmod 600 "${LITELLM_CONFIG}"
 log_success "Configuration created at ${LITELLM_CONFIG}."

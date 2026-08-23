@@ -9,6 +9,7 @@ import gc
 import time
 import asyncio
 import logging
+import json
 from contextlib import asynccontextmanager
 from typing import Optional, Dict, Any, List, Union
 
@@ -41,22 +42,34 @@ except ImportError:
 # -----------------------------------------------------------------------------
 IDLE_TTL_SECONDS = int(os.getenv("MLX_IDLE_TTL_SECONDS", "180"))  # 3 minutes
 
-DEFAULT_MODELS: Dict[str, str] = {
-    "qwen-3.8-27b": "mlx-community/Qwen3.8-27B-4bit",
-    "qwen": "mlx-community/Qwen3.8-27B-4bit",
-    "gemma-4-31b": "mlx-community/gemma-4-31B-it-4bit",
-    "gemma": "mlx-community/gemma-4-31B-it-4bit",
-    "mistral-nemo-12b": "mistralai/Mistral-Nemo-Base-2407",
-    "mistral-nemo": "mistralai/Mistral-Nemo-Base-2407",
-}
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_MODELS_PATH = os.path.join(SCRIPT_DIR, "..", "models.json")
+MODELS_CONFIG_PATH = os.getenv("MODELS_CONFIG_PATH", DEFAULT_MODELS_PATH)
+MODELS_REGISTRY: List[Dict[str, Any]] = []
+try:
+    with open(MODELS_CONFIG_PATH, "r") as f:
+        data = json.load(f)
+        MODELS_REGISTRY = data.get("models", [])
+except Exception as e:
+    logger.error(f"Failed to load models config from {MODELS_CONFIG_PATH}: {e}")
 
 def resolve_model_path(model_name: str) -> str:
-    norm = model_name.lower().strip()
-    if norm in DEFAULT_MODELS:
-        return DEFAULT_MODELS[norm]
-    for key, path in DEFAULT_MODELS.items():
-        if key in norm:
-            return path
+    norm = model_name.replace("openai/", "").lower().strip()
+    
+    # Exact match on litellm_name or mlx_target
+    for m in MODELS_REGISTRY:
+        if m.get("litellm_name", "").lower() == norm:
+            return m.get("mlx_target", model_name)
+        if m.get("mlx_target", "").lower() == norm:
+            return m.get("mlx_target", model_name)
+            
+    # Fallback to substring
+    for m in MODELS_REGISTRY:
+        targ = m.get("mlx_target", "").lower()
+        alias = m.get("litellm_name", "").lower()
+        if (alias and alias in norm) or (targ and targ in norm):
+            return m.get("mlx_target", model_name)
+            
     return model_name
 
 # -----------------------------------------------------------------------------
@@ -166,14 +179,15 @@ async def health():
 @app.get("/v1/models")
 async def list_models():
     data = []
-    for alias, path in DEFAULT_MODELS.items():
-        data.append({
-            "id": alias,
-            "object": "model",
-            "created": int(time.time()),
-            "owned_by": "turnstone-mlx",
-            "root": path
-        })
+    for m in MODELS_REGISTRY:
+        if m.get("mlx_target"):
+            data.append({
+                "id": m.get("litellm_name"),
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "turnstone-mlx",
+                "root": m.get("mlx_target")
+            })
     return {"object": "list", "data": data}
 
 @app.post("/v1/chat/completions")

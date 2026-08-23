@@ -6,6 +6,8 @@ import sys
 import httpx
 import urllib.parse
 import asyncio
+import os
+import json
 
 # ----------------------------------------------------------------------
 # Real-Time Logger Setup (Forwarded to stdout / journalctl)
@@ -36,21 +38,41 @@ NODE_PRIORITY_ORDER: List[str] = [
     "NODE_RYZEN_TWO"
 ]
 
-MODEL_WEIGHTS: Dict[str, int] = {
-    "gemma": 80,    # Heavy (80) - Mutual exclusion with Qwen and Gemma
-    "qwen": 60,     # Medium-Heavy (60) - Mutual exclusion with Gemma and Qwen
-    "ornith": 15,   # Lightweight (15) - Can co-run with Gemma or Qwen (up to 6 concurrent)
-    "orinth": 15,   # Lightweight (15) - Alias
-}
+MODEL_WEIGHTS: Dict[str, int] = {}
 DEFAULT_MODEL_WEIGHT = 50
+
+MODELS_CONFIG_PATH = os.getenv("MODELS_CONFIG_PATH", "../models.json")
+try:
+    with open(MODELS_CONFIG_PATH, "r") as f:
+        config_data = json.load(f)
+        for m in config_data.get("models", []):
+            weight = m.get("weight", DEFAULT_MODEL_WEIGHT)
+            if m.get("litellm_name"):
+                MODEL_WEIGHTS[m["litellm_name"].lower()] = weight
+            if m.get("lemonade_target"):
+                MODEL_WEIGHTS[m["lemonade_target"].lower()] = weight
+            if m.get("mlx_target"):
+                MODEL_WEIGHTS[m["mlx_target"].lower()] = weight
+            if m.get("ollama_target"):
+                MODEL_WEIGHTS[m["ollama_target"].lower()] = weight
+except Exception as e:
+    logger.error(f"Failed to load models config from {MODELS_CONFIG_PATH}: {e}")
 
 def get_model_weight(model_name: Optional[str]) -> int:
     if not model_name:
         return DEFAULT_MODEL_WEIGHT
     norm = str(model_name).lower()
+    
+    # Exact match
     for key, weight in MODEL_WEIGHTS.items():
-        if key in norm:
+        if key == norm:
             return weight
+            
+    # Substring match
+    for key, weight in MODEL_WEIGHTS.items():
+        if key in norm or norm in key:
+            return weight
+            
     return DEFAULT_MODEL_WEIGHT
 
 def get_node_from_api_base(api_base: str) -> str:

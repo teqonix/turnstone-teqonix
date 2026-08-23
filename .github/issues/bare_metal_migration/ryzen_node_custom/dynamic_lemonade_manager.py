@@ -13,6 +13,7 @@ import os
 import time
 import asyncio
 import logging
+import json
 from datetime import datetime
 from contextlib import asynccontextmanager
 from typing import Optional, Dict, Any, List
@@ -44,16 +45,48 @@ TOTAL_RAM_GB = float(os.getenv("NODE_TOTAL_RAM_GB", "128.0"))
 MEMORY_THRESHOLD_PERCENT = float(os.getenv("LEMONADE_MEMORY_THRESHOLD_PERCENT", "75.0"))
 MEMORY_THRESHOLD_GB = (MEMORY_THRESHOLD_PERCENT / 100.0) * TOTAL_RAM_GB
 
-# Heavy Model Canonical Families
-HEAVY_MODELS = ["gemma", "qwen"]
+# Centralized Models Registry
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_MODELS_PATH = os.path.join(SCRIPT_DIR, "..", "models.json")
+MODELS_CONFIG_PATH = os.getenv("MODELS_CONFIG_PATH", DEFAULT_MODELS_PATH)
+MODELS_REGISTRY: List[Dict[str, Any]] = []
+try:
+    with open(MODELS_CONFIG_PATH, "r") as f:
+        data = json.load(f)
+        MODELS_REGISTRY = data.get("models", [])
+except Exception as e:
+    logger.error(f"Failed to load models config from {MODELS_CONFIG_PATH}: {e}")
 
-def get_heavy_family(model_name: Optional[str]) -> Optional[str]:
+def get_model_metadata(model_name: Optional[str]) -> Optional[Dict[str, Any]]:
     if not model_name:
         return None
-    norm = model_name.lower()
-    for h in HEAVY_MODELS:
-        if h in norm:
-            return h
+    
+    # Clean standard openai prefix if present
+    norm = model_name.replace("openai/", "").lower()
+    
+    # 1. Exact match against lemonade_target
+    for m in MODELS_REGISTRY:
+        if m.get("lemonade_target", "").lower() == norm:
+            return m
+            
+    # 2. Match against litellm_name 
+    for m in MODELS_REGISTRY:
+        if m.get("litellm_name", "").lower() == norm:
+            return m
+            
+    # 3. Substring fallback
+    for m in MODELS_REGISTRY:
+        targ = m.get("lemonade_target", "").lower()
+        if targ and (targ in norm or norm in targ):
+            return m
+            
+    return None
+
+def get_heavy_target(model_name: Optional[str]) -> Optional[str]:
+    """Returns the EXACT lemonade_target string if the model is heavy, else None."""
+    meta = get_model_metadata(model_name)
+    if meta and meta.get("is_heavy"):
+        return meta.get("lemonade_target")
     return None
 
 
@@ -247,7 +280,7 @@ class LemonadeLifecycleManager:
                 current_loaded_names.add(m_name)
                 last_use_val = m.get("last_use")
                 pid = m.get("pid")
-                family = get_heavy_family(m_name)
+                heavy_target = get_heavy_target(m_name)
 
                 # Initialize or update tracking
                 if m_name not in self.active_models:
@@ -256,9 +289,9 @@ class LemonadeLifecycleManager:
                         "last_active_time": now,
                         "last_use": last_use_val,
                         "pid": pid,
-                        "family": family
+                        "heavy_target": heavy_target
                     }
-                    logger.info(f"[Watchdog] Discovered in-memory model in lemond: '{m_name}' (Family: {family}, last_use: {last_use_val}, PID: {pid})")
+                    logger.info(f"[Watchdog] Discovered in-memory model in lemond: '{m_name}' (Heavy Target: {heavy_target}, last_use: {last_use_val}, PID: {pid})")
                 else:
                     prev_last_use = self.active_models[m_name].get("last_use")
                     if last_use_val != prev_last_use:
@@ -267,9 +300,9 @@ class LemonadeLifecycleManager:
                         self.active_models[m_name]["last_use"] = last_use_val
                         logger.debug(f"[Watchdog] Activity detected on '{m_name}' (last_use changed: {prev_last_use} -> {last_use_val}).")
 
-                if family:
+                if heavy_target:
                     heavy_loaded[m_name] = {
-                        "family": family,
+                        "heavy_target": heavy_target,
                         "last_active_time": self.active_models[m_name]["last_active_time"],
                         "last_use": last_use_val,
                         "pid": pid
@@ -280,10 +313,10 @@ class LemonadeLifecycleManager:
                 if m_name not in current_loaded_names:
                     del self.active_models[m_name]
 
-            # Step 3: Eviction Trigger A - Conflict: Multiple Heavy Model Families Loaded
-            unique_families = {meta["family"]: m_name for m_name, meta in heavy_loaded.items()}
-            if len(unique_families) > 1:
-                logger.warning(f"[Watchdog] Heavy model conflict detected under memory pressure! Loaded families: {list(unique_families.keys())}")
+            # Step 3: Eviction Trigger A - Conflict: Multiple Heavy Models Loaded
+            unique_targets = {meta["heavy_target"]: m_name for m_name, meta in heavy_loaded.items()}
+            if len(unique_targets) > 1:
+                logger.warning(f"[Watchdog] Heavy model conflict detected under memory pressure! Loaded targets: {list(unique_targets.keys())}")
                 # Sort heavy models by last_active_time ascending (oldest first)
                 sorted_heavy = sorted(
                     heavy_loaded.items(),
@@ -327,12 +360,12 @@ class LemonadeLifecycleManager:
     async def prepare_for_request(self, model_name: str):
         async with self.lock:
             self.last_active_time = time.time()
-            family = get_heavy_family(model_name)
-            if family:
-                if self.current_heavy_model and self.current_heavy_model != family:
-                    logger.info(f"[Proxy] Lazy Eviction: Switching active heavy model from '{self.current_heavy_model}' to '{family}'...")
+            heavy_target = get_heavy_target(model_name)
+            if heavy_target:
+                if self.current_heavy_model and self.current_heavy_model != heavy_target:
+                    logger.info(f"[Proxy] Lazy Eviction: Switching active heavy model from '{self.current_heavy_model}' to '{heavy_target}'...")
                     await self.evict_model(self.current_heavy_model, reason="Proxy Lazy Eviction: Conflict with new requested model")
-                self.current_heavy_model = family
+                self.current_heavy_model = heavy_target
 
     async def idle_cleanup_loop(self):
         logger.info(f"Starting Proxy Idle Reaper loop (Interval: 15s, TTL: {IDLE_TTL_SECONDS}s)...")
@@ -381,7 +414,7 @@ async def health():
     for m_name, meta in manager.active_models.items():
         last_act = meta.get("last_active_time", now)
         active_models_summary[m_name] = {
-            "family": meta.get("family"),
+            "heavy_target": meta.get("heavy_target"),
             "pid": meta.get("pid"),
             "last_use": meta.get("last_use"),
             "idle_seconds": int(now - last_act)
