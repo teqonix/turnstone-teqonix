@@ -40,12 +40,16 @@ NODE_ID="${NODE_ID:-}"
 COORDINATOR_IP="${COORDINATOR_IP:-}"
 JWT_SECRET="${JWT_SECRET:-}"
 HF_TOKEN="${HF_TOKEN:-}"
-LEMONADE_URL="${LEMONADE_URL:-http://127.0.0.1:8000/v1}"
+LEMONADE_URL="${LEMONADE_URL:-}"
 TURNSTONE_USER_DEBIAN="${TURNSTONE_USER_DEBIAN:-turnstone}"
 SMB_PATH="${SMB_PATH:-}"
 SMB_USER="${SMB_USER:-}"
 SMB_PASSWORD="${SMB_PASSWORD:-}"
 SKIP_RYZENADJ="${SKIP_RYZENADJ:-false}"
+LEMONADE_MANAGER_VENV_DIR="${LEMONADE_MANAGER_VENV_DIR:-/opt/lemonade-manager-venv}"
+LEMONADE_MANAGER_MODE="${LEMONADE_MANAGER_MODE:-watchdog}"
+LEMONADE_WATCHDOG_POLL_INTERVAL_SECONDS="${LEMONADE_WATCHDOG_POLL_INTERVAL_SECONDS:-60}"
+LEMONADE_IDLE_TTL_SECONDS="${LEMONADE_IDLE_TTL_SECONDS:-180}"
 
 usage() {
     echo "Usage: $0 [OPTIONS]"
@@ -60,6 +64,10 @@ usage() {
     echo "      --smb-user <user>              SMB username (e.g. turnstone-np)"
     echo "      --smb-pass <pass>              SMB password"
     echo "      --turnstone-user <user>        Local Debian system user [default: turnstone]"
+    echo "      --lemonade-manager-venv <path> Dynamic Lemonade Manager venv path [default: /opt/lemonade-manager-venv]"
+    echo "      --manager-mode <mode>          Dynamic manager mode: 'watchdog' [default] or 'proxy'"
+    echo "      --watchdog-poll-interval <sec> Watchdog polling interval in seconds [default: 60]"
+    echo "      --idle-ttl <seconds>           Idle TTL before evicting heavy models [default: 180]"
     echo "      --skip-ryzenadj                Skip checking and installing ryzenadj / TDP service"
     echo "  -h, --help                         Display this help message and exit"
     exit 0
@@ -103,6 +111,22 @@ while [[ $# -gt 0 ]]; do
             TURNSTONE_USER_DEBIAN="$2"
             shift 2
             ;;
+        --lemonade-manager-venv)
+            LEMONADE_MANAGER_VENV_DIR="$2"
+            shift 2
+            ;;
+        --manager-mode)
+            LEMONADE_MANAGER_MODE="$2"
+            shift 2
+            ;;
+        --watchdog-poll-interval)
+            LEMONADE_WATCHDOG_POLL_INTERVAL_SECONDS="$2"
+            shift 2
+            ;;
+        --idle-ttl)
+            LEMONADE_IDLE_TTL_SECONDS="$2"
+            shift 2
+            ;;
         --skip-ryzenadj)
             SKIP_RYZENADJ="true"
             shift
@@ -119,6 +143,16 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Normalize manager mode and configure default LEMONADE_URL accordingly
+LEMONADE_MANAGER_MODE="$(echo "${LEMONADE_MANAGER_MODE}" | tr '[:upper:]' '[:lower:]')"
+if [ -z "${LEMONADE_URL}" ]; then
+    if [ "${LEMONADE_MANAGER_MODE}" = "proxy" ]; then
+        LEMONADE_URL="http://127.0.0.1:13306/v1"
+    else
+        LEMONADE_URL="http://127.0.0.1:13305/v1"
+    fi
+fi
 
 parse_smb_path() {
     local raw_path="$1"
@@ -582,6 +616,21 @@ for tool_bin in turnstone-server hf; do
 done
 log_success "Virtualenv created and permissions secured at ${VENV_DIR}."
 
+# Setup independent dedicated venv for Dynamic Lemonade Manager Sidecar
+log_info "Creating independent virtual environment for Dynamic Lemonade Manager at ${LEMONADE_MANAGER_VENV_DIR}..."
+if [ -d "${LEMONADE_MANAGER_VENV_DIR}" ]; then
+    rm -rf "${LEMONADE_MANAGER_VENV_DIR}"
+fi
+uv venv "${LEMONADE_MANAGER_VENV_DIR}" --python "${SYSTEM_PYTHON}"
+
+log_info "Installing fastapi, uvicorn, httpx, and pydantic into ${LEMONADE_MANAGER_VENV_DIR}..."
+uv pip install --python "${LEMONADE_MANAGER_VENV_DIR}" fastapi 'uvicorn[standard]' httpx pydantic
+
+chown -R "${TURNSTONE_USER_DEBIAN}:${TURNSTONE_USER_DEBIAN}" "${LEMONADE_MANAGER_VENV_DIR}" 2>/dev/null || chown -R "${TURNSTONE_USER_DEBIAN}" "${LEMONADE_MANAGER_VENV_DIR}"
+chmod -R a+rX "${LEMONADE_MANAGER_VENV_DIR}"
+chmod +x "${LEMONADE_MANAGER_VENV_DIR}/bin"/* 2>/dev/null || true
+log_success "Dynamic Lemonade Manager virtualenv created and secured at ${LEMONADE_MANAGER_VENV_DIR}."
+
 # Step 5b: Install Local Homebrew & all-smi Hardware Monitor for Turnstone User
 if [ -d "/home/linuxbrew/.linuxbrew" ]; then
     LOCAL_BREW_DIR="/home/linuxbrew/.linuxbrew"
@@ -874,20 +923,56 @@ EOF
 }
 
 # Step 8: Install Systemd Service Units & Dynamic Lemonade Manager Sidecar
-log_info "Step 8: Installing Systemd units & Dynamic Lemonade Sidecar..."
+log_info "Step 8: Ensuring lemond.service is active & Installing Dynamic Lemonade Sidecar..."
 
-# 1. Install Dynamic Lemonade Manager (Port 13305)
+# 0. Ensure OOtB lemond.service is enabled and running
+if systemctl list-unit-files 2>/dev/null | grep -qE '^lemond\.service'; then
+    log_info "Verifying OOtB lemond.service is enabled and active..."
+    systemctl enable lemond.service 2>/dev/null || true
+    if ! systemctl is-active --quiet lemond.service 2>/dev/null; then
+        systemctl start lemond.service 2>/dev/null || true
+    fi
+    if systemctl is-active --quiet lemond.service 2>/dev/null; then
+        log_success "OOtB lemond.service is ACTIVE."
+    else
+        log_warn "lemond.service could not be verified as active. dynamic_lemonade_manager will attempt recovery."
+    fi
+fi
+
+# 1. Install Dynamic Lemonade Manager (Port 13306)
 RYZEN_CUSTOM_DIR="/etc/turnstone/ryzen_node_custom"
 mkdir -p "${RYZEN_CUSTOM_DIR}"
 fetch_and_install_file "dynamic_lemonade_manager.py" "${RYZEN_CUSTOM_DIR}/dynamic_lemonade_manager.py" false
 chown -R "${TURNSTONE_USER_DEBIAN}:${TURNSTONE_USER_DEBIAN}" "${RYZEN_CUSTOM_DIR}"
 chmod +x "${RYZEN_CUSTOM_DIR}/dynamic_lemonade_manager.py"
 
+# Ensure independent venv exists for lemonade manager
+if [ ! -x "${LEMONADE_MANAGER_VENV_DIR}/bin/python3" ] || [ ! -x "${LEMONADE_MANAGER_VENV_DIR}/bin/uvicorn" ]; then
+    log_info "Creating independent virtual environment at ${LEMONADE_MANAGER_VENV_DIR}..."
+    uv venv "${LEMONADE_MANAGER_VENV_DIR}" --python "${SYSTEM_PYTHON}"
+    uv pip install --python "${LEMONADE_MANAGER_VENV_DIR}" fastapi 'uvicorn[standard]' httpx pydantic
+    chown -R "${TURNSTONE_USER_DEBIAN}:${TURNSTONE_USER_DEBIAN}" "${LEMONADE_MANAGER_VENV_DIR}" 2>/dev/null || chown -R "${TURNSTONE_USER_DEBIAN}" "${LEMONADE_MANAGER_VENV_DIR}"
+    chmod -R a+rX "${LEMONADE_MANAGER_VENV_DIR}"
+    chmod +x "${LEMONADE_MANAGER_VENV_DIR}/bin"/* 2>/dev/null || true
+fi
+
+# Clean up any lingering process holding port 13306 before starting
+fuser -k 13306/tcp 2>/dev/null || true
+pkill -f dynamic_lemonade_manager.py 2>/dev/null || true
+sleep 1
+
 fetch_and_install_file "lemonade-manager.service" "/etc/systemd/system/lemonade-manager.service" true
 systemctl daemon-reload
 systemctl enable lemonade-manager.service
 systemctl restart lemonade-manager.service || true
-log_success "Dynamic Lemonade Manager service enabled and started on port 13305."
+
+sleep 1
+if systemctl is-active --quiet lemonade-manager.service; then
+    log_success "Dynamic Lemonade Manager service is ACTIVE (${LEMONADE_MANAGER_MODE} mode on port 13306)."
+else
+    log_warn "Dynamic Lemonade Manager service is not active. Showing recent logs:"
+    journalctl -u lemonade-manager.service -n 25 --no-pager || true
+fi
 
 # 2. Install Turnstone Server Service Unit
 fetch_and_install_file "turnstone-server.service" "/etc/systemd/system/turnstone-server.service" true
@@ -898,14 +983,14 @@ fetch_and_install_file "node.conf" "/etc/systemd/system/turnstone-server.service
 # Step 8b: Configure lemon.d / Lemonade Systemctl Config Drop-ins
 if [ -n "${HF_TOKEN}" ]; then
     log_info "Step 8b: Configuring lemon.d / lemonade systemctl environment drop-ins with HF_TOKEN..."
-    for svc in lemonade lemon lemon-server lemonade-server; do
+    for svc in lemond lemonade lemon lemon-server lemonade-server; do
         mkdir -p "/etc/systemd/system/${svc}.service.d"
         fetch_and_install_file "hf.conf" "/etc/systemd/system/${svc}.service.d/hf.conf" true
     done
 
     # User-level drop-ins in case lemonade runs as user service
     USER_SYSTEMD_DIR="${USER_HOME}/.config/systemd/user"
-    for svc in lemonade lemon lemon-server lemonade-server; do
+    for svc in lemond lemonade lemon lemon-server lemonade-server; do
         mkdir -p "${USER_SYSTEMD_DIR}/${svc}.service.d"
         fetch_and_install_file "hf.conf" "${USER_SYSTEMD_DIR}/${svc}.service.d/hf.conf" true
     done
@@ -932,9 +1017,9 @@ systemctl daemon-reload
 systemctl enable turnstone-server.service
 systemctl restart turnstone-server.service
 
-# Restart active lemon / lemonade services if present
+# Restart active lemon / lemonade / lemond services if present
 if [ -n "${HF_TOKEN}" ]; then
-    for svc in lemonade.service lemon.service lemon-server.service lemonade-server.service; do
+    for svc in lemond.service lemonade.service lemon.service lemon-server.service lemonade-server.service; do
         if systemctl is-active --quiet "${svc}" 2>/dev/null; then
             systemctl restart "${svc}" 2>/dev/null || true
             log_info "Restarted active ${svc} with updated HF_TOKEN."
@@ -956,7 +1041,9 @@ echo -e "${GREEN}===============================================================
 echo -e "Node ID: ${NODE_ID}"
 echo -e "Advertise URL: http://${LAN_IP}:8080"
 echo -e "PostgreSQL Backend: ${POSTGRES_USER}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}"
-echo -e "Lemonade Backend: ${LEMONADE_URL}"
+echo -e "Lemonade Backend (Turnstone): ${LEMONADE_URL}"
+echo -e "Lemonade Server (lemond): http://127.0.0.1:13305"
+echo -e "Dynamic Lemonade Manager: http://127.0.0.1:13306 [Mode: ${LEMONADE_MANAGER_MODE}, Poll: ${LEMONADE_WATCHDOG_POLL_INTERVAL_SECONDS}s, Idle TTL: ${LEMONADE_IDLE_TTL_SECONDS}s]"
 echo -e "SMB Storage Mount: ${MOUNT_POINT} (${SMB_PATH})"
 echo -e "Homebrew Prefix: ${LOCAL_BREW_DIR}"
 echo -e "all-smi Utility: ${ALL_SMI_BIN} (sudo NOPASSWD enabled)"
