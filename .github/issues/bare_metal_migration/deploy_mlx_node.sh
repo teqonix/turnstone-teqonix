@@ -844,8 +844,9 @@ log_success "SMB storage configured for startup mount at ${MOUNT_POINT}."
 MLX_CUSTOM_DIR="${CONFIG_DIR}/mlx_node_custom"
 mkdir -p "${MLX_CUSTOM_DIR}" 2>/dev/null || true
 fetch_and_install_file "dynamic_mlx_server.py" "${MLX_CUSTOM_DIR}/dynamic_mlx_server.py" false
+fetch_and_install_file "stream_logs.sh" "${MLX_CUSTOM_DIR}/stream_logs.sh" false
 sudo chown -R "${TURNSTONE_USER}:staff" "${MLX_CUSTOM_DIR}" 2>/dev/null || true
-chmod +x "${MLX_CUSTOM_DIR}/dynamic_mlx_server.py" 2>/dev/null || true
+chmod +x "${MLX_CUSTOM_DIR}/dynamic_mlx_server.py" "${MLX_CUSTOM_DIR}/stream_logs.sh" 2>/dev/null || true
 
 log_info "Deploying models.json to ${CONFIG_DIR}..."
 if [ -f "${SCRIPT_DIR}/models.json" ]; then

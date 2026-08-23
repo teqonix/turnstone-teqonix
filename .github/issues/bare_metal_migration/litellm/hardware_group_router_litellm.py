@@ -1,5 +1,4 @@
 import litellm
-from litellm.types.router import RoutingContext
 from typing import Optional, List, Dict, Any
 import logging
 import sys
@@ -15,15 +14,45 @@ import json
 logger = logging.getLogger("hardware_group_router")
 logger.setLevel(logging.INFO)
 
+import logging.handlers
+
 if not logger.handlers:
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setLevel(logging.INFO)
+    # 1. Stdout Handler (for container / direct execution)
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.setLevel(logging.INFO)
     formatter = logging.Formatter(
         fmt="%(asctime)s [%(levelname)s] [HardwareGroupRouter] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S"
     )
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
+    stdout_handler.setFormatter(formatter)
+    logger.addHandler(stdout_handler)
+
+    # 2. Syslog Handler (for journalctl integration)
+    try:
+        syslog_handler = logging.handlers.SysLogHandler(address='/dev/log')
+        syslog_handler.setLevel(logging.INFO)
+        syslog_formatter = logging.Formatter(
+            fmt="[HardwareGroupRouter] %(levelname)s: %(message)s"
+        )
+        syslog_handler.setFormatter(syslog_formatter)
+        logger.addHandler(syslog_handler)
+    except Exception as e:
+        logger.debug(f"Could not initialize SysLogHandler: {e}")
+
+    # 3. File Handler (2-hour rotation)
+    try:
+        file_handler = logging.handlers.TimedRotatingFileHandler(
+            filename="/etc/litellm/custom_router.log",
+            when="H",
+            interval=2,
+            backupCount=12  # Keep 24 hours of logs
+        )
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    except Exception as e:
+        logger.debug(f"Could not initialize TimedRotatingFileHandler: {e}")
+
     logger.propagate = False
 
 # ----------------------------------------------------------------------
@@ -128,7 +157,7 @@ class HardwareGroupPlugin:
             
         return weight * in_flight
 
-    async def run(self, context: RoutingContext) -> RoutingContext:
+    async def run(self, context) -> Any:
         deployments = context.candidate_models
         if not deployments:
             return context
@@ -171,10 +200,25 @@ class HardwareGroupPlugin:
 
         load_str = " | ".join([f"{n}: {current_loads[n]}/{NODE_MAX_CAPACITY} (reqs: {in_flight[n]})" for n in NODE_PRIORITY_ORDER])
 
-        # Step 1: Find eligible nodes (have capacity budget)
+        # Step 1: Find eligible nodes (have capacity budget and no model conflicts)
         eligible_nodes = []
         for node in NODE_PRIORITY_ORDER:
             if node_deployments[node]:
+                health = node_healths.get(node, {})
+                active_model = health.get("current_heavy_model") or health.get("active_model")
+                conflict = False
+                
+                if in_flight[node] > 0 and active_model and requested_model:
+                    import re
+                    norm_req = re.sub(r'[^a-z0-9]', '', str(requested_model).lower())
+                    norm_act = re.sub(r'[^a-z0-9]', '', str(active_model).lower())
+                    if norm_req not in norm_act and norm_act not in norm_req:
+                        conflict = True
+                        
+                if conflict:
+                    logger.debug(f"[SKIP] Node '{node}' is busy with a conflicting model '{active_model}'.")
+                    continue
+                    
                 if current_loads[node] + req_weight <= NODE_MAX_CAPACITY:
                     eligible_nodes.append(node)
 
@@ -208,3 +252,5 @@ class HardwareGroupPlugin:
 
 # Note: HardwareGroupTrackerLogger was removed; we do dynamic polling instead.
 hardware_group_plugin = HardwareGroupPlugin()
+
+logger.info("LiteLLM Hardware Group Router Module imported and initialized successfully.")

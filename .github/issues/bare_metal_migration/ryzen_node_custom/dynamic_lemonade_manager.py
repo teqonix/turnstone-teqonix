@@ -358,14 +358,23 @@ class LemonadeLifecycleManager:
     # Proxy Mode Logic (Inline Request Interception)
     # -------------------------------------------------------------------------
     async def prepare_for_request(self, model_name: str):
-        async with self.lock:
-            self.last_active_time = time.time()
-            heavy_target = get_heavy_target(model_name)
-            if heavy_target:
-                if self.current_heavy_model and self.current_heavy_model != heavy_target:
-                    logger.info(f"[Proxy] Lazy Eviction: Switching active heavy model from '{self.current_heavy_model}' to '{heavy_target}'...")
-                    await self.evict_model(self.current_heavy_model, reason="Proxy Lazy Eviction: Conflict with new requested model")
-                self.current_heavy_model = heavy_target
+        heavy_target = get_heavy_target(model_name)
+        if heavy_target:
+            while True:
+                async with self.lock:
+                    self.last_active_time = time.time()
+                    if not self.current_heavy_model or self.current_heavy_model == heavy_target:
+                        self.current_heavy_model = heavy_target
+                        return
+                    
+                    if self.in_flight_requests == 0:
+                        logger.info(f"[Proxy] Lazy Eviction: Switching active heavy model from '{self.current_heavy_model}' to '{heavy_target}'...")
+                        await self.evict_model(self.current_heavy_model, reason="Proxy Lazy Eviction: Conflict with new requested model")
+                        self.current_heavy_model = heavy_target
+                        return
+                
+                logger.info(f"[Proxy] Waiting for {self.in_flight_requests} in-flight requests to finish before switching from '{self.current_heavy_model}' to '{heavy_target}'...")
+                await asyncio.sleep(1.0)
 
     async def idle_cleanup_loop(self):
         logger.info(f"Starting Proxy Idle Reaper loop (Interval: 15s, TTL: {IDLE_TTL_SECONDS}s)...")
