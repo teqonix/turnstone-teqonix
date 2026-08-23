@@ -1,0 +1,23 @@
+[Unit]
+Description=Turnstone Dynamic Lemonade Manager Sidecar
+After=network.target network-online.target lemonade.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${TURNSTONE_USER_DEBIAN}
+Group=${TURNSTONE_USER_DEBIAN}
+WorkingDirectory=/etc/turnstone
+Environment="PORT=13305"
+Environment="HOST=0.0.0.0"
+Environment="LEMONADE_BACKEND_URL=http://127.0.0.1:8000"
+Environment="LEMONADE_IDLE_TTL_SECONDS=180"
+Environment="PYTHONUNBUFFERED=1"
+Environment="PYTHONPATH=${RYZEN_CUSTOM_DIR}:/etc/turnstone"
+ExecStart=/opt/turnstone-venv/bin/python3 ${RYZEN_CUSTOM_DIR}/dynamic_lemonade_manager.py
+Restart=always
+RestartSec=5s
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

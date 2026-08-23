@@ -1,0 +1,18 @@
+[Unit]
+Description=Turnstone Server Node
+After=network.target network-online.target remote-fs.target
+Wants=network-online.target remote-fs.target
+RequiresMountsFor=${MOUNT_POINT}
+
+[Service]
+Type=simple
+User=${TURNSTONE_USER_DEBIAN}
+Group=${TURNSTONE_USER_DEBIAN}
+WorkingDirectory=${MOUNT_POINT}
+ExecStart=/opt/turnstone-venv/bin/turnstone-server --host 0.0.0.0 --port 8080 --config /etc/turnstone/config.toml
+Restart=always
+RestartSec=5s
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
