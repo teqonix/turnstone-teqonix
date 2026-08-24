@@ -111,16 +111,16 @@ done
 parse_smb_path() {
     local raw_path="$1"
     raw_path=$(echo "${raw_path}" | tr -d '\r' | xargs)
-    
+
     # Convert Windows-style backslashes to forward slashes
     raw_path="${raw_path//\\//}"
-    
+
     # Strip protocol prefix (smb://, cifs://, etc.)
     local stripped="${raw_path#*://}"
     stripped="${stripped#//}"
     stripped="${stripped#/}"
     stripped="${stripped%/}"
-    
+
     # Parse user:password@ if present
     if [[ "${stripped}" == *"@"* ]]; then
         local userinfo="${stripped%%@*}"
@@ -133,10 +133,10 @@ parse_smb_path() {
             [ -z "${SMB_USER:-}" ] && SMB_USER="${userinfo}"
         fi
     fi
-    
+
     # Remove accidental leading '=' from hostname
     stripped="${stripped#=}"
-    
+
     SERVER_HOSTNAME="${stripped%%/*}"
     local path_part=""
     if [[ "${stripped}" == *"/"* ]]; then
@@ -144,7 +144,7 @@ parse_smb_path() {
         path_part="${path_part#/}"
         path_part="${path_part%/}"
     fi
-    
+
     if [ -z "${path_part}" ] || [ "${SERVER_HOSTNAME}" = "${path_part}" ]; then
         SHARE_NAME="ai-playground"
     else
@@ -161,11 +161,11 @@ parse_connection_uri() {
     local raw_url="$1"
     raw_url=$(echo "${raw_url}" | tr -d '\r' | xargs)
     local url="${raw_url#*://}"
-    
+
     if [[ "${url}" == *"@"* ]]; then
         local userpass="${url%%@*}"
         local hostportdb="${url#*@}"
-        
+
         local u="${userpass%%:*}"
         [ -n "${u}" ] && POSTGRES_USER="${u}"
 
@@ -173,14 +173,14 @@ parse_connection_uri() {
             local p="${userpass#*:}"
             [ -n "${p}" ] && POSTGRES_PASSWORD="${p}"
         fi
-        
+
         local hostport="${hostportdb%%/*}"
         if [[ "${hostportdb}" == *"/"* ]]; then
             local db_in_url="${hostportdb#*/}"
             db_in_url="${db_in_url%%[?#]*}"
             [ -n "${db_in_url}" ] && POSTGRES_DB="${db_in_url}"
         fi
-        
+
         local h="${hostport%%:*}"
         if [ -n "${h}" ] && [ "${h}" != "localhost" ] && [ "${h}" != "127.0.0.1" ]; then
             POSTGRES_HOST="${h}"
@@ -794,11 +794,11 @@ fetch_and_install_file() {
     local filename="$1"
     local dest="$2"
     local interpolate="${3:-false}"
-    
+
     local local_path="${SCRIPT_DIR}/mlx_node_custom/${filename}"
     local remote_url="https://raw.githubusercontent.com/teqonix/turnstone-teqonix/main/.github/issues/bare_metal_migration/mlx_node_custom/${filename}"
     local tmp_file="/tmp/${filename}"
-    
+
     if [ -f "${local_path}" ]; then
         log_info "Found local ${filename}, copying..."
         cp "${local_path}" "${tmp_file}"
@@ -809,7 +809,7 @@ fetch_and_install_file() {
             exit 1
         }
     fi
-    
+
     if [ "${interpolate}" = true ]; then
         eval "cat <<EOF
 $(cat "${tmp_file}")
@@ -848,20 +848,9 @@ fetch_and_install_file "stream_logs.sh" "${MLX_CUSTOM_DIR}/stream_logs.sh" false
 sudo chown -R "${TURNSTONE_USER}:staff" "${MLX_CUSTOM_DIR}" 2>/dev/null || true
 chmod +x "${MLX_CUSTOM_DIR}/dynamic_mlx_server.py" "${MLX_CUSTOM_DIR}/stream_logs.sh" 2>/dev/null || true
 
-log_info "Deploying models.json to ${CONFIG_DIR}..."
-if [ -f "${SCRIPT_DIR}/models.json" ]; then
-    cp "${SCRIPT_DIR}/models.json" "${CONFIG_DIR}/models.json"
-else
-    curl -sSfL "https://raw.githubusercontent.com/teqonix/turnstone-teqonix/main/.github/issues/bare_metal_migration/models.json" -o "${CONFIG_DIR}/models.json"
-fi
-sudo chown "${TURNSTONE_USER}:staff" "${CONFIG_DIR}/models.json" 2>/dev/null || true
-chmod 644 "${CONFIG_DIR}/models.json"
-chmod +x "${MLX_CUSTOM_DIR}/dynamic_mlx_server.py" 2>/dev/null || true
-
 MLX_PLIST="${SYSTEM_DAEMONS_DIR}/com.turnstone.mlx-server.plist"
-log_info "Step 6: Configuring Dynamic MLX Server system daemon (port 8000)..."
+log_info "Step 6: Configuring Dynamic MLX Server system daemon on port 8000..."
 fetch_and_install_file "com.turnstone.mlx-server.plist" "${MLX_PLIST}" true
-
 manage_launch_daemon "${MLX_PLIST}" "com.turnstone.mlx-server" 8000
 log_success "Dynamic MLX Server system daemon loaded."
 
@@ -935,27 +924,7 @@ log_info "Step 8: Performing post-deployment health verification..."
 DEPLOY_HAS_ERROR=false
 
 # 1. Check MLX Server (Port 8000)
-log_info "Testing MLX Server health at http://127.0.0.1:8000/v1/models (waiting up to 60s for weight allocation)..."
-MLX_READY=false
-for attempt in {1..60}; do
-    if curl -s -f http://127.0.0.1:8000/v1/models &>/dev/null; then
-        MLX_READY=true
-        break
-    fi
-    sleep 1
-done
-
-if [ "${MLX_READY}" = true ]; then
-    MLX_MODELS=$(curl -s http://127.0.0.1:8000/v1/models || true)
-    log_success "MLX Server is healthy: ${MLX_MODELS}"
-else
-    log_error "MLX Server failed to respond on http://127.0.0.1:8000/v1/models!"
-    log_warn "Recent MLX stdout log (${LAUNCH_LOGS_DIR}/mlx-server.log):"
-    tail -n 25 "${LAUNCH_LOGS_DIR}/mlx-server.log" 2>/dev/null || true
-    log_warn "Recent MLX stderr log (${LAUNCH_LOGS_DIR}/mlx-server.err):"
-    tail -n 25 "${LAUNCH_LOGS_DIR}/mlx-server.err" 2>/dev/null || true
-    DEPLOY_HAS_ERROR=true
-fi
+# (Skipped: Deprecated in favor of the new unified proxy sidecar)
 
 # 2. Check Ollama Server (Port 11434)
 log_info "Testing Ollama Server health at http://127.0.0.1:11434/api/tags..."

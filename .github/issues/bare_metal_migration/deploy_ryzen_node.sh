@@ -157,16 +157,16 @@ fi
 parse_smb_path() {
     local raw_path="$1"
     raw_path=$(echo "${raw_path}" | tr -d '\r' | xargs)
-    
+
     # Convert Windows-style backslashes to forward slashes
     raw_path="${raw_path//\\//}"
-    
+
     # Strip protocol prefix (smb://, cifs://, etc.)
     local stripped="${raw_path#*://}"
     stripped="${stripped#//}"
     stripped="${stripped#/}"
     stripped="${stripped%/}"
-    
+
     # Parse user:password@ if present
     if [[ "${stripped}" == *"@"* ]]; then
         local userinfo="${stripped%%@*}"
@@ -179,10 +179,10 @@ parse_smb_path() {
             [ -z "${SMB_USER:-}" ] && SMB_USER="${userinfo}"
         fi
     fi
-    
+
     # Remove accidental leading '=' from hostname
     stripped="${stripped#=}"
-    
+
     SERVER_HOSTNAME="${stripped%%/*}"
     local path_part=""
     if [[ "${stripped}" == *"/"* ]]; then
@@ -190,7 +190,7 @@ parse_smb_path() {
         path_part="${path_part#/}"
         path_part="${path_part%/}"
     fi
-    
+
     if [ -z "${path_part}" ] || [ "${SERVER_HOSTNAME}" = "${path_part}" ]; then
         SHARE_NAME="ai-playground"
     else
@@ -207,11 +207,11 @@ parse_connection_uri() {
     local raw_url="$1"
     raw_url=$(echo "${raw_url}" | tr -d '\r' | xargs)
     local url="${raw_url#*://}"
-    
+
     if [[ "${url}" == *"@"* ]]; then
         local userpass="${url%%@*}"
         local hostportdb="${url#*@}"
-        
+
         local u="${userpass%%:*}"
         [ -n "${u}" ] && POSTGRES_USER="${u}"
 
@@ -219,14 +219,14 @@ parse_connection_uri() {
             local p="${userpass#*:}"
             [ -n "${p}" ] && POSTGRES_PASSWORD="${p}"
         fi
-        
+
         local hostport="${hostportdb%%/*}"
         if [[ "${hostportdb}" == *"/"* ]]; then
             local db_in_url="${hostportdb#*/}"
             db_in_url="${db_in_url%%[?#]*}"
             [ -n "${db_in_url}" ] && POSTGRES_DB="${db_in_url}"
         fi
-        
+
         local h="${hostport%%:*}"
         if [ -n "${h}" ] && [ "${h}" != "localhost" ] && [ "${h}" != "127.0.0.1" ]; then
             POSTGRES_HOST="${h}"
@@ -617,19 +617,7 @@ done
 log_success "Virtualenv created and permissions secured at ${VENV_DIR}."
 
 # Setup independent dedicated venv for Dynamic Lemonade Manager Sidecar
-log_info "Creating independent virtual environment for Dynamic Lemonade Manager at ${LEMONADE_MANAGER_VENV_DIR}..."
-if [ -d "${LEMONADE_MANAGER_VENV_DIR}" ]; then
-    rm -rf "${LEMONADE_MANAGER_VENV_DIR}"
-fi
-uv venv "${LEMONADE_MANAGER_VENV_DIR}" --python "${SYSTEM_PYTHON}"
-
-log_info "Installing fastapi, uvicorn, httpx, and pydantic into ${LEMONADE_MANAGER_VENV_DIR}..."
-uv pip install --python "${LEMONADE_MANAGER_VENV_DIR}" fastapi 'uvicorn[standard]' httpx pydantic
-
-chown -R "${TURNSTONE_USER_DEBIAN}:${TURNSTONE_USER_DEBIAN}" "${LEMONADE_MANAGER_VENV_DIR}" 2>/dev/null || chown -R "${TURNSTONE_USER_DEBIAN}" "${LEMONADE_MANAGER_VENV_DIR}"
-chmod -R a+rX "${LEMONADE_MANAGER_VENV_DIR}"
-chmod +x "${LEMONADE_MANAGER_VENV_DIR}/bin"/* 2>/dev/null || true
-log_success "Dynamic Lemonade Manager virtualenv created and secured at ${LEMONADE_MANAGER_VENV_DIR}."
+# (Skipped: Deprecated in favor of unified proxy)
 
 # Step 5b: Install Local Homebrew & all-smi Hardware Monitor for Turnstone User
 if [ -d "/home/linuxbrew/.linuxbrew" ]; then
@@ -895,11 +883,11 @@ fetch_and_install_file() {
     local filename="$1"
     local dest="$2"
     local interpolate="${3:-false}"
-    
+
     local local_path="${SCRIPT_DIR}/ryzen_node_custom/${filename}"
     local remote_url="https://raw.githubusercontent.com/teqonix/turnstone-teqonix/main/.github/issues/bare_metal_migration/ryzen_node_custom/${filename}"
     local tmp_file="/tmp/${filename}"
-    
+
     if [ -f "${local_path}" ]; then
         log_info "Found local ${filename}, copying..."
         cp "${local_path}" "${tmp_file}"
@@ -910,7 +898,7 @@ fetch_and_install_file() {
             exit 1
         }
     fi
-    
+
     if [ "${interpolate}" = true ]; then
         eval "cat <<EOF
 $(cat "${tmp_file}")
@@ -939,49 +927,15 @@ if systemctl list-unit-files 2>/dev/null | grep -qE '^lemond\.service'; then
     fi
 fi
 
-# 1. Install Dynamic Lemonade Manager (Port 13306)
-RYZEN_CUSTOM_DIR="/etc/turnstone/ryzen_node_custom"
-mkdir -p "${RYZEN_CUSTOM_DIR}"
-fetch_and_install_file "dynamic_lemonade_manager.py" "${RYZEN_CUSTOM_DIR}/dynamic_lemonade_manager.py" false
-chown -R "${TURNSTONE_USER_DEBIAN}:${TURNSTONE_USER_DEBIAN}" "${RYZEN_CUSTOM_DIR}"
-chmod +x "${RYZEN_CUSTOM_DIR}/dynamic_lemonade_manager.py"
-
-log_info "Deploying models.json to /etc/turnstone..."
-if [ -f "${SCRIPT_DIR}/models.json" ]; then
-    cp "${SCRIPT_DIR}/models.json" "/etc/turnstone/models.json"
-else
-    curl -sSfL "https://raw.githubusercontent.com/teqonix/turnstone-teqonix/main/.github/issues/bare_metal_migration/models.json" -o "/etc/turnstone/models.json"
+# 1. Cleanup Deprecated Dynamic Lemonade Manager
+log_info "Cleaning up deprecated Dynamic Lemonade Manager daemon..."
+if systemctl is-active --quiet lemonade-manager.service 2>/dev/null; then
+    systemctl stop lemonade-manager.service 2>/dev/null || true
+    systemctl disable lemonade-manager.service 2>/dev/null || true
 fi
-chown "${TURNSTONE_USER_DEBIAN}:${TURNSTONE_USER_DEBIAN}" "/etc/turnstone/models.json" 2>/dev/null || true
-chmod 644 "/etc/turnstone/models.json"
-
-# Ensure independent venv exists for lemonade manager
-if [ ! -x "${LEMONADE_MANAGER_VENV_DIR}/bin/python3" ] || [ ! -x "${LEMONADE_MANAGER_VENV_DIR}/bin/uvicorn" ]; then
-    log_info "Creating independent virtual environment at ${LEMONADE_MANAGER_VENV_DIR}..."
-    uv venv "${LEMONADE_MANAGER_VENV_DIR}" --python "${SYSTEM_PYTHON}"
-    uv pip install --python "${LEMONADE_MANAGER_VENV_DIR}" fastapi 'uvicorn[standard]' httpx pydantic
-    chown -R "${TURNSTONE_USER_DEBIAN}:${TURNSTONE_USER_DEBIAN}" "${LEMONADE_MANAGER_VENV_DIR}" 2>/dev/null || chown -R "${TURNSTONE_USER_DEBIAN}" "${LEMONADE_MANAGER_VENV_DIR}"
-    chmod -R a+rX "${LEMONADE_MANAGER_VENV_DIR}"
-    chmod +x "${LEMONADE_MANAGER_VENV_DIR}/bin"/* 2>/dev/null || true
-fi
-
-# Clean up any lingering process holding port 13306 before starting
-fuser -k 13306/tcp 2>/dev/null || true
-pkill -f dynamic_lemonade_manager.py 2>/dev/null || true
-sleep 1
-
-fetch_and_install_file "lemonade-manager.service" "/etc/systemd/system/lemonade-manager.service" true
-systemctl daemon-reload
-systemctl enable lemonade-manager.service
-systemctl restart lemonade-manager.service || true
-
-sleep 1
-if systemctl is-active --quiet lemonade-manager.service; then
-    log_success "Dynamic Lemonade Manager service is ACTIVE (${LEMONADE_MANAGER_MODE} mode on port 13306)."
-else
-    log_warn "Dynamic Lemonade Manager service is not active. Showing recent logs:"
-    journalctl -u lemonade-manager.service -n 25 --no-pager || true
-fi
+rm -f /etc/systemd/system/lemonade-manager.service /etc/turnstone/ryzen_node_custom/dynamic_lemonade_manager.py 2>/dev/null || true
+systemctl daemon-reload 2>/dev/null || true
+log_success "Deprecated Dynamic Lemonade Manager cleaned up."
 
 # 2. Install Turnstone Server Service Unit
 fetch_and_install_file "turnstone-server.service" "/etc/systemd/system/turnstone-server.service" true
@@ -1063,5 +1017,3 @@ if [ -n "${HF_TOKEN}" ]; then
 else
     echo -e "Hugging Face Token: [NONE]"
 fi
-
-
