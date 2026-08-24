@@ -1,0 +1,58 @@
+# =============================================================================
+# Turnstone LiteLLM Load Balancer Configuration (Debian Trixie Container)
+# Load Balancing: Unified Proxy manages all hardware routing
+# =============================================================================
+
+model_list:
+  # ---------------------------------------------------------------------------
+  # 1. Gemma 4 31B (General Reasoning / Orchestrator)
+  # ---------------------------------------------------------------------------
+  - model_name: "gemma-4-31b"
+    litellm_params:
+      model: "openai/gemma-4-31b"
+      api_base: "http://127.0.0.1:13306/v1"
+      api_key: "dummy"
+    model_info:
+      supports_reasoning: true
+
+  # ---------------------------------------------------------------------------
+  # 2. Qwen 3.8 27B (Deep 128k Context Coding Model)
+  # ---------------------------------------------------------------------------
+  - model_name: "qwen-3.8-27b"
+    litellm_params:
+      model: "openai/qwen-3.8-27b"
+      api_base: "http://127.0.0.1:13306/v1"
+      api_key: "dummy"
+    model_info:
+      supports_reasoning: true
+
+  # ---------------------------------------------------------------------------
+  # 3. Ornith 1.5 9B (Fast Agentic Model / Tool Calling)
+  # ---------------------------------------------------------------------------
+  - model_name: "ornith-1.5-9b"
+    litellm_params:
+      model: "openai/ornith-1.5-9b"
+      api_base: "http://127.0.0.1:13306/v1"
+      api_key: "dummy"
+
+router_settings:
+  routing_strategy: "simple-shuffle"
+  routing_strategy_args:
+    ttl: 30
+  num_retries: 10
+  timeout: 600
+  allowed_fails: 4
+  cooldown_time: 30
+
+general_settings:
+  master_key: "\${MASTER_KEY}"
+  database_url: "\${DATABASE_URL}"
+  store_model_in_db: true
+  store_prompts_in_spend_logs: true
+  maximum_spend_logs_retention_period: "21d"
+  drop_params: true
+
+litellm_settings:
+  drop_params: true
+  set_verbose: false
+  telemetry: false
