@@ -677,7 +677,7 @@ if [ "${INSTALL_POSTGRES}" = true ]; then
 
     if [ -n "${PG_CONF_DIR}" ] && [ -f "${PG_CONF_DIR}/postgresql.conf" ]; then
         log_info "Configuring PostgreSQL (${PG_VERSION}) network listening and container shared memory..."
-        
+
         # Listen on all network interfaces
         if grep -q "^#listen_addresses =" "${PG_CONF_DIR}/postgresql.conf"; then
             sed -i "s/^#listen_addresses =.*/listen_addresses = '*'/" "${PG_CONF_DIR}/postgresql.conf"
@@ -798,7 +798,7 @@ if [ ! -d "${VENV_DIR}" ] || [ ! -f "${VENV_DIR}/bin/litellm" ]; then
     mkdir -p /opt
     rm -rf "${VENV_DIR}"
     uv venv "${VENV_DIR}" --python "${SYSTEM_PYTHON}"
-    
+
     log_info "Installing 'litellm[proxy]', prisma, asyncpg, psycopg2-binary, fastapi, uvicorn, and dependencies..."
     uv pip install --python "${VENV_DIR}" "fastapi>=0.112.0,<0.116.0" "litellm[proxy]" uvicorn gunicorn backoff asyncpg psycopg2-binary prisma
     log_success "LiteLLM and database drivers installed successfully."
@@ -913,12 +913,12 @@ fetch_and_install_file() {
     local filename="$1"
     local dest="$2"
     local interpolate="${3:-false}"
-    
+
     local local_path="${SCRIPT_DIR}/litellm/${filename}"
     local remote_url="https://raw.githubusercontent.com/teqonix/turnstone-teqonix/main/.github/issues/bare_metal_migration/litellm/${filename}"
-    
+
     local tmp_file="/tmp/${filename}"
-    
+
     if [ -f "${local_path}" ]; then
         log_info "Found local ${filename}, copying..."
         cp "${local_path}" "${tmp_file}"
@@ -929,7 +929,7 @@ fetch_and_install_file() {
             exit 1
         }
     fi
-    
+
     if [ "${interpolate}" = true ]; then
         log_info "Interpolating variables in ${filename}..."
         export NODE_RYZEN_ONE NODE_RYZEN_TWO NODE_MBP_OLLAMA NODE_MBP_MLX MASTER_KEY DATABASE_URL
@@ -940,28 +940,15 @@ EOF
     else
         cp "${tmp_file}" "${dest}"
     fi
-    
+
     rm -f "${tmp_file}"
 }
 
-fetch_and_install_file "hardware_group_router_litellm.py" "${LITELLM_DIR}/hardware_group_router_litellm.py" false
-chown "${LITELLM_USER}:${LITELLM_USER}" "${LITELLM_DIR}/hardware_group_router_litellm.py" 2>/dev/null || true
+fetch_and_install_file "unified_proxy.py" "${LITELLM_DIR}/unified_proxy.py" false
+fetch_and_install_file "models_map.json" "${LITELLM_DIR}/models_map.json" false
+chown "${LITELLM_USER}:${LITELLM_USER}" "${LITELLM_DIR}/unified_proxy.py" 2>/dev/null || true
 
-# Fetch models config and generator script
-fetch_and_install_file "config.yaml.template" "${LITELLM_DIR}/config.yaml.template" true
-fetch_and_install_file "../models.json" "${LITELLM_DIR}/models.json" false
-fetch_and_install_file "generate_config.py" "${LITELLM_DIR}/generate_config.py" false
-
-log_info "Generating dynamic LiteLLM config from models.json..."
-export MODELS_CONFIG_PATH="${LITELLM_DIR}/models.json"
-export CONFIG_TEMPLATE_PATH="${LITELLM_DIR}/config.yaml.template"
-export CONFIG_OUTPUT_PATH="${LITELLM_CONFIG}"
-export NODE_RYZEN_ONE="${NODE_RYZEN_ONE}"
-export NODE_RYZEN_TWO="${NODE_RYZEN_TWO}"
-export NODE_MBP_MLX="${NODE_MBP_MLX}"
-export NODE_MBP_OLLAMA="${NODE_MBP_OLLAMA}"
-"${VENV_DIR}/bin/python3" "${LITELLM_DIR}/generate_config.py"
-
+fetch_and_install_file "config.yaml" "${LITELLM_CONFIG}" true
 chown -R "${LITELLM_USER}:${LITELLM_USER}" "${LITELLM_DIR}"
 chmod 600 "${LITELLM_CONFIG}"
 log_success "Configuration created at ${LITELLM_CONFIG}."
@@ -993,6 +980,8 @@ Environment="PYTHONUNBUFFERED=1"
 Environment="PYTHONPATH=${LITELLM_DIR}"
 Environment="MBP_COOLDOWN_SECONDS=${MBP_COOLDOWN_SECONDS}"
 Environment="PATH=${VENV_DIR}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ExecStartPre=-/bin/sh -c 'pkill -f "unified_proxy.py" || true'
+ExecStartPre=-/bin/sh -c 'nohup ${VENV_DIR}/bin/python3 ${LITELLM_DIR}/unified_proxy.py > ${LITELLM_DIR}/unified_proxy.log 2>&1 &'
 ExecStart=${VENV_DIR}/bin/python3 -m litellm.proxy.proxy_cli --config ${LITELLM_CONFIG} --host ${LITELLM_HOST} --port ${LITELLM_PORT}
 Restart=always
 RestartSec=5s
@@ -1012,7 +1001,7 @@ if pidof systemd &>/dev/null || [ -d /run/systemd/system ]; then
 else
     log_warn "Systemd not active as PID 1 in this container. Using background runner."
     log_info "Creating helper start script at /usr/local/bin/start-litellm..."
-    
+
     cat > /usr/local/bin/start-litellm <<EOF
 #!/usr/bin/env bash
 export HOME="/home/${LITELLM_USER}"
@@ -1024,14 +1013,19 @@ export PYTHONUNBUFFERED=1
 export PYTHONPATH="${LITELLM_DIR}:\${PYTHONPATH:-}"
 export MBP_COOLDOWN_SECONDS="${MBP_COOLDOWN_SECONDS}"
 export PATH="${VENV_DIR}/bin:\$PATH"
+
+# Start the unified proxy
+nohup ${VENV_DIR}/bin/python3 ${LITELLM_DIR}/unified_proxy.py > ${LITELLM_DIR}/unified_proxy.log 2>&1 &
+
 exec ${VENV_DIR}/bin/python3 -m litellm.proxy.proxy_cli --config ${LITELLM_CONFIG} --host ${LITELLM_HOST} --port ${LITELLM_PORT}
 EOF
     chmod +x /usr/local/bin/start-litellm
-    
+
     # Kill previous instances if restarting
+    pkill -f "unified_proxy.py" || true
     pkill -f "litellm.*--config" || true
     sleep 1
-    
+
     log_info "Starting LiteLLM proxy in background..."
     nohup /usr/local/bin/start-litellm > /var/log/litellm.log 2>&1 &
 fi
