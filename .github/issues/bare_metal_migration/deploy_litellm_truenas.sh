@@ -106,6 +106,7 @@ Options:
   --node-mbp <url>               Alias for MacBook Pro Ollama Server (default: http://mbp-ai-core.lan:11434/v1)
   --mbp-cooldown <seconds>       Cooldown window for qwen-3.8-27b priority (default: 60)
   --strategy <strategy>          Routing strategy: least-busy, latency-based-routing, simple-shuffle (default: simple-shuffle)
+  --proxy-only, --update-proxy   Update and restart unified_proxy.py only (skip full stack install)
   --restart                      Force restart the service
   -h, --help                     Display this help message
 
@@ -460,6 +461,10 @@ while [[ $# -gt 0 ]]; do
             ROUTING_STRATEGY="$2"
             shift 2
             ;;
+        --proxy-only|--update-proxy|--rebuild-proxy)
+            ACTION_PROXY_ONLY=true
+            shift
+            ;;
         --restart)
             FORCE_RESTART=true
             shift
@@ -474,10 +479,93 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# If inspect/status requested, show summary and exit immediately
-if [ "${ACTION_INSPECT}" = true ]; then
-    show_status_summary
+fetch_and_install_file() {
+    local filename="$1"
+    local dest="$2"
+    local interpolate="${3:-false}"
+
+    local local_path="${SCRIPT_DIR}/litellm/${filename}"
+    local remote_url="https://raw.githubusercontent.com/teqonix/turnstone-teqonix/main/.github/issues/bare_metal_migration/litellm/${filename}"
+
+    local tmp_file="/tmp/${filename}"
+
+    if [ -f "${local_path}" ]; then
+        log_info "Found local ${filename}, copying..."
+        cp "${local_path}" "${tmp_file}"
+    else
+        log_info "Fetching ${filename} from remote..."
+        curl -sSfL "${remote_url}" -o "${tmp_file}" || {
+            log_error "Failed to fetch ${filename}"
+            exit 1
+        }
+    fi
+
+    if [ "${interpolate}" = true ]; then
+        log_info "Interpolating variables in ${filename}..."
+        export NODE_RYZEN_ONE NODE_RYZEN_TWO NODE_MBP_OLLAMA NODE_MBP_MLX MASTER_KEY DATABASE_URL
+        eval "cat <<EOF
+$(cat "${tmp_file}")
+EOF
+" > "${dest}"
+    else
+        cp "${tmp_file}" "${dest}"
+    fi
+
+    rm -f "${tmp_file}"
+}
+
+rebuild_unified_proxy_only() {
+    log_section "Quick Update: Unified Hardware Proxy"
+    log_info "Updating unified_proxy.py and models_map.json in ${LITELLM_DIR}..."
+
+    mkdir -p "${LITELLM_DIR}"
+    fetch_and_install_file "unified_proxy.py" "${LITELLM_DIR}/unified_proxy.py" false
+    fetch_and_install_file "models_map.json" "${LITELLM_DIR}/models_map.json" false
+    chown -R "${LITELLM_USER}:${LITELLM_USER}" "${LITELLM_DIR}" 2>/dev/null || true
+
+    log_info "Restarting Unified Hardware Proxy service..."
+    pkill -f "unified_proxy.py" || true
+    sleep 1
+
+    if pidof systemd &>/dev/null || [ -d /run/systemd/system ]; then
+        if systemctl is-active --quiet litellm.service; then
+            log_info "Restarting litellm.service via systemd (restarts unified_proxy via ExecStartPre)..."
+            systemctl restart litellm.service
+        else
+            log_info "Starting unified_proxy.py directly in background..."
+            nohup sudo -u "${LITELLM_USER}" "${VENV_DIR}/bin/python3" "${LITELLM_DIR}/unified_proxy.py" > "${LITELLM_DIR}/unified_proxy.log" 2>&1 &
+        fi
+    else
+        log_info "Starting unified_proxy.py directly in background..."
+        nohup sudo -u "${LITELLM_USER}" "${VENV_DIR}/bin/python3" "${LITELLM_DIR}/unified_proxy.py" > "${LITELLM_DIR}/unified_proxy.log" 2>&1 &
+    fi
+
+    log_info "Verifying Unified Hardware Proxy status on port 13306..."
+    PROXY_UP=false
+    for i in $(seq 1 10); do
+        if curl -s http://127.0.0.1:13306/ &>/dev/null || pgrep -f "unified_proxy.py" &>/dev/null; then
+            PROXY_UP=true
+            log_success "Unified Hardware Proxy is active and running on port 13306!"
+            break
+        fi
+        sleep 1
+    done
+
+    if [ "${PROXY_UP}" = false ]; then
+        log_warn "Unified Proxy did not respond on port 13306 within 10s. Check ${LITELLM_DIR}/unified_proxy.log."
+    fi
+
+    log_success "Unified Hardware Proxy update complete."
     exit 0
+}
+
+# If proxy-only update requested, execute and exit immediately
+if [ "${ACTION_PROXY_ONLY:-false}" = true ]; then
+    if [ "$EUID" -ne 0 ]; then
+        log_warn "Root privileges required to update system services. Re-executing with sudo..."
+        exec sudo bash "$0" "$@"
+    fi
+    rebuild_unified_proxy_only
 fi
 
 log_section "LiteLLM Proxy Installation (Debian Trixie Container)"
@@ -907,42 +995,7 @@ fi
 # -----------------------------------------------------------------------------
 # Step 7a: Fetch and Configure LiteLLM Router and Config
 # -----------------------------------------------------------------------------
-log_info "Fetching LiteLLM Router and Configuration files..."
-
-fetch_and_install_file() {
-    local filename="$1"
-    local dest="$2"
-    local interpolate="${3:-false}"
-
-    local local_path="${SCRIPT_DIR}/litellm/${filename}"
-    local remote_url="https://raw.githubusercontent.com/teqonix/turnstone-teqonix/main/.github/issues/bare_metal_migration/litellm/${filename}"
-
-    local tmp_file="/tmp/${filename}"
-
-    if [ -f "${local_path}" ]; then
-        log_info "Found local ${filename}, copying..."
-        cp "${local_path}" "${tmp_file}"
-    else
-        log_info "Fetching ${filename} from remote..."
-        curl -sSfL "${remote_url}" -o "${tmp_file}" || {
-            log_error "Failed to fetch ${filename}"
-            exit 1
-        }
-    fi
-
-    if [ "${interpolate}" = true ]; then
-        log_info "Interpolating variables in ${filename}..."
-        export NODE_RYZEN_ONE NODE_RYZEN_TWO NODE_MBP_OLLAMA NODE_MBP_MLX MASTER_KEY DATABASE_URL
-        eval "cat <<EOF
-$(cat "${tmp_file}")
-EOF
-" > "${dest}"
-    else
-        cp "${tmp_file}" "${dest}"
-    fi
-
-    rm -f "${tmp_file}"
-}
+log_info "Installing LiteLLM Router and Configuration files..."
 
 fetch_and_install_file "unified_proxy.py" "${LITELLM_DIR}/unified_proxy.py" false
 fetch_and_install_file "models_map.json" "${LITELLM_DIR}/models_map.json" false

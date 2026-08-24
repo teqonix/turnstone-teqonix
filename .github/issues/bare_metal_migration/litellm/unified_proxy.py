@@ -1,5 +1,6 @@
 import os
 import json
+import random
 import logging
 import asyncio
 from typing import Dict, Any, List, Optional
@@ -203,53 +204,86 @@ class UnifiedProxyManager:
 
         nodes = [mac_stats, ryzen1_stats, ryzen2_stats]
 
+        logger.info(f"--- Evaluating Node States for '{model_name}' (Heavy: {is_heavy}) ---")
         valid_nodes = []
         for n in nodes:
+            node_name = "Mac (MBP)" if n.get("is_mac") else n.get("backend_url", "Unknown")
             if n.get("offline"):
+                logger.warning(f"  [{node_name}] Status: OFFLINE / Unreachable")
                 continue
 
             loaded = n.get("loaded_models", [])
             has_matching_model = any(norm_model in m.lower() or m.lower() in norm_model for m in loaded)
             mem = n.get("mem_utilization", 0.0)
+            gpu = n.get("gpu_usage", 0.0)
+            power = n.get("power_draw", 0.0)
             num_heavy = n.get("num_heavy", 0)
             num_small = n.get("num_small", 0)
 
+            is_valid = False
+            reason = ""
             if has_matching_model:
-                # Matching model is already loaded and ready in memory
-                valid_nodes.append(n)
+                is_valid = True
+                reason = "Model already loaded in memory"
             elif is_heavy:
-                # Allow loading/swapping heavy model if memory has headroom and node is not overloaded
                 if mem < 0.85 and (num_heavy + num_small <= 2):
-                    valid_nodes.append(n)
+                    is_valid = True
+                    reason = "Eligible for heavy model swap"
+                else:
+                    reason = f"At capacity (RAM: {mem*100:.1f}%, Models: {num_heavy}h/{num_small}s)"
             else:
-                # Allow small model if memory has headroom
                 if mem < 0.85:
-                    valid_nodes.append(n)
+                    is_valid = True
+                    reason = "Eligible for light model"
+                else:
+                    reason = f"At capacity (RAM: {mem*100:.1f}%)"
+
+            status_str = "VALID" if is_valid else "REJECTED"
+            logger.info(f"  [{node_name}] {status_str} ({reason}) | RAM: {mem*100:.1f}%, GPU: {gpu:.1f}%, Power: {power:.1f}W | Loaded: {loaded}")
+
+            if is_valid:
+                valid_nodes.append(n)
 
         if not valid_nodes:
+            logger.warning(f"No valid nodes available for '{model_name}'.")
             return None
 
-        # Sort: 1) Matching model already in memory, 2) Prefer Mac, 3) Lower GPU, 4) Lower power
+        # Sort factors:
+        # For Heavy Models: Prioritize Mac (Apple Silicon MLX engine) first, then in-memory match, then resource metrics
+        # For Light Models: Prioritize existing in-memory model match first, then Mac (Ollama), then resource metrics
         def sort_key(n):
             loaded = n.get("loaded_models", [])
             has_model = any(norm_model in m.lower() or m.lower() in norm_model for m in loaded)
-            return (
-                not has_model,
-                not n.get("is_mac", False),
-                n.get("gpu_usage", 100),
-                n.get("power_draw", 1000)
-            )
+            if is_heavy:
+                return (
+                    not n.get("is_mac", False),
+                    not has_model,
+                    n.get("gpu_usage", 100.0),
+                    round(n.get("mem_utilization", 1.0), 2),
+                    n.get("power_draw", 1000.0)
+                )
+            else:
+                return (
+                    not has_model,
+                    not n.get("is_mac", False),
+                    n.get("gpu_usage", 100.0),
+                    round(n.get("mem_utilization", 1.0), 2),
+                    n.get("power_draw", 1000.0)
+                )
 
+        # Shuffle candidates first to distribute load evenly when all metrics are tied
+        random.shuffle(valid_nodes)
         valid_nodes.sort(key=sort_key)
         best = valid_nodes[0]
 
         if best.get("is_mac"):
-            if is_heavy:
-                return best.get("backend_url_mlx")
-            else:
-                return best.get("backend_url_ollama")
+            target = best.get("backend_url_mlx") if is_heavy else best.get("backend_url_ollama")
         else:
-            return best.get("backend_url")
+            target = best.get("backend_url")
+
+        best_name = "Mac (MBP)" if best.get("is_mac") else best.get("backend_url")
+        logger.info(f"--- Routing Decision: Selected [{best_name}] -> {target} ---")
+        return target
 
 manager = UnifiedProxyManager()
 
@@ -266,6 +300,7 @@ app = FastAPI(title="Turnstone Unified Hardware Proxy", lifespan=lifespan)
 async def proxy_or_handle(path: str, request: Request):
     body = None
     model_name = ""
+    start_time = asyncio.get_event_loop().time()
 
     if request.method in ["POST", "PUT", "PATCH"]:
         try:
@@ -342,6 +377,8 @@ async def proxy_or_handle(path: str, request: Request):
                         yield chunk
                 finally:
                     await backend_res.aclose()
+                    elapsed = asyncio.get_event_loop().time() - start_time
+                    logger.info(f"Stream finished for {model_name} on {target_url} in {elapsed:.2f}s (Status: {backend_res.status_code})")
             return StreamingResponse(stream_generator(), status_code=backend_res.status_code, media_type="text/event-stream")
         else:
             content = await backend_res.aread()
@@ -349,10 +386,13 @@ async def proxy_or_handle(path: str, request: Request):
             headers = dict(backend_res.headers)
             headers.pop("content-length", None)
             headers.pop("content-encoding", None)
+            elapsed = asyncio.get_event_loop().time() - start_time
+            logger.info(f"Request finished for {model_name} on {target_url} in {elapsed:.2f}s (Status: {backend_res.status_code})")
             return Response(content=content, status_code=backend_res.status_code, headers=headers)
 
     except Exception as e:
-        logger.error(f"Error proxying request to {target_url}: {e}")
+        elapsed = asyncio.get_event_loop().time() - start_time
+        logger.error(f"Error proxying request to {target_url} after {elapsed:.2f}s: {e}")
         raise HTTPException(status_code=502, detail=f"Backend communication failure: {str(e)}")
 
 
