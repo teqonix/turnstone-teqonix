@@ -124,6 +124,37 @@ Built-in tools for shell, files, search, web, memory, notifications, and autonom
 
 **Multi-node**: Client → Console (rendezvous routing proxy) → Server nodes. The console picks the target node for each workstream via rendezvous (HRW) hashing over the live service registry — pure function of `(ws_id, live_nodes)`, no stored bucket state, deterministic across readers. A node join or drop only re-routes the keys that score highest on the affected node.
 
+### Hardware-Level Load Balancing
+LiteLLM and Turnstone natively only support model-level load balancing. To achieve robust cluster deployment across multiple machines (e.g., Apple Silicon and AMD Ryzen nodes), Turnstone uses a custom proxy (`dynamic_lemonade_manager.py` in proxy mode) to handle true hardware-level load balancing.
+
+This architecture intercepts requests, tracks actual in-flight inference traffic, and monitors node memory states in real-time. This prevents out-of-memory errors and premature model evictions by ensuring the router (`HardwareGroupRouter`) can synchronously query actual load (`GET /health`) before routing, rather than relying on static capacity estimates.
+
+#### LiteLLM Configuration
+
+To implement the `HardwareGroupRouter`, you must update your `litellm` `config.yaml` to point to the new proxy endpoints and load the custom router plugin:
+
+1. **Update `api_base` URLs:** Change the endpoints for your Ryzen nodes to point to the `dynamic_lemonade_manager.py` proxy on port `13306` (instead of the default `13305`). Your Apple Silicon nodes running `dynamic_mlx_server.py` will run on port `8000`.
+2. **Enable the Custom Router:** Register the custom python script as a routing plugin in LiteLLM.
+
+Example `config.yaml`:
+```yaml
+model_list:
+  - model_name: gemma
+    litellm_params:
+      model: openai/gemma
+      api_base: http://amd-ai-core-one.lan:13306/v1 # <--- Proxy Port (13306)
+  - model_name: gemma
+    litellm_params:
+      model: openai/gemma
+      api_base: http://mbp-ai-core.lan:8000/v1       # <--- MLX Node Port (8000)
+
+router_settings:
+  routing_strategy: custom_strategy
+  routing_strategy_args:
+    strategy_module: .github.issues.bare_metal_migration.litellm.hardware_group_router_litellm
+    strategy_class: hardware_group_plugin
+```
+
 | Component | Purpose |
 |-----------|---------|
 | `turnstone` | Terminal CLI (REPL) |
