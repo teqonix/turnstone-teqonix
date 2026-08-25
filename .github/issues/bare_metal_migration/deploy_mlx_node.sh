@@ -44,6 +44,7 @@ SMB_USER="${SMB_USER:-}"
 SMB_PASSWORD="${SMB_PASSWORD:-}"
 TURNSTONE_USER="${TURNSTONE_USER:-}"
 HF_TOKEN="${HF_TOKEN:-}"
+OLLAMA_ONLY=false
 
 usage() {
     echo "Usage: $0 [OPTIONS]"
@@ -57,6 +58,7 @@ usage() {
     echo "      --smb-user <user>              SMB username (e.g. turnstone-np)"
     echo "      --smb-pass <pass>              SMB password"
     echo "      --turnstone-user <user>        Local system user [default: turnstone or current user]"
+    echo "      --ollama-only                  Deploy Ollama only (disables MLX server and removes Ollama RAM constraints)"
     echo "  -h, --help                         Display this help message and exit"
     exit 0
 }
@@ -94,6 +96,10 @@ while [[ $# -gt 0 ]]; do
         --turnstone-user|--local-user)
             TURNSTONE_USER="$2"
             shift 2
+            ;;
+        --ollama-only)
+            OLLAMA_ONLY=true
+            shift 1
             ;;
         -h|--help)
             usage
@@ -840,6 +846,7 @@ manage_launch_daemon "${SMB_MOUNT_PLIST}" "com.turnstone.smb-mount"
 run_as_target_user "bash '${MOUNT_SCRIPT}' 2>/dev/null || true"
 log_success "SMB storage configured for startup mount at ${MOUNT_POINT}."
 
+if [ "${OLLAMA_ONLY}" != true ]; then
 # Step 6: Setup Dynamic MLX Server (FastAPI with Lazy Eviction & Metal Cache Clearing)
 MLX_CUSTOM_DIR="${CONFIG_DIR}/mlx_node_custom"
 mkdir -p "${MLX_CUSTOM_DIR}" 2>/dev/null || true
@@ -853,10 +860,28 @@ log_info "Step 6: Configuring Dynamic MLX Server system daemon on port 8000..."
 fetch_and_install_file "com.turnstone.mlx-server.plist" "${MLX_PLIST}" true
 manage_launch_daemon "${MLX_PLIST}" "com.turnstone.mlx-server" 8000
 log_success "Dynamic MLX Server system daemon loaded."
+fi
 
 # Step 6b: Setup Ollama Launchd Daemon (Multi-Model Swapping Engine on Port 11434)
 OLLAMA_PLIST="${SYSTEM_DAEMONS_DIR}/com.turnstone.ollama.plist"
-log_info "Step 6b: Configuring Ollama system daemon on port 11434 (Memory Capped: 40GB)..."
+if [ "${OLLAMA_ONLY}" = true ]; then
+    log_info "Step 6b: Configuring Ollama system daemon on port 11434 (Memory Capped: None)..."
+    OLLAMA_RAM_LIMIT_XML=""
+else
+    log_info "Step 6b: Configuring Ollama system daemon on port 11434 (Memory Capped: 40GB)..."
+    read -r -d '' OLLAMA_RAM_LIMIT_XML << 'EOF' || true
+    <key>HardResourceLimits</key>
+    <dict>
+        <key>ResidentSetSize</key>
+        <integer>42949672960</integer>
+    </dict>
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>ResidentSetSize</key>
+        <integer>42949672960</integer>
+    </dict>
+EOF
+fi
 fetch_and_install_file "com.turnstone.ollama.plist" "${OLLAMA_PLIST}" true
 
 manage_launch_daemon "${OLLAMA_PLIST}" "com.turnstone.ollama" 11434
@@ -865,6 +890,7 @@ log_success "Ollama system daemon loaded."
 # Step 6c: Download and Associate Models with Servers
 log_info "Step 6c: Verifying & downloading models for MLX and Ollama..."
 
+if [ "${OLLAMA_ONLY}" != true ]; then
 # 1. MLX & Hugging Face Models: Qwen3.8-27B-4bit, Gemma-4-31B-it-4bit & Mistral-Nemo-Base-2407
 log_info "Checking / downloading models via Hugging Face ('mlx-community/Qwen3.8-27B-4bit', 'mlx-community/gemma-4-31B-it-4bit', 'mistralai/Mistral-Nemo-Base-2407')..."
 run_as_target_user "
@@ -881,6 +907,7 @@ run_as_target_user "
     fi
 "
 log_success "MLX and Hugging Face models verified (Qwen3.8-27B-4bit, Gemma-4-31B-it-4bit, Mistral-Nemo-Base-2407)."
+fi
 
 # 2. Ollama Models: Qwen3.8 27B, Gemma 4 31B, Mistral Nemo 12B, & Ornith
 log_info "Waiting for Ollama daemon to initialize..."
@@ -973,7 +1000,9 @@ echo -e "System User: ${TURNSTONE_USER} (${USER_HOME})"
 echo -e "Node ID: ${NODE_ID}"
 echo -e "Advertise URL: http://${LAN_IP}:8080"
 echo -e "PostgreSQL Backend: ${POSTGRES_USER}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}"
-echo -e "MLX Server API (Pinned): http://127.0.0.1:8000/v1 (mlx-community/Qwen3-Coder-Next-6bit)"
+if [ "${OLLAMA_ONLY}" != true ]; then
+    echo -e "MLX Server API (Pinned): http://127.0.0.1:8000/v1 (mlx-community/Qwen3-Coder-Next-6bit)"
+fi
 echo -e "Ollama Server API (Dynamic): http://127.0.0.1:11434/v1 (Qwen3.8 27B, Gemma 4 31B)"
 echo -e "SMB Storage Mount: ${MOUNT_POINT} (${SMB_PATH})"
 echo -e "Homebrew Prefix: ${LOCAL_BREW_DIR}"
