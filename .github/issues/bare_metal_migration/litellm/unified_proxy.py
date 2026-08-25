@@ -32,7 +32,6 @@ NODE_RYZEN_ONE = os.getenv("NODE_RYZEN_ONE", "http://amd-ai-core-one.lan:13305")
 NODE_RYZEN_TWO = os.getenv("NODE_RYZEN_TWO", "http://amd-ai-core-two.lan:13305")
 NODE_MBP_SSH_USER = os.getenv("TURNSTONE_USER", "turnstone")
 NODE_MBP_HOSTNAME = os.getenv("MBP_HOSTNAME", "mbp-ai-core.lan")
-NODE_MBP_MLX = os.getenv("NODE_MBP_MLX", f"http://{NODE_MBP_HOSTNAME}:8000")
 NODE_MBP_OLLAMA = os.getenv("NODE_MBP_OLLAMA", f"http://{NODE_MBP_HOSTNAME}:11434")
 NODE_MBP_SSH = os.getenv("NODE_MBP_SSH", f"{NODE_MBP_SSH_USER}@{NODE_MBP_HOSTNAME}")
 
@@ -133,16 +132,6 @@ class UnifiedProxyManager:
                 loaded_models = []
 
                 try:
-                    mlx_res = await self.http_client.get(f"{NODE_MBP_MLX}/health", timeout=2.0)
-                    if mlx_res.status_code == 200:
-                        mlx_data = mlx_res.json()
-                        active_model = mlx_data.get("active_model")
-                        if active_model:
-                            loaded_models.append(active_model)
-                except Exception:
-                    pass
-
-                try:
                     ollama_res = await self.http_client.get(f"{NODE_MBP_OLLAMA}/api/ps", timeout=2.0)
                     if ollama_res.status_code == 200:
                         ollama_models = ollama_res.json().get("models", [])
@@ -163,8 +152,7 @@ class UnifiedProxyManager:
                     "loaded_models": loaded_models,
                     "num_heavy": num_heavy,
                     "num_small": num_small,
-                    "backend_url_mlx": NODE_MBP_MLX,
-                    "backend_url_ollama": NODE_MBP_OLLAMA,
+                    "backend_url": NODE_MBP_OLLAMA,
                     "is_mac": True
                 }
             else:
@@ -249,39 +237,43 @@ class UnifiedProxyManager:
             return None
 
         # Sort factors:
-        # For Heavy Models: Prioritize Mac (Apple Silicon MLX engine) first, then in-memory match, then resource metrics
-        # For Light Models: Prioritize existing in-memory model match first, then Mac (Ollama), then resource metrics
+        # 1. Model already loaded in memory (highest priority to avoid cold swap)
+        # 2. Busy penalty (demote busy nodes; if Mac is working on something, use available Ryzen nodes)
+        # 3. Mac priority only when idle and model is heavy
+        # 4. Resource metrics (GPU load, RAM utilization, power draw)
         def sort_key(n):
             loaded = n.get("loaded_models", [])
             has_model = any(norm_model in m.lower() or m.lower() in norm_model for m in loaded)
-            if is_heavy:
-                return (
-                    not n.get("is_mac", False),
-                    not has_model,
-                    n.get("gpu_usage", 100.0),
-                    round(n.get("mem_utilization", 1.0), 2),
-                    n.get("power_draw", 1000.0)
-                )
-            else:
-                return (
-                    not has_model,
-                    not n.get("is_mac", False),
-                    n.get("gpu_usage", 100.0),
-                    round(n.get("mem_utilization", 1.0), 2),
-                    n.get("power_draw", 1000.0)
-                )
+            gpu = n.get("gpu_usage", 0.0)
+            num_models = n.get("num_heavy", 0) + n.get("num_small", 0)
+            is_mac = n.get("is_mac", False)
+            
+            # Node is considered busy if GPU is actively computing or models are loaded
+            is_busy = (gpu > 15.0) or (num_models > 0 and not has_model)
+
+            # If Mac is busy, demote it so other available nodes take precedence
+            mac_penalty = 1 if (is_mac and is_busy) else 0
+
+            # If Mac is completely idle, give it priority for heavy models
+            mac_idle_priority = 0 if (is_mac and not is_busy and is_heavy) else 1
+
+            return (
+                not has_model,          # 1. In-memory model match
+                mac_penalty,            # 2. Avoid Mac if it is already working on something
+                is_busy,                # 3. Prefer non-busy nodes
+                mac_idle_priority,      # 4. Idle Mac priority for heavy models
+                round(gpu, -1),         # 5. Lowest GPU load
+                round(n.get("mem_utilization", 1.0), 2), # 6. Lowest RAM usage
+                n.get("power_draw", 1000.0)
+            )
 
         # Shuffle candidates first to distribute load evenly when all metrics are tied
         random.shuffle(valid_nodes)
         valid_nodes.sort(key=sort_key)
         best = valid_nodes[0]
 
-        if best.get("is_mac"):
-            target = best.get("backend_url_mlx") if is_heavy else best.get("backend_url_ollama")
-        else:
-            target = best.get("backend_url")
-
-        best_name = "Mac (MBP)" if best.get("is_mac") else best.get("backend_url")
+        target = best.get("backend_url")
+        best_name = "Mac (MBP - Ollama)" if best.get("is_mac") else best.get("backend_url")
         logger.info(f"--- Routing Decision: Selected [{best_name}] -> {target} ---")
         return target
 
@@ -327,11 +319,7 @@ async def proxy_or_handle(path: str, request: Request):
     # Rewrite model name based on target node to prevent 404s
     if isinstance(body, dict) and "model" in body:
         norm_model = model_name.lower()
-        backend_type = "lemonade"
-        if NODE_MBP_MLX in best_url:
-            backend_type = "mac_mlx"
-        elif NODE_MBP_OLLAMA in best_url:
-            backend_type = "mac_ollama"
+        backend_type = "mac_ollama" if NODE_MBP_OLLAMA in best_url else "lemonade"
             
         mapping = manager.model_map.get(backend_type, {})
         for key, target_model in mapping.items():
@@ -373,8 +361,23 @@ async def proxy_or_handle(path: str, request: Request):
         if is_streaming:
             async def stream_generator():
                 try:
-                    async for chunk in backend_res.aiter_raw():
-                        yield chunk
+                    async for line in backend_res.aiter_lines():
+                        if line.startswith("data: ") and line.strip() != "data: [DONE]":
+                            data_str = line[6:].strip()
+                            try:
+                                chunk_json = json.loads(data_str)
+                                choices = chunk_json.get("choices", [])
+                                modified = False
+                                for c in choices:
+                                    delta = c.get("delta", {})
+                                    if isinstance(delta, dict) and "reasoning" in delta and "reasoning_content" not in delta:
+                                        delta["reasoning_content"] = delta["reasoning"]
+                                        modified = True
+                                if modified:
+                                    line = f"data: {json.dumps(chunk_json)}"
+                            except Exception:
+                                pass
+                        yield (line + "\n").encode("utf-8")
                 finally:
                     await backend_res.aclose()
                     elapsed = asyncio.get_event_loop().time() - start_time
@@ -383,6 +386,19 @@ async def proxy_or_handle(path: str, request: Request):
         else:
             content = await backend_res.aread()
             await backend_res.aclose()
+            try:
+                data_json = json.loads(content.decode("utf-8"))
+                choices = data_json.get("choices", [])
+                modified = False
+                for c in choices:
+                    msg = c.get("message", {})
+                    if isinstance(msg, dict) and "reasoning" in msg and "reasoning_content" not in msg:
+                        msg["reasoning_content"] = msg["reasoning"]
+                        modified = True
+                if modified:
+                    content = json.dumps(data_json).encode("utf-8")
+            except Exception:
+                pass
             headers = dict(backend_res.headers)
             headers.pop("content-length", None)
             headers.pop("content-encoding", None)
