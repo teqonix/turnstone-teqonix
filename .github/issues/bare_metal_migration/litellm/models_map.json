@@ -1,10 +1,8 @@
 {
-  "mac_mlx": {
-    "gemma": "mlx-community/gemma-4-31B-it-4bit",
-    "qwen": "mlx-community/Qwen3.8-27B-4bit"
-  },
   "mac_ollama": {
-    "ornith": "ornith-1.5:9b"
+    "ornith": "ornith-1.5:9b",
+    "gemma": "gemma4:31b",
+    "qwen": "qwen3.8:27b"
   },
   "lemonade": {
     "gemma": "gemma-4-31B-it-GGUF-UD-Q4_K_XL",

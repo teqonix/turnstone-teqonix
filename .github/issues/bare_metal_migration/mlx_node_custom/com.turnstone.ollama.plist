@@ -33,16 +33,7 @@
         <key>OLLAMA_MAX_LOADED_MODELS</key>
         <string>1</string>
     </dict>
-    <key>HardResourceLimits</key>
-    <dict>
-        <key>ResidentSetSize</key>
-        <integer>42949672960</integer>
-    </dict>
-    <key>SoftResourceLimits</key>
-    <dict>
-        <key>ResidentSetSize</key>
-        <integer>42949672960</integer>
-    </dict>
+${OLLAMA_RAM_LIMIT_XML}
     <key>ProgramArguments</key>
     <array>
         <string>${LOCAL_BREW_DIR}/bin/ollama</string>
