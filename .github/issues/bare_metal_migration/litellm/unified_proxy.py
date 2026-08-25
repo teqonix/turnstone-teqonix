@@ -3,6 +3,7 @@ import json
 import random
 import logging
 import asyncio
+import time
 from typing import Dict, Any, List, Optional
 from enum import Enum
 from contextlib import asynccontextmanager
@@ -35,6 +36,7 @@ NODE_MBP_HOSTNAME = os.getenv("MBP_HOSTNAME", "mbp-ai-core.lan")
 NODE_MBP_OLLAMA = os.getenv("NODE_MBP_OLLAMA", f"http://{NODE_MBP_HOSTNAME}:11434")
 NODE_MBP_SSH = os.getenv("NODE_MBP_SSH", f"{NODE_MBP_SSH_USER}@{NODE_MBP_HOSTNAME}")
 
+COOLDOWN_SECONDS = float(os.getenv("NODE_COOLDOWN_SECONDS", os.getenv("COOLDOWN_SECONDS", "30.0")))
 HEAVY_MODELS = ["gemma", "qwen"]
 
 def is_heavy_model(model_name: str) -> bool:
@@ -46,6 +48,14 @@ class UnifiedProxyManager:
     def __init__(self):
         self.http_client: Optional[httpx.AsyncClient] = None
         self.model_map: Dict[str, Dict[str, str]] = {}
+        self.in_flight_requests: Dict[str, int] = {}
+        self.last_active_time: Dict[str, float] = {}
+        self.last_access: Dict[str, Dict[str, float]] = {}
+
+    def update_access_time(self, backend_url: str, model_name: str):
+        if backend_url not in self.last_access:
+            self.last_access[backend_url] = {}
+        self.last_access[backend_url][model_name] = time.time()
 
     def load_model_map(self):
         config_path = os.getenv("MODELS_MAP_PATH", "models_map.json")
@@ -69,7 +79,21 @@ class UnifiedProxyManager:
         if self.http_client:
             await self.http_client.aclose()
 
+    def record_request_start(self, backend_url: str):
+        self.in_flight_requests[backend_url] = self.in_flight_requests.get(backend_url, 0) + 1
+        self.last_active_time[backend_url] = asyncio.get_event_loop().time()
+
+    def record_request_end(self, backend_url: str):
+        current = self.in_flight_requests.get(backend_url, 0)
+        self.in_flight_requests[backend_url] = max(0, current - 1)
+        self.last_active_time[backend_url] = asyncio.get_event_loop().time()
+
     async def fetch_ryzen_stats(self, url: str) -> Dict[str, Any]:
+        in_flight = self.in_flight_requests.get(url, 0)
+        last_active = self.last_active_time.get(url, 0.0)
+        now = asyncio.get_event_loop().time()
+        time_since_active = (now - last_active) if last_active > 0 else 999999.0
+
         try:
             res_stats = await self.http_client.get(f"{url}/v1/system-stats", timeout=5.0)
             res_health = await self.http_client.get(f"{url}/v1/health", timeout=5.0)
@@ -81,8 +105,8 @@ class UnifiedProxyManager:
             total_ram = float(os.getenv("NODE_TOTAL_RAM_GB", "128.0"))
             mem_utilization = (memory_gb / total_ram) if total_ram > 0 else 0
 
-            gpu_usage = stats.get("gpu_usage_percent", 0.0)
-            power_draw = stats.get("power_draw_w", 0.0)
+            gpu_usage = stats.get("gpu_percent", 0.0)
+            power_draw = 0.0
 
             raw_loaded = health.get("all_models_loaded", [])
             loaded_models = [m.get("model_name", "") for m in raw_loaded if isinstance(m, dict)]
@@ -97,6 +121,8 @@ class UnifiedProxyManager:
                 "loaded_models": loaded_models,
                 "num_heavy": num_heavy,
                 "num_small": num_small,
+                "in_flight": in_flight,
+                "time_since_active": time_since_active,
                 "backend_url": url,
                 "is_mac": False
             }
@@ -109,12 +135,19 @@ class UnifiedProxyManager:
                 "loaded_models": [],
                 "num_heavy": 99,
                 "num_small": 99,
+                "in_flight": in_flight,
+                "time_since_active": time_since_active,
                 "backend_url": url,
                 "is_mac": False,
                 "offline": True
             }
 
     async def fetch_macos_stats(self) -> Dict[str, Any]:
+        in_flight = self.in_flight_requests.get(NODE_MBP_OLLAMA, 0)
+        last_active = self.last_active_time.get(NODE_MBP_OLLAMA, 0.0)
+        now = asyncio.get_event_loop().time()
+        time_since_active = (now - last_active) if last_active > 0 else 999999.0
+
         try:
             proc = await asyncio.create_subprocess_shell(
                 f"ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=5 {NODE_MBP_SSH} 'all-smi snapshot'",
@@ -125,9 +158,17 @@ class UnifiedProxyManager:
             if proc.returncode == 0:
                 stats = json.loads(stdout.decode())
 
-                mem_utilization = stats.get("memory_utilization", 0.0)
-                gpu_usage = stats.get("gpu_utilization", 0.0)
-                power_draw = stats.get("power_w", 0.0)
+                mem_utilization = 0.0
+                if "memory" in stats and len(stats["memory"]) > 0:
+                    mem_utilization = stats["memory"][0].get("utilization", 0.0) / 100.0
+
+                gpu_usage = 0.0
+                if "gpus" in stats and len(stats["gpus"]) > 0:
+                    gpu_usage = stats["gpus"][0].get("utilization", 0.0)
+
+                power_draw = 0.0
+                if "chassis" in stats and len(stats["chassis"]) > 0:
+                    power_draw = stats["chassis"][0].get("total_power_watts", 0.0)
 
                 loaded_models = []
 
@@ -152,6 +193,8 @@ class UnifiedProxyManager:
                     "loaded_models": loaded_models,
                     "num_heavy": num_heavy,
                     "num_small": num_small,
+                    "in_flight": in_flight,
+                    "time_since_active": time_since_active,
                     "backend_url": NODE_MBP_OLLAMA,
                     "is_mac": True
                 }
@@ -164,6 +207,9 @@ class UnifiedProxyManager:
                     "loaded_models": [],
                     "num_heavy": 99,
                     "num_small": 99,
+                    "in_flight": in_flight,
+                    "time_since_active": time_since_active,
+                    "backend_url": NODE_MBP_OLLAMA,
                     "is_mac": True,
                     "offline": True
                 }
@@ -176,6 +222,9 @@ class UnifiedProxyManager:
                 "loaded_models": [],
                 "num_heavy": 99,
                 "num_small": 99,
+                "in_flight": in_flight,
+                "time_since_active": time_since_active,
+                "backend_url": NODE_MBP_OLLAMA,
                 "is_mac": True,
                 "offline": True
             }
@@ -207,6 +256,16 @@ class UnifiedProxyManager:
             power = n.get("power_draw", 0.0)
             num_heavy = n.get("num_heavy", 0)
             num_small = n.get("num_small", 0)
+            in_flight = n.get("in_flight", 0)
+            time_since_active = n.get("time_since_active", 999999.0)
+
+            # A node is actively computing if it has active in-flight requests or GPU > 15%
+            is_computing = (gpu > 15.0) or (in_flight > 0)
+            cooldown_passed = (not is_computing) and (time_since_active >= COOLDOWN_SECONDS)
+
+            n["is_computing"] = is_computing
+            n["cooldown_passed"] = cooldown_passed
+            n["has_matching_model"] = has_matching_model
 
             is_valid = False
             reason = ""
@@ -214,9 +273,19 @@ class UnifiedProxyManager:
                 is_valid = True
                 reason = "Model already loaded in memory"
             elif is_heavy:
-                if mem < 0.85 and (num_heavy + num_small <= 2):
+                if num_heavy == 0 and mem < 0.85:
                     is_valid = True
-                    reason = "Eligible for heavy model swap"
+                    reason = "Eligible for heavy model load (Node is empty of heavy models)"
+                elif num_heavy >= 1:
+                    if is_computing:
+                        is_valid = False
+                        reason = f"Actively computing other workload (In-flight: {in_flight}, GPU: {gpu:.1f}%)"
+                    else:
+                        is_valid = True
+                        if cooldown_passed:
+                            reason = "Eligible for heavy model swap (Cooldown passed)"
+                        else:
+                            reason = f"Eligible for heavy model swap (Within cooldown: {time_since_active:.1f}s < {COOLDOWN_SECONDS}s)"
                 else:
                     reason = f"At capacity (RAM: {mem*100:.1f}%, Models: {num_heavy}h/{num_small}s)"
             else:
@@ -227,7 +296,8 @@ class UnifiedProxyManager:
                     reason = f"At capacity (RAM: {mem*100:.1f}%)"
 
             status_str = "VALID" if is_valid else "REJECTED"
-            logger.info(f"  [{node_name}] {status_str} ({reason}) | RAM: {mem*100:.1f}%, GPU: {gpu:.1f}%, Power: {power:.1f}W | Loaded: {loaded}")
+            cooldown_str = "Cooldown: Passed" if cooldown_passed else f"Cooldown: {time_since_active:.1f}s"
+            logger.info(f"  [{node_name}] {status_str} ({reason}) | RAM: {mem*100:.1f}%, GPU: {gpu:.1f}%, Power: {power:.1f}W, In-Flight: {in_flight}, {cooldown_str} | Loaded: {loaded}")
 
             if is_valid:
                 valid_nodes.append(n)
@@ -237,35 +307,51 @@ class UnifiedProxyManager:
             return None
 
         # Sort factors:
-        # 1. Model already loaded in memory (highest priority to avoid cold swap)
-        # 2. Busy penalty (demote busy nodes; if Mac is working on something, use available Ryzen nodes)
-        # 3. Mac priority only when idle and model is heavy
-        # 4. Resource metrics (GPU load, RAM utilization, power draw)
+        # For Heavy Models:
+        # 1. Prioritize idle Mac (rank 0) even if another node has the model in memory, to execute model swap
+        # 2. Demote Mac if it is actively computing or within cooldown
+        # 3. Prefer nodes that already have the model loaded in memory
+        # 4. Prefer non-computing nodes
+        # 5. Fewest in-flight requests
+        # 6. Lowest GPU load, RAM utilization, power draw
+        #
+        # For Light Models:
+        # 1. Prefer node with model already loaded in memory (avoid unnecessary swap/cold load)
+        # 2. Prefer non-computing nodes
+        # 3. Fewest in-flight requests
+        # 4. Lowest GPU load, RAM utilization, power draw
         def sort_key(n):
-            loaded = n.get("loaded_models", [])
-            has_model = any(norm_model in m.lower() or m.lower() in norm_model for m in loaded)
+            has_model = n.get("has_matching_model", False)
             gpu = n.get("gpu_usage", 0.0)
-            num_models = n.get("num_heavy", 0) + n.get("num_small", 0)
             is_mac = n.get("is_mac", False)
-            
-            # Node is considered busy if GPU is actively computing or models are loaded
-            is_busy = (gpu > 15.0) or (num_models > 0 and not has_model)
+            is_computing = n.get("is_computing", False)
+            cooldown_passed = n.get("cooldown_passed", True)
+            in_flight = n.get("in_flight", 0)
 
-            # If Mac is busy, demote it so other available nodes take precedence
-            mac_penalty = 1 if (is_mac and is_busy) else 0
+            if is_heavy:
+                # If Mac is valid, not computing, and cooldown has passed, give it top priority (rank 0)
+                mac_heavy_priority = 0 if (is_mac and not is_computing and cooldown_passed) else 1
+                mac_busy_penalty = 1 if (is_mac and (is_computing or not cooldown_passed)) else 0
 
-            # If Mac is completely idle, give it priority for heavy models
-            mac_idle_priority = 0 if (is_mac and not is_busy and is_heavy) else 1
-
-            return (
-                not has_model,          # 1. In-memory model match
-                mac_penalty,            # 2. Avoid Mac if it is already working on something
-                is_busy,                # 3. Prefer non-busy nodes
-                mac_idle_priority,      # 4. Idle Mac priority for heavy models
-                round(gpu, -1),         # 5. Lowest GPU load
-                round(n.get("mem_utilization", 1.0), 2), # 6. Lowest RAM usage
-                n.get("power_draw", 1000.0)
-            )
+                return (
+                    mac_heavy_priority,      # 1. Prioritize idle Mac for heavy model swap & execution
+                    mac_busy_penalty,        # 2. Demote Mac if busy or cooling down
+                    not has_model,           # 3. Preloaded model match on alternative nodes
+                    is_computing,            # 4. Prefer non-computing nodes
+                    in_flight,               # 5. Fewest in-flight requests
+                    round(gpu, -1),          # 6. Lowest GPU load
+                    round(n.get("mem_utilization", 1.0), 2), # 7. Lowest RAM usage
+                    n.get("power_draw", 1000.0)
+                )
+            else:
+                return (
+                    not has_model,           # 1. In-memory model match
+                    is_computing,            # 2. Prefer non-computing nodes
+                    in_flight,               # 3. Fewest in-flight requests
+                    round(gpu, -1),          # 4. Lowest GPU load
+                    round(n.get("mem_utilization", 1.0), 2), # 5. Lowest RAM usage
+                    n.get("power_draw", 1000.0)
+                )
 
         # Shuffle candidates first to distribute load evenly when all metrics are tied
         random.shuffle(valid_nodes)
@@ -275,15 +361,103 @@ class UnifiedProxyManager:
         target = best.get("backend_url")
         best_name = "Mac (MBP - Ollama)" if best.get("is_mac") else best.get("backend_url")
         logger.info(f"--- Routing Decision: Selected [{best_name}] -> {target} ---")
-        return target
+        return best
 
 manager = UnifiedProxyManager()
+
+async def idle_watcher():
+    logger.info("Starting idle model watcher...")
+    while True:
+        await asyncio.sleep(60)
+        try:
+            current_time = time.time()
+            for url in [NODE_RYZEN_ONE, NODE_RYZEN_TWO]:
+                try:
+                    if not manager.http_client:
+                        continue
+                    res_health = await manager.http_client.get(f"{url}/v1/health", timeout=5.0)
+                    if res_health.status_code == 200:
+                        health = res_health.json()
+                        raw_loaded = health.get("all_models_loaded", [])
+                        loaded_models = [m.get("model_name", "") for m in raw_loaded if isinstance(m, dict)]
+                        
+                        if url not in manager.last_access:
+                            manager.last_access[url] = {}
+                            
+                        for model in loaded_models:
+                            if not model: continue
+                            if model not in manager.last_access[url]:
+                                manager.last_access[url][model] = current_time
+                            
+                            idle_time = current_time - manager.last_access[url][model]
+                            if idle_time > 300: # ~5 minutes
+                                logger.info(f"Model {model} on {url} has been idle for {idle_time:.1f}s. Unloading to save power.")
+                                try:
+                                    await manager.http_client.post(f"{url}/v1/unload", json={"model_name": model}, timeout=5.0)
+                                    manager.last_access[url].pop(model, None)
+                                except Exception as e:
+                                    logger.warning(f"Failed to unload {model} from {url}: {e}")
+                except Exception:
+                    pass
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Error in idle watcher: {e}")
+
+async def runaway_watcher():
+    logger.info("Starting runaway watcher...")
+    while True:
+        await asyncio.sleep(60)
+        try:
+            now = asyncio.get_event_loop().time()
+            for url, in_flight in list(manager.in_flight_requests.items()):
+                if in_flight > 0:
+                    last_active = manager.last_active_time.get(url, 0.0)
+                    time_since_active = now - last_active
+                    if time_since_active > 600:
+                        logger.error(f"Runaway request detected on {url}. In-flight: {in_flight}, stuck for {time_since_active:.1f}s. Initiating kill process.")
+                        # Attempt soft unload
+                        try:
+                            if url == NODE_MBP_OLLAMA:
+                                pass
+                            else:
+                                await manager.http_client.post(f"{url}/v1/unload_all", timeout=5.0)
+                        except Exception:
+                            pass
+                        
+                        await asyncio.sleep(10)
+                        
+                        # Hard kill
+                        logger.error(f"Executing hard kill on {url}")
+                        if url == NODE_MBP_OLLAMA:
+                            cmd = f"ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=5 {NODE_MBP_SSH} 'sudo pkill ollama'"
+                        else:
+                            host = url.replace("http://", "").split(":")[0]
+                            ssh_target = f"turnstone@{host}"
+                            cmd = f"ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=5 {ssh_target} 'sudo systemctl restart lemond.service'"
+                        
+                        proc = await asyncio.create_subprocess_shell(cmd)
+                        await proc.communicate()
+                        
+                        manager.in_flight_requests[url] = 0
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Error in runaway watcher: {e}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     manager.load_model_map()
     await manager.init_client()
+    task1 = asyncio.create_task(idle_watcher())
+    task2 = asyncio.create_task(runaway_watcher())
     yield
+    task1.cancel()
+    task2.cancel()
+    try:
+        await asyncio.gather(task1, task2, return_exceptions=True)
+    except Exception:
+        pass
     await manager.close_client()
 
 app = FastAPI(title="Turnstone Unified Hardware Proxy", lifespan=lifespan)
@@ -307,16 +481,33 @@ async def proxy_or_handle(path: str, request: Request):
              return {"object": "list", "data": []}
         return Response(content="Proxy is alive", status_code=200)
 
-    best_url = await manager.get_best_node(model_name)
+    best_node = await manager.get_best_node(model_name)
 
-    if not best_url:
+    if not best_node:
         logger.warning(f"All nodes are busy (AT_CAPACITY). Rejecting request for {model_name}.")
         raise HTTPException(status_code=429, detail="All nodes are currently at capacity. Please try again later.")
+
+    best_url = best_node.get("backend_url")
+    is_heavy = is_heavy_model(model_name)
+    has_matching_model = best_node.get("has_matching_model", False)
+
+    # Perform Heavy Model Swap Unload if necessary
+    if is_heavy and not has_matching_model and best_node.get("num_heavy", 0) >= 1:
+        logger.info(f"Performing heavy model swap on {best_url}. Unloading existing heavy models.")
+        if not best_node.get("is_mac"):
+            for m in best_node.get("loaded_models", []):
+                if is_heavy_model(m):
+                    try:
+                        await manager.http_client.post(f"{best_url}/v1/unload", json={"model_name": m}, timeout=10.0)
+                        logger.info(f"Unloaded {m} from {best_url}")
+                    except Exception as e:
+                        logger.warning(f"Failed to unload {m} for swap: {e}")
 
     target_url = f"{best_url}/{path.lstrip('/')}"
     logger.info(f"Routing request for {model_name} to {target_url}")
 
     # Rewrite model name based on target node to prevent 404s
+    actual_model_name = model_name
     if isinstance(body, dict) and "model" in body:
         norm_model = model_name.lower()
         backend_type = "mac_ollama" if NODE_MBP_OLLAMA in best_url else "lemonade"
@@ -325,10 +516,16 @@ async def proxy_or_handle(path: str, request: Request):
         for key, target_model in mapping.items():
             if key in norm_model:
                 body["model"] = target_model
+                actual_model_name = target_model
                 break
+
+    # Track access time for idle unloading
+    if NODE_RYZEN_ONE in best_url or NODE_RYZEN_TWO in best_url:
+        manager.update_access_time(best_url, actual_model_name)
 
     headers = {k: v for k, v in request.headers.items() if k.lower() not in ["host", "content-length"]}
 
+    manager.record_request_start(best_url)
     try:
         if isinstance(body, dict):
             backend_req = manager.http_client.build_request(
@@ -377,36 +574,42 @@ async def proxy_or_handle(path: str, request: Request):
                                     line = f"data: {json.dumps(chunk_json)}"
                             except Exception:
                                 pass
+                        manager.last_active_time[best_url] = asyncio.get_event_loop().time()
                         yield (line + "\n").encode("utf-8")
                 finally:
                     await backend_res.aclose()
+                    manager.record_request_end(best_url)
                     elapsed = asyncio.get_event_loop().time() - start_time
                     logger.info(f"Stream finished for {model_name} on {target_url} in {elapsed:.2f}s (Status: {backend_res.status_code})")
             return StreamingResponse(stream_generator(), status_code=backend_res.status_code, media_type="text/event-stream")
         else:
-            content = await backend_res.aread()
-            await backend_res.aclose()
             try:
-                data_json = json.loads(content.decode("utf-8"))
-                choices = data_json.get("choices", [])
-                modified = False
-                for c in choices:
-                    msg = c.get("message", {})
-                    if isinstance(msg, dict) and "reasoning" in msg and "reasoning_content" not in msg:
-                        msg["reasoning_content"] = msg["reasoning"]
-                        modified = True
-                if modified:
-                    content = json.dumps(data_json).encode("utf-8")
-            except Exception:
-                pass
-            headers = dict(backend_res.headers)
-            headers.pop("content-length", None)
-            headers.pop("content-encoding", None)
-            elapsed = asyncio.get_event_loop().time() - start_time
-            logger.info(f"Request finished for {model_name} on {target_url} in {elapsed:.2f}s (Status: {backend_res.status_code})")
-            return Response(content=content, status_code=backend_res.status_code, headers=headers)
+                content = await backend_res.aread()
+                await backend_res.aclose()
+                try:
+                    data_json = json.loads(content.decode("utf-8"))
+                    choices = data_json.get("choices", [])
+                    modified = False
+                    for c in choices:
+                        msg = c.get("message", {})
+                        if isinstance(msg, dict) and "reasoning" in msg and "reasoning_content" not in msg:
+                            msg["reasoning_content"] = msg["reasoning"]
+                            modified = True
+                    if modified:
+                        content = json.dumps(data_json).encode("utf-8")
+                except Exception:
+                    pass
+                headers = dict(backend_res.headers)
+                headers.pop("content-length", None)
+                headers.pop("content-encoding", None)
+                elapsed = asyncio.get_event_loop().time() - start_time
+                logger.info(f"Request finished for {model_name} on {target_url} in {elapsed:.2f}s (Status: {backend_res.status_code})")
+                return Response(content=content, status_code=backend_res.status_code, headers=headers)
+            finally:
+                manager.record_request_end(best_url)
 
     except Exception as e:
+        manager.record_request_end(best_url)
         elapsed = asyncio.get_event_loop().time() - start_time
         logger.error(f"Error proxying request to {target_url} after {elapsed:.2f}s: {e}")
         raise HTTPException(status_code=502, detail=f"Backend communication failure: {str(e)}")
