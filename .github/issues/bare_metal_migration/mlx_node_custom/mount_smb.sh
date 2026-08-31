@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
-# Turnstone SMB Mount Helper (macOS)
-mkdir -p "${MOUNT_POINT}" 2>/dev/null || true
-if ! mount | grep -Fq "on ${MOUNT_POINT} "; then
-    mount_smbfs "//${REMOTE_USERNAME}:${SMB_PASSWORD}@${SERVER_HOSTNAME}/${SHARE_NAME}" "${MOUNT_POINT}" 2>/dev/null || true
-fi
+# =============================================================================
+# Turnstone SMB Mount Helper (DEPRECATED - Migrated to NFS)
+#
+# This script is retained for backwards compatibility and forwards execution
+# to mount_nfs.sh.
+# =============================================================================
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+echo "[WARNING] mount_smb.sh is deprecated. Switching to NFS mount via mount_nfs.sh..."
+exec bash "${SCRIPT_DIR}/mount_nfs.sh" "$@"
