@@ -15,6 +15,7 @@
 #   6. ai-core-two -> turnstone@amd-ai-core-two.lan:~/nerd_projects/turnstone-teqonix
 #   7. mbp-ai-core -> turnstone@mbp-ai-core.lan:~/nerd_projects/turnstone-teqonix
 #   8. litellm     -> turnstone@litellm-proxy.lan:~/nerd_projects/turnstone-teqonix
+#   9. silo-14     -> turnstone-np@silo-14.lan:~/nerd_projects/turnstone-teqonix
 #
 # Usage:
 #   ./sync_repo.sh                      # Sync to ALL cluster nodes (default)
@@ -61,7 +62,7 @@ fi
 
 # Target Cluster Nodes Definition
 # Format: KEY | HOST | USER | DEST_REL_PATH | DESCRIPTION
-NODE_KEYS=("postgres" "coordinator" "worker-one" "worker-two" "ai-core-one" "ai-core-two" "mbp-ai-core" "litellm")
+NODE_KEYS=("postgres" "coordinator" "worker-one" "worker-two" "ai-core-one" "ai-core-two" "mbp-ai-core" "litellm" "silo-14")
 
 node_host() {
     case "$1" in
@@ -73,6 +74,7 @@ node_host() {
         ai-core-two) echo "amd-ai-core-two.lan" ;;
         mbp-ai-core) echo "mbp-ai-core.lan" ;;
         litellm|litellm-proxy) echo "litellm-proxy.lan" ;;
+        silo-14) echo "silo-14.lan" ;;
         *) echo "" ;;
     esac
 }
@@ -81,6 +83,7 @@ node_user() {
     case "$1" in
         postgres) echo "postgres" ;;
         coordinator|worker-one|worker-two|turnstone-worker-one|turnstone-worker-two|ai-core-one|ai-core-two|mbp-ai-core|litellm|litellm-proxy) echo "turnstone" ;;
+        silo-14) echo "turnstone-np" ;;
         *) echo "" ;;
     esac
 }
@@ -88,6 +91,7 @@ node_user() {
 node_dest() {
     case "$1" in
         postgres|coordinator|worker-one|worker-two|turnstone-worker-one|turnstone-worker-two|ai-core-one|ai-core-two|mbp-ai-core|litellm|litellm-proxy) echo "~/nerd_projects/turnstone-teqonix" ;;
+        silo-14) echo "/mnt/silo-14/ai-playground/turnstone-teqonix" ;;
         *) echo "" ;;
     esac
 }
@@ -102,7 +106,7 @@ node_desc() {
         ai-core-two) echo "Ryzen AI Halo Inference Node #2 (amd-ai-core-two.lan)" ;;
         mbp-ai-core) echo "Apple M5 Max MLX Inference Node (mbp-ai-core.lan)" ;;
         litellm|litellm-proxy) echo "LiteLLM Proxy Load Balancer Node (litellm-proxy.lan)" ;;
-        *) echo "" ;;
+        silo-14) echo "TrueNAS NFS Share (silo-14.lan)" ;;
     esac
 }
 
@@ -132,6 +136,7 @@ ${BOLD}TARGETS:${NC}
   ai-core-two   Sync to turnstone@amd-ai-core-two.lan
   mbp-ai-core   Sync to turnstone@mbp-ai-core.lan
   litellm       Sync to turnstone@litellm-proxy.lan
+  silo-14       Sync to turnstone-np@silo-14.lan
 
 ${BOLD}OPTIONS:${NC}
   -t, --target <node>    Specify target node ('postgres', 'coordinator', 'worker-one', 'worker-two', 'ai-core-one', 'ai-core-two', 'mbp-ai-core', 'litellm', or 'all')
@@ -216,7 +221,7 @@ parse_args() {
                     exit 1
                 fi
                 ;;
-            all|postgres|coordinator|turnstone-postgres|turnstone-postgres.lan|turnstone-coordinator|turnstone-coordinator-nerd-projects.lan|worker-one|turnstone-worker-one|turnstone-worker-one.lan|worker-two|turnstone-worker-two|turnstone-worker-two.lan|ai-core-one|amd-ai-core-one|amd-ai-core-one.lan|ai-core-two|amd-ai-core-two|amd-ai-core-two.lan|mbp-ai-core|mbp-ai-core.lan|litellm|litellm-proxy|litellm-proxy.lan|1|2|3|4|5|6|7|8)
+            all|postgres|coordinator|turnstone-postgres|turnstone-postgres.lan|turnstone-coordinator|turnstone-coordinator-nerd-projects.lan|worker-one|turnstone-worker-one|turnstone-worker-one.lan|worker-two|turnstone-worker-two|turnstone-worker-two.lan|ai-core-one|amd-ai-core-one|amd-ai-core-one.lan|ai-core-two|amd-ai-core-two|amd-ai-core-two.lan|mbp-ai-core|mbp-ai-core.lan|litellm|litellm-proxy|litellm-proxy.lan|silo-14|silo-14.lan|1|2|3|4|5|6|7|8|9)
                 TARGET_CHOICE="$1"
                 shift
                 ;;
@@ -259,6 +264,9 @@ resolve_targets() {
             ;;
         litellm|litellm-proxy|litellm-proxy.lan|8)
             SELECTED_TARGETS=("litellm")
+            ;;
+        silo-14|silo-14.lan|9)
+            SELECTED_TARGETS=("silo-14")
             ;;
         *)
             log_error "Invalid target selection: '${choice}'."

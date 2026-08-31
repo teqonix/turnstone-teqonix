@@ -34,6 +34,8 @@
         <string>${MOUNT_POINT}</string>
         <key>TURNSTONE_SMB_MOUNT</key>
         <string>${MOUNT_POINT}</string>
+        <key>TURNSTONE_NFS_MOUNT</key>
+        <string>${MOUNT_POINT}</string>
         <key>TURNSTONE_WORKSPACE</key>
         <string>${MOUNT_POINT}</string>
         <key>HF_TOKEN</key>
