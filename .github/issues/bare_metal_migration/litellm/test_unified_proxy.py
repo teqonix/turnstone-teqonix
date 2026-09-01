@@ -1,5 +1,6 @@
 import pytest
 import asyncio
+import time
 from unittest.mock import AsyncMock, patch, MagicMock
 
 # We need to set env vars before importing the module to ensure deterministic testing
@@ -212,3 +213,53 @@ async def test_routing_at_capacity(manager):
 
         best = await manager.get_best_node("gemma-4")
         assert best is None
+
+
+@pytest.mark.asyncio
+async def test_idle_watcher_suppresses_unload():
+    from unified_proxy import idle_watcher, manager as global_manager, NODE_RYZEN_ONE
+
+    mock_client = AsyncMock()
+    mock_health_res = MagicMock()
+    mock_health_res.status_code = 200
+    mock_health_res.json.return_value = {
+        "all_models_loaded": [{"model_name": "gemma-4-31B"}]
+    }
+    mock_client.get = AsyncMock(return_value=mock_health_res)
+    mock_client.post = AsyncMock()
+
+    global_manager.http_client = mock_client
+    global_manager.last_access = {NODE_RYZEN_ONE: {"gemma-4-31B": time.time() - 400.0}}
+
+
+    with patch("asyncio.sleep", side_effect=[None, asyncio.CancelledError()]), \
+         patch("unified_proxy.logger.warning") as mock_warn:
+        try:
+            await idle_watcher()
+        except asyncio.CancelledError:
+            pass
+
+        mock_warn.assert_called()
+        assert any("Idle watchdog timer passed" in str(call) for call in mock_warn.call_args_list)
+        mock_client.post.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_runaway_watcher_suppresses_restart():
+    from unified_proxy import runaway_watcher, manager as global_manager
+
+    global_manager.in_flight_requests = {"http://ryzen1:13305": 1}
+    global_manager.last_active_time = {"http://ryzen1:13305": 0.0}
+
+    with patch("asyncio.sleep", side_effect=[None, asyncio.CancelledError()]), \
+         patch.object(global_manager.watchdog, "restart_node_service") as mock_restart, \
+         patch("unified_proxy.logger.warning") as mock_warn:
+        try:
+            await runaway_watcher()
+        except asyncio.CancelledError:
+            pass
+
+        mock_warn.assert_called()
+        assert any("Runaway watchdog timer passed" in str(call) for call in mock_warn.call_args_list)
+        mock_restart.assert_not_called()
+
