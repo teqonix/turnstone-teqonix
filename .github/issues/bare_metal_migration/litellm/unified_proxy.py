@@ -14,6 +14,8 @@ from fastapi.responses import StreamingResponse
 import httpx
 import uvicorn
 
+from service_watchdog import LlmServiceWatchdog, _normalize_url
+
 # Configure Logging
 logging.basicConfig(
     level=logging.INFO,
@@ -41,6 +43,8 @@ class NodeState(Enum):
 #   capacity_rejected  - all nodes were at capacity; request was rejected
 #   model_swap         - a heavy model was unloaded to make room for a new one
 #   runaway_detected   - a runaway request was detected and killed
+#   watchdog_restart   - watchdog initiated service restart on a wedged node
+#   node_recovered     - node recovered and confirmed responsive after restart
 #
 # Each event is a JSON object with at least:
 #   ts       - ISO-8601 UTC timestamp
@@ -56,6 +60,8 @@ EVENT_TYPES = (
     "capacity_rejected",
     "model_swap",
     "runaway_detected",
+    "watchdog_restart",
+    "node_recovered",
 )
 
 #: Max events kept in the in-memory ring buffer (for late-joining subscribers).
@@ -197,8 +203,6 @@ def emit_node_state_change(url: str, stats: dict) -> None:
         _last_node_state[url] = "OFFLINE"
 
 
-
-
 # Pull from environment variables set in deploy script
 NODE_RYZEN_ONE = os.getenv("NODE_RYZEN_ONE", "http://amd-ai-core-one.lan:13305")
 NODE_RYZEN_TWO = os.getenv("NODE_RYZEN_TWO", "http://amd-ai-core-two.lan:13305")
@@ -209,6 +213,7 @@ NODE_MBP_SSH = os.getenv("NODE_MBP_SSH", f"{NODE_MBP_SSH_USER}@{NODE_MBP_HOSTNAM
 
 COOLDOWN_SECONDS = float(os.getenv("NODE_COOLDOWN_SECONDS", os.getenv("COOLDOWN_SECONDS", "30.0")))
 HEAVY_MODELS = ["gemma", "qwen"]
+
 
 def is_heavy_model(model_name: str) -> bool:
     norm = model_name.lower()
@@ -222,6 +227,9 @@ class UnifiedProxyManager:
         self.in_flight_requests: Dict[str, int] = {}
         self.last_active_time: Dict[str, float] = {}
         self.last_access: Dict[str, Dict[str, float]] = {}
+        self.watchdog: LlmServiceWatchdog = LlmServiceWatchdog(
+            event_callback=lambda event_type, node, payload: emit_event(event_type, node=node, **payload)
+        )
 
     def update_access_time(self, backend_url: str, model_name: str):
         if backend_url not in self.last_access:
@@ -245,6 +253,7 @@ class UnifiedProxyManager:
             timeout=httpx.Timeout(connect=10.0, read=300.0, write=30.0, pool=300.0),
             limits=httpx.Limits(max_keepalive_connections=50, max_connections=200)
         )
+        self.watchdog.set_http_client(self.http_client)
 
     async def close_client(self):
         if self.http_client:
@@ -264,10 +273,11 @@ class UnifiedProxyManager:
         last_active = self.last_active_time.get(url, 0.0)
         now = asyncio.get_event_loop().time()
         time_since_active = (now - last_active) if last_active > 0 else 999999.0
+        clean_url = _normalize_url(url)
 
         try:
-            res_stats = await self.http_client.get(f"{url}/v1/system-stats", timeout=5.0)
-            res_health = await self.http_client.get(f"{url}/v1/health", timeout=5.0)
+            res_stats = await self.http_client.get(f"{clean_url}/v1/system-stats", timeout=5.0)
+            res_health = await self.http_client.get(f"{clean_url}/v1/health", timeout=5.0)
 
             stats = res_stats.json() if res_stats.status_code == 200 else {}
             health = res_health.json() if res_health.status_code == 200 else {}
@@ -400,7 +410,7 @@ class UnifiedProxyManager:
                 "offline": True
             }
 
-    async def get_best_node(self, model_name: str) -> Optional[str]:
+    async def get_best_node(self, model_name: str) -> Optional[Dict[str, Any]]:
         is_heavy = is_heavy_model(model_name)
         norm_model = model_name.lower().replace("openai/", "").strip()
 
@@ -537,10 +547,12 @@ class UnifiedProxyManager:
         logger.info(f"--- Routing Decision: Selected [{best_name}] -> {target} ---")
         return best
 
+
 manager = UnifiedProxyManager()
 
+
 async def idle_watcher():
-    logger.info("Starting idle model watcher...")
+    logger.info("Starting idle model watcher with watchdog protection...")
     while True:
         await asyncio.sleep(60)
         try:
@@ -549,7 +561,8 @@ async def idle_watcher():
                 try:
                     if not manager.http_client:
                         continue
-                    res_health = await manager.http_client.get(f"{url}/v1/health", timeout=5.0)
+                    clean_url = _normalize_url(url)
+                    res_health = await manager.http_client.get(f"{clean_url}/v1/health", timeout=5.0)
                     if res_health.status_code == 200:
                         health = res_health.json()
                         raw_loaded = health.get("all_models_loaded", [])
@@ -559,27 +572,43 @@ async def idle_watcher():
                             manager.last_access[url] = {}
                             
                         for model in loaded_models:
-                            if not model: continue
+                            if not model:
+                                continue
                             if model not in manager.last_access[url]:
                                 manager.last_access[url][model] = current_time
                             
                             idle_time = current_time - manager.last_access[url][model]
-                            if idle_time > 300: # ~5 minutes
+                            if idle_time > 300:  # ~5 minutes
                                 logger.info(f"Model {model} on {url} has been idle for {idle_time:.1f}s. Unloading to save power.")
                                 try:
-                                    await manager.http_client.post(f"{url}/v1/unload", json={"model_name": model}, timeout=5.0)
-                                    manager.last_access[url].pop(model, None)
+                                    res = await manager.http_client.post(
+                                        f"{clean_url}/v1/unload", json={"model_name": model}, timeout=5.0
+                                    )
+                                    if res.status_code == 200:
+                                        manager.last_access[url].pop(model, None)
+                                        logger.info(f"Successfully unloaded idle model {model} from {url}")
+                                    else:
+                                        raise RuntimeError(f"Unload returned HTTP status {res.status_code}")
                                 except Exception as e:
-                                    logger.warning(f"Failed to unload {model} from {url}: {e}")
-                except Exception:
-                    pass
+                                    logger.warning(
+                                        f"Failed to unload idle model {model} from {url}: {e}. Triggering watchdog confirmation..."
+                                    )
+                                    await manager.watchdog.handle_unload_failure(
+                                        url,
+                                        model,
+                                        e,
+                                        on_recovered_cb=lambda u=url, m=model: manager.last_access.get(u, {}).pop(m, None),
+                                    )
+                except Exception as node_e:
+                    logger.debug(f"Error checking node {url} in idle watcher: {node_e}")
         except asyncio.CancelledError:
             break
         except Exception as e:
             logger.error(f"Error in idle watcher: {e}")
 
+
 async def runaway_watcher():
-    logger.info("Starting runaway watcher...")
+    logger.info("Starting runaway watcher with watchdog protection...")
     while True:
         await asyncio.sleep(60)
         try:
@@ -589,41 +618,26 @@ async def runaway_watcher():
                     last_active = manager.last_active_time.get(url, 0.0)
                     time_since_active = now - last_active
                     if time_since_active > 600:
-                        logger.error(f"Runaway request detected on {url}. In-flight: {in_flight}, stuck for {time_since_active:.1f}s. Initiating kill process.")
+                        logger.error(
+                            f"Runaway request detected on {url}. In-flight: {in_flight}, stuck for {time_since_active:.1f}s. Initiating watchdog kill process."
+                        )
                         emit_event(
                             "runaway_detected",
                             node=url,
                             in_flight=in_flight,
                             stuck_seconds=round(time_since_active, 1),
                         )
-                        # Attempt soft unload
-                        try:
-                            if url == NODE_MBP_OLLAMA:
-                                pass
-                            else:
-                                await manager.http_client.post(f"{url}/v1/unload_all", timeout=5.0)
-                        except Exception:
-                            pass
-                        
-                        await asyncio.sleep(10)
-                        
-                        # Hard kill
-                        logger.error(f"Executing hard kill on {url}")
-                        if url == NODE_MBP_OLLAMA:
-                            cmd = f"ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=5 {NODE_MBP_SSH} 'sudo pkill ollama'"
-                        else:
-                            host = url.replace("http://", "").split(":")[0]
-                            ssh_target = f"turnstone@{host}"
-                            cmd = f"ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=5 {ssh_target} 'sudo systemctl restart lemond.service'"
-                        
-                        proc = await asyncio.create_subprocess_shell(cmd)
-                        await proc.communicate()
-                        
-                        manager.in_flight_requests[url] = 0
+                        await manager.watchdog.handle_runaway_request(
+                            url,
+                            in_flight,
+                            time_since_active,
+                            on_recovered_cb=lambda u=url: manager.in_flight_requests.update({u: 0}),
+                        )
         except asyncio.CancelledError:
             break
         except Exception as e:
             logger.error(f"Error in runaway watcher: {e}")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -640,7 +654,9 @@ async def lifespan(app: FastAPI):
         pass
     await manager.close_client()
 
+
 app = FastAPI(title="Turnstone Unified Hardware Proxy", lifespan=lifespan)
+
 
 @app.get("/events/stream")
 async def events_stream(request: Request):
@@ -716,6 +732,44 @@ async def events_snapshot():
     return {"events": event_hub.snapshot(), "count": len(event_hub)}
 
 
+@app.get("/watchdog/status")
+async def watchdog_status():
+    """Returns status of LLM service watchdog, including cooldowns and last restarts."""
+    nodes = [NODE_RYZEN_ONE, NODE_RYZEN_TWO, NODE_MBP_OLLAMA]
+    statuses = {}
+    for n in nodes:
+        clean = _normalize_url(n)
+        statuses[clean] = {
+            "in_cooldown": manager.watchdog.is_in_cooldown(clean),
+            "remaining_cooldown_s": round(manager.watchdog.get_remaining_cooldown(clean), 1),
+            "last_restart_timestamp": manager.watchdog.last_restart_time.get(clean, 0.0),
+            "is_mac": manager.watchdog.is_macos_backend(clean),
+        }
+    return {
+        "cooldown_seconds": manager.watchdog.cooldown_seconds,
+        "probe_timeout": manager.watchdog.probe_timeout,
+        "recovery_timeout": manager.watchdog.recovery_timeout,
+        "nodes": statuses,
+    }
+
+
+@app.post("/watchdog/restart")
+async def watchdog_manual_restart(request: Request):
+    """Manually trigger a watchdog service restart on a given node."""
+    body = await request.json()
+    node_url = body.get("node", "")
+    if not node_url:
+        raise HTTPException(status_code=400, detail="Missing 'node' parameter in request body.")
+    reason = body.get("reason", "Manual admin restart request")
+    clean = _normalize_url(node_url)
+    success = await manager.watchdog.restart_node_service(
+        clean,
+        reason=reason,
+        on_recovered_cb=lambda: manager.in_flight_requests.update({clean: 0}),
+    )
+    return {"ok": success, "node": clean, "reason": reason}
+
+
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH"])
 async def proxy_or_handle(path: str, request: Request):
     body = None
@@ -756,21 +810,44 @@ async def proxy_or_handle(path: str, request: Request):
     if is_heavy and not has_matching_model and best_node.get("num_heavy", 0) >= 1:
         logger.info(f"Performing heavy model swap on {best_url}. Unloading existing heavy models.")
         if not best_node.get("is_mac"):
+            clean_url = _normalize_url(best_url)
             for m in best_node.get("loaded_models", []):
                 if is_heavy_model(m):
                     try:
-                        await manager.http_client.post(f"{best_url}/v1/unload", json={"model_name": m}, timeout=10.0)
-                        logger.info(f"Unloaded {m} from {best_url}")
-                        emit_event(
-                            "model_swap",
-                            node=best_url,
-                            unloaded_model=m,
-                            incoming_model=model_name,
+                        res = await manager.http_client.post(
+                            f"{clean_url}/v1/unload", json={"model_name": m}, timeout=10.0
                         )
+                        if res.status_code == 200:
+                            logger.info(f"Unloaded {m} from {best_url}")
+                            emit_event(
+                                "model_swap",
+                                node=best_url,
+                                unloaded_model=m,
+                                incoming_model=model_name,
+                            )
+                        else:
+                            raise RuntimeError(f"Swap unload returned HTTP status {res.status_code}")
                     except Exception as e:
-                        logger.warning(f"Failed to unload {m} for swap: {e}")
+                        logger.warning(
+                            f"Failed to unload {m} for swap on {best_url}: {e}. Triggering watchdog recovery..."
+                        )
+                        recovered = await manager.watchdog.handle_unload_failure(
+                            best_url,
+                            m,
+                            e,
+                            on_recovered_cb=lambda u=best_url: manager.in_flight_requests.update({u: 0}),
+                        )
+                        if not recovered:
+                            logger.error(
+                                f"Node {best_url} could not be recovered after failed swap unload."
+                            )
+                            raise HTTPException(
+                                status_code=503,
+                                detail=f"Node {best_url} failed heavy model swap unload and could not be recovered by watchdog.",
+                            )
 
-    target_url = f"{best_url}/{path.lstrip('/')}"
+    clean_best_url = _normalize_url(best_url)
+    target_url = f"{clean_best_url}/{path.lstrip('/')}"
     logger.info(f"Routing request for {model_name} to {target_url}")
 
     # Rewrite model name based on target node to prevent 404s
@@ -919,6 +996,26 @@ async def proxy_or_handle(path: str, request: Request):
             elapsed_s=round(elapsed, 2),
             in_flight=manager.in_flight_requests.get(best_url, 0),
         )
+
+        # If network error or timeout occurred, verify health and trigger background recovery
+        if isinstance(e, (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError)):
+            async def _check_and_recover_node(node_url: str, err_msg: str):
+                try:
+                    is_healthy = await manager.watchdog.probe_node_health(node_url)
+                    if not is_healthy:
+                        logger.error(
+                            f"[WATCHDOG] Node {node_url} confirmed unresponsive after network error ({err_msg}). Initiating service restart."
+                        )
+                        await manager.watchdog.restart_node_service(
+                            node_url,
+                            reason=f"Node unresponsive after network error: {err_msg}",
+                            on_recovered_cb=lambda: manager.in_flight_requests.update({node_url: 0}),
+                        )
+                except Exception as rec_err:
+                    logger.error(f"[WATCHDOG] Error in background recovery check: {rec_err}")
+
+            asyncio.create_task(_check_and_recover_node(best_url, str(e)))
+
         raise HTTPException(status_code=502, detail=f"Backend communication failure: {str(e)}")
 
 

@@ -76,7 +76,12 @@ NODE_RYZEN_TWO="${NODE_RYZEN_TWO:-http://amd-ai-core-two.lan:13306/v1}"
 NODE_MBP_MLX="${NODE_MBP_MLX:-http://mbp-ai-core.lan:8000/v1}"
 NODE_MBP_OLLAMA="${NODE_MBP_OLLAMA:-${NODE_MBP:-http://mbp-ai-core.lan:11434/v1}}"
 NODE_MBP="${NODE_MBP:-${NODE_MBP_OLLAMA}}"
+NODE_MBP_HOSTNAME="${NODE_MBP_HOSTNAME:-${MBP_HOSTNAME:-mbp-ai-core.lan}}"
 MBP_COOLDOWN_SECONDS="${MBP_COOLDOWN_SECONDS:-60}"
+WATCHDOG_SSH_USER="${WATCHDOG_SSH_USER:-turnstone}"
+WATCHDOG_COOLDOWN_SECONDS="${WATCHDOG_COOLDOWN_SECONDS:-120}"
+WATCHDOG_PROBE_TIMEOUT="${WATCHDOG_PROBE_TIMEOUT:-5.0}"
+WATCHDOG_RECOVERY_TIMEOUT="${WATCHDOG_RECOVERY_TIMEOUT:-30.0}"
 
 MASTER_KEY="${LITELLM_MASTER_KEY:-${MASTER_KEY:-}}"
 ROUTING_STRATEGY="${ROUTING_STRATEGY:-simple-shuffle}"
@@ -104,9 +109,14 @@ Options:
   --node-mbp-mlx <url>           URL for MacBook Pro MLX Server (default: http://mbp-ai-core.lan:8000/v1)
   --node-mbp-ollama <url>        URL for MacBook Pro Ollama Server (default: http://mbp-ai-core.lan:11434/v1)
   --node-mbp <url>               Alias for MacBook Pro Ollama Server (default: http://mbp-ai-core.lan:11434/v1)
+  --node-mbp-hostname <host>     Hostname for MacBook Pro M5 node (default: mbp-ai-core.lan)
   --mbp-cooldown <seconds>       Cooldown window for qwen-3.8-27b priority (default: 60)
+  --watchdog-user <user>         SSH user for service watchdog remote restarts (default: turnstone)
+  --watchdog-cooldown <seconds>  Cooldown seconds between watchdog node restarts (default: 120)
+  --watchdog-probe-timeout <sec> Probe timeout seconds for node health verification (default: 5.0)
+  --watchdog-recovery-timeout <s> Recovery polling timeout seconds after restart (default: 30.0)
   --strategy <strategy>          Routing strategy: least-busy, latency-based-routing, simple-shuffle (default: simple-shuffle)
-  --proxy-only, --update-proxy   Update and restart unified_proxy.py only (skip full stack install)
+  --proxy-only, --update-proxy   Update and restart unified_proxy.py & service_watchdog.py only (skip full stack install)
   --restart                      Force restart the service
   -h, --help                     Display this help message
 
@@ -353,7 +363,8 @@ show_status_summary() {
     echo -e "${BOLD}Routing Strategy:${NC}        ${configured_strategy} (MBP Activity Priority + Least-Busy)"
     echo -e "${BOLD}MBP Cooldown Lock:${NC}       ${MBP_COOLDOWN_SECONDS}s (qwen-3.8-27b warm cache reservation)"
     echo -e "${BOLD}Config File:${NC}             ${LITELLM_CONFIG}"
-    echo -e "${BOLD}Router Module:${NC}           ${LITELLM_DIR}/turnstone_router.py"
+    echo -e "${BOLD}Router / Proxy:${NC}          ${LITELLM_DIR}/unified_proxy.py (Port 13306)"
+    echo -e "${BOLD}Service Watchdog:${NC}        ${LITELLM_DIR}/service_watchdog.py (Automated SSH recovery)"
     echo -e "${BOLD}Virtualenv:${NC}              ${VENV_DIR}"
     echo ""
     echo -e "${CYAN}LiteLLM GUI Admin Access Instructions:${NC}"
@@ -453,8 +464,28 @@ while [[ $# -gt 0 ]]; do
             NODE_MBP_OLLAMA="$2"
             shift 2
             ;;
+        --node-mbp-hostname|--mbp-hostname)
+            NODE_MBP_HOSTNAME="$2"
+            shift 2
+            ;;
         --mbp-cooldown)
             MBP_COOLDOWN_SECONDS="$2"
+            shift 2
+            ;;
+        --watchdog-user)
+            WATCHDOG_SSH_USER="$2"
+            shift 2
+            ;;
+        --watchdog-cooldown)
+            WATCHDOG_COOLDOWN_SECONDS="$2"
+            shift 2
+            ;;
+        --watchdog-probe-timeout)
+            WATCHDOG_PROBE_TIMEOUT="$2"
+            shift 2
+            ;;
+        --watchdog-recovery-timeout)
+            WATCHDOG_RECOVERY_TIMEOUT="$2"
             shift 2
             ;;
         --strategy)
@@ -515,11 +546,12 @@ EOF
 }
 
 rebuild_unified_proxy_only() {
-    log_section "Quick Update: Unified Hardware Proxy"
-    log_info "Updating unified_proxy.py and models_map.json in ${LITELLM_DIR}..."
+    log_section "Quick Update: Unified Hardware Proxy & Service Watchdog"
+    log_info "Updating unified_proxy.py, service_watchdog.py, and models_map.json in ${LITELLM_DIR}..."
 
     mkdir -p "${LITELLM_DIR}"
     fetch_and_install_file "unified_proxy.py" "${LITELLM_DIR}/unified_proxy.py" false
+    fetch_and_install_file "service_watchdog.py" "${LITELLM_DIR}/service_watchdog.py" false
     fetch_and_install_file "models_map.json" "${LITELLM_DIR}/models_map.json" false
     chown -R "${LITELLM_USER}:${LITELLM_USER}" "${LITELLM_DIR}" 2>/dev/null || true
 
@@ -995,11 +1027,12 @@ fi
 # -----------------------------------------------------------------------------
 # Step 7a: Fetch and Configure LiteLLM Router and Config
 # -----------------------------------------------------------------------------
-log_info "Installing LiteLLM Router and Configuration files..."
+log_info "Installing LiteLLM Router, Service Watchdog, and Configuration files..."
 
 fetch_and_install_file "unified_proxy.py" "${LITELLM_DIR}/unified_proxy.py" false
+fetch_and_install_file "service_watchdog.py" "${LITELLM_DIR}/service_watchdog.py" false
 fetch_and_install_file "models_map.json" "${LITELLM_DIR}/models_map.json" false
-chown "${LITELLM_USER}:${LITELLM_USER}" "${LITELLM_DIR}/unified_proxy.py" 2>/dev/null || true
+chown "${LITELLM_USER}:${LITELLM_USER}" "${LITELLM_DIR}/unified_proxy.py" "${LITELLM_DIR}/service_watchdog.py" 2>/dev/null || true
 
 fetch_and_install_file "config.yaml" "${LITELLM_CONFIG}" true
 chown -R "${LITELLM_USER}:${LITELLM_USER}" "${LITELLM_DIR}"
@@ -1032,6 +1065,11 @@ Environment="STORE_MODEL_IN_DB=True"
 Environment="PYTHONUNBUFFERED=1"
 Environment="PYTHONPATH=${LITELLM_DIR}"
 Environment="MBP_COOLDOWN_SECONDS=${MBP_COOLDOWN_SECONDS}"
+Environment="WATCHDOG_SSH_USER=${WATCHDOG_SSH_USER}"
+Environment="WATCHDOG_COOLDOWN_SECONDS=${WATCHDOG_COOLDOWN_SECONDS}"
+Environment="WATCHDOG_PROBE_TIMEOUT=${WATCHDOG_PROBE_TIMEOUT}"
+Environment="WATCHDOG_RECOVERY_TIMEOUT=${WATCHDOG_RECOVERY_TIMEOUT}"
+Environment="MBP_HOSTNAME=${NODE_MBP_HOSTNAME}"
 Environment="PATH=${VENV_DIR}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 ExecStartPre=-/bin/sh -c 'pkill -f "unified_proxy.py" || true'
 ExecStartPre=-/bin/sh -c 'nohup ${VENV_DIR}/bin/python3 ${LITELLM_DIR}/unified_proxy.py > ${LITELLM_DIR}/unified_proxy.log 2>&1 &'
@@ -1065,6 +1103,11 @@ export STORE_MODEL_IN_DB="True"
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="${LITELLM_DIR}:\${PYTHONPATH:-}"
 export MBP_COOLDOWN_SECONDS="${MBP_COOLDOWN_SECONDS}"
+export WATCHDOG_SSH_USER="${WATCHDOG_SSH_USER}"
+export WATCHDOG_COOLDOWN_SECONDS="${WATCHDOG_COOLDOWN_SECONDS}"
+export WATCHDOG_PROBE_TIMEOUT="${WATCHDOG_PROBE_TIMEOUT}"
+export WATCHDOG_RECOVERY_TIMEOUT="${WATCHDOG_RECOVERY_TIMEOUT}"
+export MBP_HOSTNAME="${NODE_MBP_HOSTNAME}"
 export PATH="${VENV_DIR}/bin:\$PATH"
 
 # Start the unified proxy
