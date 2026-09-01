@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # AI Cluster Monitoring Tmux Session Manager
-# Sets up a 3-node monitoring dashboard (Top: all-smi, Mid: SSH Shells, Bot: Help Screen)
+# Sets up a 3-node monitoring dashboard (Top: all-smi, Mid: SSH Shells, Bot: LiteLLM Logs & Help Screen)
 
 SESSION="ai-cluster"
 WINDOW="MONITOR"
@@ -10,6 +10,7 @@ WINDOW="MONITOR"
 HOST1="teqonix@amd-ai-core-one.lan"
 HOST2="teqonix@amd-ai-core-two.lan"
 HOST3="teqonix@mbp-ai-core.lan"
+HOST_PROXY="turnstone@litellm-proxy.lan"
 
 # 0. Idempotency: Destroy session if it already exists
 if tmux has-session -t "$SESSION" 2>/dev/null; then
@@ -21,8 +22,10 @@ fi
 P_TOP_1=$(tmux new-session -d -s "$SESSION" -n "$WINDOW" -P -F "#{pane_id}")
 
 # 2. Layout Construction using dynamic pane IDs
-# Create the bottom wide help pane (allocate ~25% height)
-P_BOT=$(tmux split-window -v -p 25 -t "$P_TOP_1" -P -F "#{pane_id}")
+# Create the bottom row (allocate ~25% height) and split into Proxy logs & Help screen
+P_BOT_PROXY=$(tmux split-window -v -p 25 -t "$P_TOP_1" -P -F "#{pane_id}")
+P_BOT_LITELLM=$(tmux split-window -h -p 25 -t "$P_BOT_PROXY" -P -F "#{pane_id}")
+P_BOT_HELP=$(tmux split-window -h -p 30 -t "$P_BOT_LITELLM" -P -F "#{pane_id}")
 
 # Split the top row into 3 columns (Host 1, Host 2, Host 3)
 P_TOP_2=$(tmux split-window -h -p 67 -t "$P_TOP_1" -P -F "#{pane_id}")
@@ -45,16 +48,18 @@ tmux send-keys -t "$P_MID_1" "ssh $HOST1" C-m
 tmux send-keys -t "$P_MID_2" "ssh $HOST2" C-m
 tmux send-keys -t "$P_MID_3" "ssh $HOST3" C-m
 
-# --- BOTTOM ROW: Help Screen ---
-tmux send-keys -t "$P_BOT" "clear && cat << 'EOF'
+# --- BOTTOM ROW: LiteLLM Proxy Logs & Help Screen ---
+tmux send-keys -t "$P_BOT_PROXY" "ssh -t $HOST_PROXY 'tail -f /etc/litellm/unified_proxy.log'" C-m
+tmux send-keys -t "$P_BOT_LITELLM" "ssh -t $HOST_PROXY 'sudo journalctl -f -n 100 --grep=litellm'" C-m
+tmux send-keys -t "$P_BOT_HELP" "clear && cat << 'EOF'
 ################################################################################
-#                      AI CLUSTER MONITORING DASHBOARD                          #
+#                      AI CLUSTER MONITORING DASHBOARD                         #
 ################################################################################
 #                                                                              #
-#  LAYOUT:                                                                      #
-#  [ Host 1: all-smi ] [ Host 2: all-smi ] [ Host 3: all-smi ]  <-- TOP ROW     #
-#  [ Host 1: Shell   ] [ Host 2: Shell   ] [ Host 3: Shell   ]  <-- MID ROW     #
-#  [                         HELP SCREEN                        ]  <-- BOT ROW     #
+#  LAYOUT:                                                                     #
+#  [ Host 1: all-smi ] [ Host 2: all-smi ] [ Host 3: all-smi ]  <-- TOP ROW    #
+#  [ Host 1: Shell   ] [ Host 2: Shell   ] [ Host 3: Shell   ]  <-- MID ROW    #
+#  [ LiteLLM Proxy Logs                  ] [ Help Screen     ]  <-- BOT ROW    #
 #                                                                              #
 #  TMUX NAVIGATION:                                                            #
 #  - Switch Pane:  Ctrl+b + Arrow Keys                                         #

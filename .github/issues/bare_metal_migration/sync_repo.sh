@@ -662,7 +662,7 @@ sync_to_node() {
         rsync_cmd+=(--exclude='.git/')
     fi
 
-    # Standard exclusions for python build artifacts and venvs
+    # Standard exclusions for python build artifacts, venvs, and jj repo locks
     rsync_cmd+=(
         --exclude='.venv'
         --exclude='venv'
@@ -672,6 +672,8 @@ sync_to_node() {
         --exclude='.ruff_cache'
         --exclude='.mypy_cache'
         --exclude='.DS_Store'
+        --exclude='.jj/'
+        --exclude='.jj'
     )
 
     # Add source path and destination path
@@ -682,11 +684,20 @@ sync_to_node() {
     echo -e "${CYAN}${rsync_cmd[*]}${NC}"
     echo
 
-    if "${rsync_cmd[@]}"; then
+    set +e
+    "${rsync_cmd[@]}"
+    local rsync_rc=$?
+    set -e
+
+    if [ "${rsync_rc}" -eq 0 ]; then
+        log_success "Successfully synced repo to ${user}@${host}:${dest_dir}/"
+        return 0
+    elif [ "${rsync_rc}" -eq 24 ]; then
+        log_warn "Rsync finished with code 24 (some files vanished during transfer, e.g. temporary locks). Considered success."
         log_success "Successfully synced repo to ${user}@${host}:${dest_dir}/"
         return 0
     else
-        log_error "Rsync failed for node ${host}."
+        log_error "Rsync failed for node ${host} (exit code ${rsync_rc})."
         return 1
     fi
 }
