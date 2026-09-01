@@ -352,25 +352,12 @@ class LlmServiceWatchdog:
     ) -> bool:
         """
         Invoked when in-flight requests on a node exceed timeout threshold.
-        Attempts soft unload if possible, then verifies and forces restart.
+        Logs a WARNING message that the watchdog timer has passed (unload/restart suppressed).
         """
         norm_url = _normalize_url(backend_url)
-        logger.error(
-            f"[WATCHDOG] Runaway request detected on {norm_url}. In-flight: {in_flight}, stuck for {stuck_seconds:.1f}s."
+        logger.warning(
+            f"[WATCHDOG] Watchdog timer passed: Runaway request detected on {norm_url}. "
+            f"In-flight: {in_flight}, active for {stuck_seconds:.1f}s. Model unload and service restart suppressed."
         )
+        return True
 
-        # Attempt soft unload if supported
-        if not self.is_macos_backend(norm_url) and self.http_client:
-            try:
-                await self.http_client.post(
-                    f"{norm_url}/v1/unload_all", timeout=5.0
-                )
-            except Exception:
-                pass
-            await asyncio.sleep(5.0)
-
-        return await self.restart_node_service(
-            norm_url,
-            reason=f"Runaway requests ({in_flight}) stuck for {stuck_seconds:.1f}s",
-            on_recovered_cb=on_recovered_cb,
-        )

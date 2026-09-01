@@ -618,8 +618,8 @@ async def runaway_watcher():
                     last_active = manager.last_active_time.get(url, 0.0)
                     time_since_active = now - last_active
                     if time_since_active > 600:
-                        logger.error(
-                            f"Runaway request detected on {url}. In-flight: {in_flight}, stuck for {time_since_active:.1f}s. Initiating watchdog kill process."
+                        logger.warning(
+                            f"[WATCHDOG] Runaway watchdog timer passed: Node {url} has {in_flight} in-flight request(s) active for {time_since_active:.1f}s (> 600s). Restart suppressed."
                         )
                         emit_event(
                             "runaway_detected",

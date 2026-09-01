@@ -151,12 +151,16 @@ async def test_handle_runaway_request():
     watchdog = LlmServiceWatchdog(http_client=mock_client)
 
     with patch.object(watchdog, "restart_node_service", return_value=True) as mock_restart, \
-         patch("asyncio.sleep", return_value=None):
+         patch("service_watchdog.logger.warning") as mock_warning:
         recovered = await watchdog.handle_runaway_request(
             "http://ryzen1:13305", in_flight=2, stuck_seconds=650.0
         )
         assert recovered is True
-        mock_restart.assert_called_once()
+        mock_restart.assert_not_called()
+        mock_client.post.assert_not_called()
+        mock_warning.assert_called_once()
+        assert "Watchdog timer passed" in mock_warning.call_args[0][0]
+
 
 
 def test_watchdog_endpoints():
