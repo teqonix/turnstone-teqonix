@@ -15,6 +15,9 @@ WATCHDOG_SSH_KEY = os.getenv("WATCHDOG_SSH_KEY", "")
 WATCHDOG_COOLDOWN_SECONDS = float(os.getenv("WATCHDOG_COOLDOWN_SECONDS", "120.0"))
 WATCHDOG_PROBE_TIMEOUT = float(os.getenv("WATCHDOG_PROBE_TIMEOUT", "5.0"))
 WATCHDOG_RECOVERY_TIMEOUT = float(os.getenv("WATCHDOG_RECOVERY_TIMEOUT", "30.0"))
+WATCHDOG_SINGLE_REQUEST_TIMEOUT = float(
+    os.getenv("WATCHDOG_SINGLE_REQUEST_TIMEOUT", os.getenv("SINGLE_REQUEST_TIMEOUT", "5400.0"))
+)
 NODE_MBP_HOSTNAME = os.getenv("MBP_HOSTNAME", "mbp-ai-core.lan")
 
 
@@ -44,6 +47,7 @@ class LlmServiceWatchdog:
         cooldown_seconds: float = WATCHDOG_COOLDOWN_SECONDS,
         probe_timeout: float = WATCHDOG_PROBE_TIMEOUT,
         recovery_timeout: float = WATCHDOG_RECOVERY_TIMEOUT,
+        single_request_timeout: float = WATCHDOG_SINGLE_REQUEST_TIMEOUT,
         event_callback: Optional[Callable[[str, str, Dict[str, Any]], None]] = None,
     ):
         self.http_client = http_client
@@ -52,9 +56,9 @@ class LlmServiceWatchdog:
         self.cooldown_seconds = cooldown_seconds
         self.probe_timeout = probe_timeout
         self.recovery_timeout = recovery_timeout
+        self.single_request_timeout = single_request_timeout
         self.event_callback = event_callback
         self.last_restart_time: Dict[str, float] = {}
-        self.health_unresponsive_since: Dict[str, float] = {}
 
     def set_http_client(self, client: httpx.AsyncClient):
         self.http_client = client
@@ -170,59 +174,45 @@ class LlmServiceWatchdog:
                 return True
             else:
                 # Ryzen Lemonade endpoint
-                health_ok = False
-                health_data = None
+                # Primary liveness probe is /live
                 try:
-                    res = await self.http_client.get(
-                        f"{clean_url}/v1/health", timeout=self.probe_timeout
+                    live_res = await self.http_client.get(
+                        f"{clean_url}/live", timeout=self.probe_timeout
                     )
-                    if res.status_code == 200:
-                        health_ok = True
-                        health_data = res.json()
-                except Exception:
-                    pass
-
-                now = time.time()
-                if health_ok:
-                    self.health_unresponsive_since.pop(clean_url, None)
-                else:
-                    if clean_url not in self.health_unresponsive_since:
-                        self.health_unresponsive_since[clean_url] = now
-                    
-                    unresponsive_time = now - self.health_unresponsive_since[clean_url]
-                    if unresponsive_time >= 8 * 60:
-                        logger.warning(
-                            f"[WATCHDOG] Health endpoint /v1/health on {clean_url} has been inaccessible for {unresponsive_time:.1f}s (>= 8 minutes)."
-                        )
-                    
-                    # Fallback to /live endpoint
-                    try:
-                        live_res = await self.http_client.get(
-                            f"{clean_url}/live", timeout=self.probe_timeout
-                        )
-                        if live_res.status_code == 200:
-                            live_data = live_res.json()
-                            if live_data.get("status") != "ok":
-                                return False
-                        else:
-                            return False
-                    except Exception as e:
-                        logger.warning(f"Probe health and live checks failed on {clean_url}: {e}")
+                    if live_res.status_code != 200:
                         return False
-
-                if expected_unloaded_model and health_data:
                     try:
-                        raw_loaded = health_data.get("all_models_loaded", [])
-                        loaded = [
-                            m.get("model_name", "") for m in raw_loaded if isinstance(m, dict)
-                        ]
-                        if any(expected_unloaded_model.lower() == m.lower() for m in loaded):
-                            logger.warning(
-                                f"Probe: Model {expected_unloaded_model} still loaded on {clean_url} after failed unload."
-                            )
+                        live_data = live_res.json()
+                        if isinstance(live_data, dict) and live_data.get("status") in ["error", "failed", "unhealthy"]:
                             return False
                     except Exception:
                         pass
+                except Exception as e:
+                    logger.warning(f"Probe /live check failed on {clean_url}: {e}")
+                    return False
+
+                # If an unloaded model check was requested, verify /v1/health
+                if expected_unloaded_model:
+                    try:
+                        res = await self.http_client.get(
+                            f"{clean_url}/v1/health", timeout=self.probe_timeout
+                        )
+                        if res.status_code == 200:
+                            health_data = res.json()
+                            raw_loaded = health_data.get("all_models_loaded", [])
+                            loaded = [
+                                m.get("model_name", "") for m in raw_loaded if isinstance(m, dict)
+                            ]
+                            if any(expected_unloaded_model.lower() == m.lower() for m in loaded):
+                                logger.warning(
+                                    f"Probe: Model {expected_unloaded_model} still loaded on {clean_url} after failed unload."
+                                )
+                                return False
+                    except Exception as e:
+                        # /v1/health is not reliable enough during active inference;
+                        # as long as /live is healthy, do not fail probe purely on /v1/health timeout
+                        logger.debug(f"Non-fatal /v1/health check failure during probe on {clean_url}: {e}")
+
                 return True
         except Exception as e:
             logger.warning(f"Probe health check failed on {clean_url}: {e}")
@@ -352,12 +342,44 @@ class LlmServiceWatchdog:
     ) -> bool:
         """
         Invoked when in-flight requests on a node exceed timeout threshold.
-        Logs a WARNING message that the watchdog timer has passed (unload/restart suppressed).
+        If stuck_seconds < single_request_timeout (default 5400s / 90 min),
+        unloading and service restart are suppressed.
+        If a single request has been running for over 90 minutes, checks /live and only
+        attempts a model unload if /live is responsive. Service restart is suppressed.
         """
         norm_url = _normalize_url(backend_url)
+        if stuck_seconds < self.single_request_timeout:
+            logger.warning(
+                f"[WATCHDOG] Watchdog timer passed: Runaway request detected on {norm_url}. "
+                f"In-flight: {in_flight}, active for {stuck_seconds:.1f}s. Model unload and service restart suppressed."
+            )
+            return True
+
         logger.warning(
-            f"[WATCHDOG] Watchdog timer passed: Runaway request detected on {norm_url}. "
-            f"In-flight: {in_flight}, active for {stuck_seconds:.1f}s. Model unload and service restart suppressed."
+            f"[WATCHDOG] Single LLM request on {norm_url} has been running for {stuck_seconds:.1f}s "
+            f"(>= {self.single_request_timeout:.0f}s / 90 minutes). Service restart suppressed."
         )
+        is_responsive = await self.probe_node_health(norm_url)
+        if is_responsive:
+            logger.info(
+                f"[WATCHDOG] Node {norm_url} confirmed responsive on /live after {stuck_seconds:.1f}s runaway request. "
+                f"Attempting model unload to clear stuck request."
+            )
+            if not self.is_macos_backend(norm_url) and self.http_client:
+                try:
+                    await self.http_client.post(f"{norm_url}/v1/unload_all", timeout=5.0)
+                except Exception as e:
+                    logger.warning(f"[WATCHDOG] Unload all failed on {norm_url}: {e}")
+            if on_recovered_cb:
+                try:
+                    res = on_recovered_cb()
+                    if asyncio.iscoroutine(res):
+                        await res
+                except Exception:
+                    pass
+        else:
+            logger.error(
+                f"[WATCHDOG] Node {norm_url} unresponsive on /live after {stuck_seconds:.1f}s runaway request."
+            )
         return True
 

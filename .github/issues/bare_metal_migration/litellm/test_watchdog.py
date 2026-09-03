@@ -162,6 +162,48 @@ async def test_handle_runaway_request():
         assert "Watchdog timer passed" in mock_warning.call_args[0][0]
 
 
+@pytest.mark.asyncio
+async def test_probe_node_health_ryzen_health_timeout_live_ok():
+    mock_client = AsyncMock()
+    watchdog = LlmServiceWatchdog(http_client=mock_client)
+
+    # When expected_unloaded_model is checked, /live returns 200 OK, but /v1/health raises Timeout
+    async def mock_get(url, timeout):
+        if "live" in url:
+            m = MagicMock()
+            m.status_code = 200
+            m.json.return_value = {"status": "ok"}
+            return m
+        raise httpx.ReadTimeout("Health check timed out")
+
+    mock_client.get = AsyncMock(side_effect=mock_get)
+    # Even if /v1/health times out, as long as /live is healthy, probe succeeds
+    assert await watchdog.probe_node_health("http://ryzen1:13305", expected_unloaded_model="gemma") is True
+
+
+@pytest.mark.asyncio
+async def test_handle_runaway_request_exceeds_90m():
+    mock_client = AsyncMock()
+    mock_client.post = AsyncMock()
+    watchdog = LlmServiceWatchdog(http_client=mock_client)
+
+    with patch.object(watchdog, "probe_node_health", return_value=True) as mock_probe, \
+         patch.object(watchdog, "restart_node_service", return_value=True) as mock_restart:
+        cb_called = False
+        def on_rec():
+            nonlocal cb_called
+            cb_called = True
+
+        recovered = await watchdog.handle_runaway_request(
+            "http://ryzen1:13305", in_flight=1, stuck_seconds=5500.0, on_recovered_cb=on_rec
+        )
+        assert recovered is True
+        mock_probe.assert_called_once()
+        mock_client.post.assert_called_once_with("http://ryzen1:13305/v1/unload_all", timeout=5.0)
+        mock_restart.assert_not_called()
+        assert cb_called is True
+
+
 
 def test_watchdog_endpoints():
     from fastapi.testclient import TestClient

@@ -212,6 +212,10 @@ NODE_MBP_OLLAMA = os.getenv("NODE_MBP_OLLAMA", f"http://{NODE_MBP_HOSTNAME}:1143
 NODE_MBP_SSH = os.getenv("NODE_MBP_SSH", f"{NODE_MBP_SSH_USER}@{NODE_MBP_HOSTNAME}")
 
 COOLDOWN_SECONDS = float(os.getenv("NODE_COOLDOWN_SECONDS", os.getenv("COOLDOWN_SECONDS", "30.0")))
+LLM_REQUEST_TIMEOUT = float(os.getenv("LLM_REQUEST_TIMEOUT", "5400.0"))  # 90 minutes
+RUNAWAY_WATCHDOG_TIMEOUT = float(
+    os.getenv("RUNAWAY_WATCHDOG_TIMEOUT", os.getenv("RUNAWAY_TIMEOUT", "5400.0"))
+)
 HEAVY_MODELS = ["gemma", "qwen"]
 
 
@@ -250,7 +254,7 @@ class UnifiedProxyManager:
 
     async def init_client(self):
         self.http_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=10.0, read=300.0, write=30.0, pool=300.0),
+            timeout=httpx.Timeout(connect=10.0, read=LLM_REQUEST_TIMEOUT, write=60.0, pool=LLM_REQUEST_TIMEOUT),
             limits=httpx.Limits(max_keepalive_connections=50, max_connections=200)
         )
         self.watchdog.set_http_client(self.http_client)
@@ -275,40 +279,39 @@ class UnifiedProxyManager:
         time_since_active = (now - last_active) if last_active > 0 else 999999.0
         clean_url = _normalize_url(url)
 
+        stats = {}
+        health = {}
+        is_responsive = False
+
+        # 1. Fetch system metrics
         try:
             res_stats = await self.http_client.get(f"{clean_url}/v1/system-stats", timeout=5.0)
-            res_health = await self.http_client.get(f"{clean_url}/v1/health", timeout=5.0)
-
-            stats = res_stats.json() if res_stats.status_code == 200 else {}
-            health = res_health.json() if res_health.status_code == 200 else {}
-
-            memory_gb = stats.get("memory_gb", 0.0)
-            total_ram = float(os.getenv("NODE_TOTAL_RAM_GB", "128.0"))
-            mem_utilization = (memory_gb / total_ram) if total_ram > 0 else 0
-
-            gpu_usage = stats.get("gpu_percent", 0.0)
-            power_draw = 0.0
-
-            raw_loaded = health.get("all_models_loaded", [])
-            loaded_models = [m.get("model_name", "") for m in raw_loaded if isinstance(m, dict)]
-
-            num_heavy = sum(1 for name in loaded_models if is_heavy_model(name))
-            num_small = len(loaded_models) - num_heavy
-
-            return {
-                "mem_utilization": mem_utilization,
-                "gpu_usage": gpu_usage,
-                "power_draw": power_draw,
-                "loaded_models": loaded_models,
-                "num_heavy": num_heavy,
-                "num_small": num_small,
-                "in_flight": in_flight,
-                "time_since_active": time_since_active,
-                "backend_url": url,
-                "is_mac": False
-            }
+            if res_stats.status_code == 200:
+                stats = res_stats.json()
+                is_responsive = True
         except Exception as e:
-            logger.warning(f"Failed to fetch stats from {url}: {e}")
+            logger.debug(f"Stats check failed on {clean_url}: {e}")
+
+        # 2. Fetch loaded models
+        try:
+            res_health = await self.http_client.get(f"{clean_url}/v1/health", timeout=5.0)
+            if res_health.status_code == 200:
+                health = res_health.json()
+                is_responsive = True
+        except Exception as e:
+            logger.debug(f"Health check failed on {clean_url}: {e}")
+
+        # 3. Fallback to /live probe if neither endpoint responded
+        if not is_responsive:
+            try:
+                res_live = await self.http_client.get(f"{clean_url}/live", timeout=5.0)
+                if res_live.status_code == 200:
+                    is_responsive = True
+            except Exception as e:
+                logger.debug(f"Live probe check failed on {clean_url}: {e}")
+
+        if not is_responsive:
+            logger.warning(f"Failed to fetch stats and /live probe unreachable for {url}")
             return {
                 "mem_utilization": 1.0,
                 "gpu_usage": 100,
@@ -322,6 +325,32 @@ class UnifiedProxyManager:
                 "is_mac": False,
                 "offline": True
             }
+
+        memory_gb = stats.get("memory_gb", 0.0)
+        total_ram = float(os.getenv("NODE_TOTAL_RAM_GB", "128.0"))
+        mem_utilization = (memory_gb / total_ram) if total_ram > 0 else 0
+
+        gpu_usage = stats.get("gpu_percent", 0.0)
+        power_draw = 0.0
+
+        raw_loaded = health.get("all_models_loaded", [])
+        loaded_models = [m.get("model_name", "") for m in raw_loaded if isinstance(m, dict)]
+
+        num_heavy = sum(1 for name in loaded_models if is_heavy_model(name))
+        num_small = len(loaded_models) - num_heavy
+
+        return {
+            "mem_utilization": mem_utilization,
+            "gpu_usage": gpu_usage,
+            "power_draw": power_draw,
+            "loaded_models": loaded_models,
+            "num_heavy": num_heavy,
+            "num_small": num_small,
+            "in_flight": in_flight,
+            "time_since_active": time_since_active,
+            "backend_url": url,
+            "is_mac": False
+        }
 
     async def fetch_macos_stats(self) -> Dict[str, Any]:
         in_flight = self.in_flight_requests.get(NODE_MBP_OLLAMA, 0)
@@ -561,6 +590,10 @@ async def idle_watcher():
                 try:
                     if not manager.http_client:
                         continue
+                    # If node is actively processing requests, skip idle checks
+                    if manager.in_flight_requests.get(url, 0) > 0:
+                        continue
+
                     clean_url = _normalize_url(url)
                     res_health = await manager.http_client.get(f"{clean_url}/v1/health", timeout=5.0)
                     if res_health.status_code == 200:
@@ -579,26 +612,9 @@ async def idle_watcher():
                             
                             idle_time = current_time - manager.last_access[url][model]
                             if idle_time > 300:  # ~5 minutes
-                                logger.info(f"Model {model} on {url} has been idle for {idle_time:.1f}s. Unloading to save power.")
-                                try:
-                                    res = await manager.http_client.post(
-                                        f"{clean_url}/v1/unload", json={"model_name": model}, timeout=5.0
-                                    )
-                                    if res.status_code == 200:
-                                        manager.last_access[url].pop(model, None)
-                                        logger.info(f"Successfully unloaded idle model {model} from {url}")
-                                    else:
-                                        raise RuntimeError(f"Unload returned HTTP status {res.status_code}")
-                                except Exception as e:
-                                    logger.warning(
-                                        f"Failed to unload idle model {model} from {url}: {e}. Triggering watchdog confirmation..."
-                                    )
-                                    await manager.watchdog.handle_unload_failure(
-                                        url,
-                                        model,
-                                        e,
-                                        on_recovered_cb=lambda u=url, m=model: manager.last_access.get(u, {}).pop(m, None),
-                                    )
+                                logger.warning(
+                                    f"[WATCHDOG] Idle watchdog timer passed: Model {model} on {url} has been idle for {idle_time:.1f}s (> 300s). Model unload suppressed."
+                                )
                 except Exception as node_e:
                     logger.debug(f"Error checking node {url} in idle watcher: {node_e}")
         except asyncio.CancelledError:
@@ -617,9 +633,9 @@ async def runaway_watcher():
                 if in_flight > 0:
                     last_active = manager.last_active_time.get(url, 0.0)
                     time_since_active = now - last_active
-                    if time_since_active > 600:
+                    if time_since_active > RUNAWAY_WATCHDOG_TIMEOUT:
                         logger.warning(
-                            f"[WATCHDOG] Runaway watchdog timer passed: Node {url} has {in_flight} in-flight request(s) active for {time_since_active:.1f}s (> 600s). Restart suppressed."
+                            f"[WATCHDOG] Runaway watchdog timer passed: Node {url} has {in_flight} in-flight request(s) active for {time_since_active:.1f}s (> {RUNAWAY_WATCHDOG_TIMEOUT:.0f}s). Restart suppressed."
                         )
                         emit_event(
                             "runaway_detected",
@@ -928,10 +944,28 @@ async def proxy_or_handle(path: str, request: Request):
                             except Exception:
                                 pass
                         manager.last_active_time[best_url] = asyncio.get_event_loop().time()
+                        if best_url in manager.last_access and actual_model_name in manager.last_access[best_url]:
+                            manager.last_access[best_url][actual_model_name] = time.time()
                         yield (line + "\n").encode("utf-8")
+                except (httpx.ReadTimeout, httpx.StreamError, httpx.RemoteProtocolError) as stream_err:
+                    elapsed = asyncio.get_event_loop().time() - start_time
+                    logger.warning(
+                        f"Streaming connection closed/timed out on {target_url} for {model_name} after {elapsed:.2f}s: {stream_err}"
+                    )
+                except asyncio.CancelledError:
+                    elapsed = asyncio.get_event_loop().time() - start_time
+                    logger.info(f"Client disconnected stream for {model_name} on {target_url} after {elapsed:.2f}s")
+                    raise
+                except Exception as stream_err:
+                    elapsed = asyncio.get_event_loop().time() - start_time
+                    logger.error(
+                        f"Unexpected error in stream generator for {model_name} on {target_url} after {elapsed:.2f}s: {stream_err}"
+                    )
                 finally:
                     await backend_res.aclose()
                     manager.record_request_end(best_url)
+                    if best_url in manager.last_access and actual_model_name in manager.last_access[best_url]:
+                        manager.last_access[best_url][actual_model_name] = time.time()
                     elapsed = asyncio.get_event_loop().time() - start_time
                     logger.info(f"Stream finished for {model_name} on {target_url} in {elapsed:.2f}s (Status: {backend_res.status_code})")
                     emit_event(
@@ -970,6 +1004,8 @@ async def proxy_or_handle(path: str, request: Request):
                 return Response(content=content, status_code=backend_res.status_code, headers=headers)
             finally:
                 manager.record_request_end(best_url)
+                if best_url in manager.last_access and actual_model_name in manager.last_access[best_url]:
+                    manager.last_access[best_url][actual_model_name] = time.time()
                 emit_event(
                     "request_end",
                     node=best_url,
@@ -983,6 +1019,8 @@ async def proxy_or_handle(path: str, request: Request):
 
     except Exception as e:
         manager.record_request_end(best_url)
+        if best_url in manager.last_access and actual_model_name in manager.last_access[best_url]:
+            manager.last_access[best_url][actual_model_name] = time.time()
         elapsed = asyncio.get_event_loop().time() - start_time
         logger.error(f"Error proxying request to {target_url} after {elapsed:.2f}s: {e}")
         emit_event(
