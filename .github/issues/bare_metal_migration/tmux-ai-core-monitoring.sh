@@ -48,8 +48,8 @@ tmux send-keys -t "$P_MID_1" "ssh $HOST1" C-m
 tmux send-keys -t "$P_MID_2" "ssh $HOST2" C-m
 tmux send-keys -t "$P_MID_3" "ssh $HOST3" C-m
 
-# --- BOTTOM ROW: LiteLLM Proxy Logs & Help Screen ---
-tmux send-keys -t "$P_BOT_PROXY" "ssh -t $HOST_PROXY 'tail -f /etc/litellm/unified_proxy.log'" C-m
+# --- BOTTOM ROW: PAIR Router Logs, LiteLLM Logs & Help Screen ---
+tmux send-keys -t "$P_BOT_PROXY" "ssh -t $HOST_PROXY 'sudo journalctl -u nvpair.service -f -n 100 2>/dev/null || sudo journalctl -f -n 100 --grep=nvpair'" C-m
 tmux send-keys -t "$P_BOT_LITELLM" "ssh -t $HOST_PROXY 'sudo journalctl -f -n 100 --grep=litellm'" C-m
 tmux send-keys -t "$P_BOT_HELP" "clear && cat << 'EOF'
 ################################################################################
@@ -59,7 +59,7 @@ tmux send-keys -t "$P_BOT_HELP" "clear && cat << 'EOF'
 #  LAYOUT:                                                                     #
 #  [ Host 1: all-smi ] [ Host 2: all-smi ] [ Host 3: all-smi ]  <-- TOP ROW    #
 #  [ Host 1: Shell   ] [ Host 2: Shell   ] [ Host 3: Shell   ]  <-- MID ROW    #
-#  [ LiteLLM Proxy Logs                  ] [ Help Screen     ]  <-- BOT ROW    #
+#  [ PAIR Router Logs] [ LiteLLM Logs    ] [ Help Screen     ]  <-- BOT ROW    #
 #                                                                              #
 #  TMUX NAVIGATION:                                                            #
 #  - Switch Pane:  Ctrl+b + Arrow Keys                                         #

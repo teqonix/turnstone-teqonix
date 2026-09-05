@@ -2,14 +2,11 @@
 # =============================================================================
 # Turnstone LLM Inference Node Deployment (AMD Ryzen AI Halo - Linux)
 #
-# This node acts ONLY as an LLM inference server. It provisions the ryzenadj
-# power-management utility (TDP control) and verifies the local Lemonade model
-# server is reachable.
-#
-# The Turnstone node role has been moved to a dedicated Debian 12 container
-# (see deploy_turnstone_debian12.sh). This script no longer installs the
-# `turnstone` package, no longer writes /etc/turnstone/config.toml, and no
-# longer manages a turnstone-server systemd unit.
+# This node acts as an LLM inference server. It provisions:
+#   1) ryzenadj power-management utility (TDP control)
+#   2) NVIDIA Personal AI Router (PAIR) package and ROCm Ollama manifest
+#   3) Systemd service running nvpair-tui in a dedicated tmux session (teqonix)
+#   4) Shared NFS workspace storage
 # =============================================================================
 
 set -euo pipefail
@@ -30,10 +27,14 @@ trap 'log_error "An error occurred on line $LINENO. Deployment stopped."; exit 1
 
 # Determine repository root
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." 2>/dev/null && pwd || pwd)"
 
-# Inference endpoint served by the local Lemonade model server.
+# Configuration & Defaults
 LEMONADE_URL="${LEMONADE_URL:-http://127.0.0.1:8000/v1}"
+PAIR_OLLAMA_URL="${PAIR_OLLAMA_URL:-http://127.0.0.1:11434/v1}"
 SKIP_RYZENADJ="${SKIP_RYZENADJ:-false}"
+SKIP_PAIR="${SKIP_PAIR:-false}"
+SKIP_TMUX_DAEMON="${SKIP_TMUX_DAEMON:-false}"
 NFS_SERVER="${NFS_SERVER:-silo-14.lan}"
 NFS_SHARE="${NFS_SHARE:-/mnt/silo-14/ai-playground}"
 MOUNT_POINT="${MOUNT_POINT:-/home/turnstone/silo-14/ai-playground}"
@@ -65,10 +66,13 @@ auto_discover_nfs
 usage() {
     echo "Usage: $0 [OPTIONS]"
     echo ""
-    echo "LLM inference node only (no Turnstone node is installed by this script)."
+    echo "LLM inference node deployment (NVIDIA Personal AI Router + Lemonade + RyzenAdj)."
     echo ""
     echo "Options:"
     echo "      --lemonade-url <url>       Local Lemonade API base URL [default: ${LEMONADE_URL}]"
+    echo "      --pair-url <url>           Local PAIR Ollama API base URL [default: ${PAIR_OLLAMA_URL}]"
+    echo "      --skip-pair                Skip downloading/installing NVIDIA Personal AI Router"
+    echo "      --skip-tmux-daemon         Skip configuring/enabling the nvpair.service tmux daemon"
     echo "      --skip-ryzenadj            Skip checking/installing ryzenadj / TDP service"
     echo "      --nfs-server <host>        NFS server hostname [default: ${NFS_SERVER}]"
     echo "      --nfs-share <path>         NFS share export path [default: ${NFS_SHARE}]"
@@ -83,6 +87,18 @@ while [[ $# -gt 0 ]]; do
         --lemonade-url)
             LEMONADE_URL="$2"
             shift 2
+            ;;
+        --pair-url)
+            PAIR_OLLAMA_URL="$2"
+            shift 2
+            ;;
+        --skip-pair)
+            SKIP_PAIR="true"
+            shift
+            ;;
+        --skip-tmux-daemon)
+            SKIP_TMUX_DAEMON="true"
+            shift
             ;;
         --skip-ryzenadj)
             SKIP_RYZENADJ="true"
@@ -118,7 +134,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 echo -e "${BLUE}=================================================================${NC}"
-echo -e "${BLUE}  LLM Inference Node Deployment (AMD Ryzen AI Halo - Lemonade)  ${NC}"
+echo -e "${BLUE}  LLM Inference Node Deployment (AMD Ryzen AI Halo - PAIR/ROCm)  ${NC}"
 echo -e "${BLUE}=================================================================${NC}"
 
 # Step 1: Root Check
@@ -150,28 +166,198 @@ else
     log_info "Skipping RyzenAdj check (--skip-ryzenadj specified)."
 fi
 
-# Step 3: Verify Local Lemonade Inference Server
-log_info "Step 3: Verifying local Lemonade inference server at ${LEMONADE_URL}..."
-LEMONADE_READY=false
-for _attempt in {1..30}; do
-    if curl -sf "${LEMONADE_URL}/models" &>/dev/null 2>&1; then
-        LEMONADE_READY=true
+# Step 3: Install NVIDIA Personal AI Router (PAIR)
+if [ "${SKIP_PAIR}" != "true" ]; then
+    log_info "Step 3: Installing/Updating NVIDIA Personal AI Router (PAIR)..."
+
+    # Install prerequisites
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl tmux jq ca-certificates
+
+    log_info "Fetching latest PAIR release metadata..."
+    PAIR_YML_CONTENT=""
+    PAIR_RELEASE_URLS=(
+        "https://github.com/NVIDIA/Personal-AI-Router/releases/latest/download/latest-linux.yml"
+        "https://github.com/NVIDIA/Personal-AI-Router/releases/download/latest/latest-linux.yml"
+    )
+    for r_url in "${PAIR_RELEASE_URLS[@]}"; do
+        if PAIR_YML_CONTENT=$(curl -sSL -f "${r_url}" 2>/dev/null); then
+            [ -n "${PAIR_YML_CONTENT}" ] && break
+        fi
+    done
+
+    PAIR_DEB_NAME=""
+    if [ -n "${PAIR_YML_CONTENT}" ]; then
+        PAIR_DEB_NAME=$(echo "${PAIR_YML_CONTENT}" | awk -F': ' '/url:.*\.deb/{print $2}' | tr -d ' "\r' | head -n 1)
+        if [ -z "${PAIR_DEB_NAME}" ]; then
+            PAIR_DEB_NAME=$(echo "${PAIR_YML_CONTENT}" | awk -F': ' '/path:.*\.deb/{print $2}' | tr -d ' "\r' | head -n 1)
+        fi
+    fi
+
+    if [ -z "${PAIR_DEB_NAME}" ]; then
+        PAIR_DEB_NAME="NVPAIR-Setup-0.1.1-amd64.deb"
+        log_warn "Could not parse deb filename from release YAML. Using fallback: ${PAIR_DEB_NAME}"
+    fi
+
+    log_info "Target PAIR package: ${PAIR_DEB_NAME}"
+    PAIR_DOWNLOAD_URLS=(
+        "https://github.com/NVIDIA/Personal-AI-Router/releases/latest/download/${PAIR_DEB_NAME}"
+        "https://github.com/NVIDIA/Personal-AI-Router/releases/download/latest/${PAIR_DEB_NAME}"
+    )
+
+    TEMP_DEB="/tmp/${PAIR_DEB_NAME}"
+    DOWNLOADED=false
+    for dl_url in "${PAIR_DOWNLOAD_URLS[@]}"; do
+        log_info "Attempting download from ${dl_url}..."
+        if curl -sSL -f -o "${TEMP_DEB}" "${dl_url}"; then
+            DOWNLOADED=true
+            break
+        fi
+    done
+
+    if [ "${DOWNLOADED}" = true ] && [ -s "${TEMP_DEB}" ]; then
+        log_info "Installing ${TEMP_DEB}..."
+        if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${TEMP_DEB}"; then
+            log_warn "apt-get install returned non-zero; attempting dpkg -i and apt-get install -f..."
+            dpkg -i "${TEMP_DEB}" || true
+            DEBIAN_FRONTEND=noninteractive apt-get install -f -y -qq
+        fi
+        rm -f "${TEMP_DEB}"
+        log_success "NVIDIA Personal AI Router package installed."
+    else
+        log_warn "Failed to download PAIR .deb. Checking if /opt/PAIR already exists..."
+        if [ ! -d "/opt/PAIR" ]; then
+            log_error "PAIR is not installed and package download failed."
+            exit 1
+        fi
+    fi
+
+    # Ensure nvpair-tui is accessible on standard PATH
+    if [ -x "/opt/PAIR/resources/cli-bin/nvpair-tui" ]; then
+        ln -sf "/opt/PAIR/resources/cli-bin/nvpair-tui" "/usr/bin/nvpair-tui"
+        ln -sf "/opt/PAIR/resources/cli-bin/nvpair-tui" "/usr/local/bin/nvpair-tui"
+    fi
+    if [ -x "/opt/PAIR/resources/cli-bin/nvpair" ]; then
+        ln -sf "/opt/PAIR/resources/cli-bin/nvpair" "/usr/bin/nvpair"
+        ln -sf "/opt/PAIR/resources/cli-bin/nvpair" "/usr/local/bin/nvpair"
+    fi
+
+    # Step 4: Inject Custom PAIR Configurations (ROCm Ollama Manifest)
+    log_info "Step 4: Injecting custom PAIR manifest configurations (ROCm Ollama)..."
+    PAIR_MANIFEST_SRC=""
+    CANDIDATE_MANIFESTS=(
+        "${SCRIPT_DIR}/nvidia_personal_ai_router/ryzen_ollama.json"
+        "${REPO_ROOT}/.github/issues/bare_metal_migration/nvidia_personal_ai_router/ryzen_ollama.json"
+    )
+    for cand in "${CANDIDATE_MANIFESTS[@]}"; do
+        if [ -f "${cand}" ]; then
+            PAIR_MANIFEST_SRC="${cand}"
+            break
+        fi
+    done
+
+    if [ -z "${PAIR_MANIFEST_SRC}" ]; then
+        log_info "Fetching ryzen_ollama.json at runtime from remote repository..."
+        REMOTE_MANIFEST_URL="https://raw.githubusercontent.com/teqonix/turnstone-teqonix/main/.github/issues/bare_metal_migration/nvidia_personal_ai_router/ryzen_ollama.json"
+        TMP_MANIFEST="/tmp/ryzen_ollama.json"
+        if curl -sSfL "${REMOTE_MANIFEST_URL}" -o "${TMP_MANIFEST}" 2>/dev/null; then
+            PAIR_MANIFEST_SRC="${TMP_MANIFEST}"
+            log_success "Downloaded ryzen_ollama.json from remote."
+        fi
+    fi
+
+    if [ -n "${PAIR_MANIFEST_SRC}" ]; then
+        log_info "Found ryzen_ollama.json at: ${PAIR_MANIFEST_SRC}"
+        # 1. System service engine manager manifests
+        mkdir -p "/opt/PAIR/resources/services/nvpair-engine-manager/manifests"
+        cp -f "${PAIR_MANIFEST_SRC}" "/opt/PAIR/resources/services/nvpair-engine-manager/manifests/ryzen_ollama.json"
+
+        # 2. CLI bin manifests if present
+        if [ -d "/opt/PAIR/resources/cli-bin" ]; then
+            mkdir -p "/opt/PAIR/resources/cli-bin/manifests"
+            cp -f "${PAIR_MANIFEST_SRC}" "/opt/PAIR/resources/cli-bin/manifests/ryzen_ollama.json"
+        fi
+
+        # 3. User config manifests (teqonix and root)
+        for u_home in "/home/teqonix" "/root"; do
+            if [ -d "${u_home}" ]; then
+                u_dir="${u_home}/.config/Nvidia Corporation/Personal AI Router/manifests"
+                mkdir -p "${u_dir}"
+                cp -f "${PAIR_MANIFEST_SRC}" "${u_dir}/ryzen_ollama.json"
+                if [ "${u_home}" = "/home/teqonix" ] && id -u teqonix &>/dev/null; then
+                    chown -R teqonix:teqonix "${u_home}/.config"
+                fi
+                log_success "Injected manifest to: ${u_dir}/ryzen_ollama.json"
+            fi
+        done
+    else
+        log_warn "ryzen_ollama.json not found. Skipping manifest injection."
+    fi
+else
+    log_info "Step 3-4: Skipping PAIR installation (--skip-pair specified)."
+fi
+
+# Step 5: Configure and Start nvpair tmux Daemon Service
+if [ "${SKIP_TMUX_DAEMON}" != "true" ]; then
+    log_info "Step 5: Configuring nvpair tmux daemon service..."
+    NVPAIR_INSTALLER=""
+    CANDIDATE_INSTALLERS=(
+        "${SCRIPT_DIR}/nvidia_personal_ai_router/install_nvpair_service.sh"
+        "${REPO_ROOT}/.github/issues/bare_metal_migration/nvidia_personal_ai_router/install_nvpair_service.sh"
+    )
+    for cand in "${CANDIDATE_INSTALLERS[@]}"; do
+        if [ -f "${cand}" ]; then
+            NVPAIR_INSTALLER="${cand}"
+            break
+        fi
+    done
+
+    if [ -z "${NVPAIR_INSTALLER}" ]; then
+        log_info "Fetching install_nvpair_service.sh at runtime from remote repository..."
+        REMOTE_INSTALLER_URL="https://raw.githubusercontent.com/teqonix/turnstone-teqonix/main/.github/issues/bare_metal_migration/nvidia_personal_ai_router/install_nvpair_service.sh"
+        TMP_INSTALLER="/tmp/install_nvpair_service.sh"
+        if curl -sSfL "${REMOTE_INSTALLER_URL}" -o "${TMP_INSTALLER}" 2>/dev/null; then
+            NVPAIR_INSTALLER="${TMP_INSTALLER}"
+            log_success "Downloaded install_nvpair_service.sh from remote."
+        fi
+    fi
+
+    if [ -n "${NVPAIR_INSTALLER}" ]; then
+        bash "${NVPAIR_INSTALLER}" --user "teqonix"
+    else
+        log_error "Failed to locate or download install_nvpair_service.sh."
+        exit 1
+    fi
+else
+    log_info "Step 5: Skipping nvpair tmux daemon setup (--skip-tmux-daemon specified)."
+fi
+
+# Step 6: Verify Local Inference Endpoints
+log_info "Step 6: Verifying local inference endpoints..."
+# PAIR / Ollama check (port 11434)
+PAIR_READY=false
+for _attempt in {1..10}; do
+    if curl -sf "${PAIR_OLLAMA_URL%/*}/api/tags" &>/dev/null 2>&1 || curl -sf "http://127.0.0.1:11434/" &>/dev/null 2>&1; then
+        PAIR_READY=true
         break
     fi
     sleep 1
 done
 
-if [ "${LEMONADE_READY}" = true ]; then
-    log_success "Lemonade inference server is healthy at ${LEMONADE_URL}."
+if [ "${PAIR_READY}" = true ]; then
+    log_success "PAIR Ollama endpoint is active and responding on port 11434."
 else
-    log_warn "Lemonade server not yet responding at ${LEMONADE_URL}."
-    log_warn "This is expected if the model server has not been started yet."
-    log_warn "The Turnstone node (Debian 12 container) will reach this node at this URL."
+    log_warn "PAIR Ollama endpoint not yet responding on port 11434 (will start with nvpair tmux session)."
 fi
 
-# Step 4: Configure NFS Shared Storage for AI Workspace
+# Optional Lemonade check
+if curl -sf "${LEMONADE_URL}/models" &>/dev/null 2>&1; then
+    log_success "Lemonade inference server is active at ${LEMONADE_URL}."
+fi
+
+# Step 7: Configure NFS Shared Storage for AI Workspace
 if [ "${SKIP_NFS}" != "true" ]; then
-    log_info "Step 4: Configuring NFS shared storage (${NFS_SERVER}:${NFS_SHARE} -> ${MOUNT_POINT})..."
+    log_info "Step 7: Configuring NFS shared storage (${NFS_SERVER}:${NFS_SHARE} -> ${MOUNT_POINT})..."
 
     if ! dpkg -s nfs-common &>/dev/null; then
         log_info "Installing nfs-common package..."
@@ -272,7 +458,7 @@ if [ "${SKIP_NFS}" != "true" ]; then
         log_warn "NFS share could not be mounted at ${MOUNT_POINT} during deployment. It will mount automatically at boot via /etc/fstab."
     fi
 else
-    log_info "Step 4: Skipping NFS mount setup (--skip-nfs specified)."
+    log_info "Step 7: Skipping NFS mount setup (--skip-nfs specified)."
 fi
 
 LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || hostname -i 2>/dev/null | awk '{print $1}' || echo "127.0.0.1")"
@@ -281,13 +467,14 @@ LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || hostname -i 2>/dev/null 
 echo -e "${GREEN}=================================================================${NC}"
 echo -e "${GREEN}  LLM Inference Node (AMD Ryzen AI Halo) Provisioned!          ${NC}"
 echo -e "${GREEN}=================================================================${NC}"
-echo -e "Node role: LLM inference server (no Turnstone node installed here)"
-echo -e "Lemonade backend: ${LEMONADE_URL}"
+echo -e "Node role: LLM inference server (NVIDIA PAIR + ROCm Ollama)"
+echo -e "PAIR Ollama endpoint: http://${LAN_IP}:11434"
+echo -e "nvpair tmux session:  nvpair.service (user: teqonix, session: pair)"
 echo -e "LAN IP: ${LAN_IP}"
 echo -e "Power management: ryzenadj (TDP)"
 if [ "${SKIP_NFS}" != "true" ]; then
     echo -e "Shared storage (NFS): ${NFS_SERVER}:${NFS_SHARE} mounted at ${MOUNT_POINT}"
 fi
 echo -e ""
-echo -e "The Turnstone node now runs in a dedicated Debian 12 container."
-echo -e "Run deploy_turnstone_debian12.sh to provision it."
+echo -e "To attach to the PAIR TUI directly on this host:"
+echo -e "  sudo -u teqonix tmux attach -t pair"

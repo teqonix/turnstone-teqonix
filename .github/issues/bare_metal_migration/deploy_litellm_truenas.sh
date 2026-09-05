@@ -71,17 +71,15 @@ POSTGRES_PORT="5432"
 POSTGRES_DB="postgres"
 
 # Node Endpoints (Defaults match Turnstone cluster hostnames & ports)
-NODE_RYZEN_ONE="${NODE_RYZEN_ONE:-http://amd-ai-core-one.lan:13306/v1}"
-NODE_RYZEN_TWO="${NODE_RYZEN_TWO:-http://amd-ai-core-two.lan:13306/v1}"
+# Node Endpoints (Defaults match Turnstone cluster hostnames & ports)
+NODE_RYZEN_ONE="${NODE_RYZEN_ONE:-http://amd-ai-core-one.lan:11434/v1}"
+NODE_RYZEN_TWO="${NODE_RYZEN_TWO:-http://amd-ai-core-two.lan:11434/v1}"
 NODE_MBP_MLX="${NODE_MBP_MLX:-http://mbp-ai-core.lan:8000/v1}"
 NODE_MBP_OLLAMA="${NODE_MBP_OLLAMA:-${NODE_MBP:-http://mbp-ai-core.lan:11434/v1}}"
 NODE_MBP="${NODE_MBP:-${NODE_MBP_OLLAMA}}"
 NODE_MBP_HOSTNAME="${NODE_MBP_HOSTNAME:-${MBP_HOSTNAME:-mbp-ai-core.lan}}"
 MBP_COOLDOWN_SECONDS="${MBP_COOLDOWN_SECONDS:-60}"
-WATCHDOG_SSH_USER="${WATCHDOG_SSH_USER:-turnstone}"
-WATCHDOG_COOLDOWN_SECONDS="${WATCHDOG_COOLDOWN_SECONDS:-120}"
-WATCHDOG_PROBE_TIMEOUT="${WATCHDOG_PROBE_TIMEOUT:-5.0}"
-WATCHDOG_RECOVERY_TIMEOUT="${WATCHDOG_RECOVERY_TIMEOUT:-30.0}"
+PAIR_LOCAL_URL="${PAIR_LOCAL_URL:-http://127.0.0.1:11434}"
 
 MASTER_KEY="${LITELLM_MASTER_KEY:-${MASTER_KEY:-}}"
 ROUTING_STRATEGY="${ROUTING_STRATEGY:-simple-shuffle}"
@@ -104,19 +102,15 @@ Options:
   --no-postgres                  Skip local PostgreSQL server installation / configuration
   --destructive                  Destroy existing PostgreSQL instance & LiteLLM Proxy, deploying fresh
   -w, --workers <num>            Number of Uvicorn workers (default: 1)
-  --node-ryzen-1 <url>           URL for Ryzen AI Halo Node 1 (default: http://amd-ai-core-one.lan:13305/v1)
-  --node-ryzen-2 <url>           URL for Ryzen AI Halo Node 2 (default: http://amd-ai-core-two.lan:13305/v1)
+  --node-ryzen-1 <url>           URL for Ryzen AI Halo Node 1 (default: http://amd-ai-core-one.lan:11434/v1)
+  --node-ryzen-2 <url>           URL for Ryzen AI Halo Node 2 (default: http://amd-ai-core-two.lan:11434/v1)
   --node-mbp-mlx <url>           URL for MacBook Pro MLX Server (default: http://mbp-ai-core.lan:8000/v1)
   --node-mbp-ollama <url>        URL for MacBook Pro Ollama Server (default: http://mbp-ai-core.lan:11434/v1)
   --node-mbp <url>               Alias for MacBook Pro Ollama Server (default: http://mbp-ai-core.lan:11434/v1)
   --node-mbp-hostname <host>     Hostname for MacBook Pro M5 node (default: mbp-ai-core.lan)
   --mbp-cooldown <seconds>       Cooldown window for qwen-3.8-27b priority (default: 60)
-  --watchdog-user <user>         SSH user for service watchdog remote restarts (default: turnstone)
-  --watchdog-cooldown <seconds>  Cooldown seconds between watchdog node restarts (default: 120)
-  --watchdog-probe-timeout <sec> Probe timeout seconds for node health verification (default: 5.0)
-  --watchdog-recovery-timeout <s> Recovery polling timeout seconds after restart (default: 30.0)
   --strategy <strategy>          Routing strategy: least-busy, latency-based-routing, simple-shuffle (default: simple-shuffle)
-  --proxy-only, --update-proxy   Update and restart unified_proxy.py & service_watchdog.py only (skip full stack install)
+  --update-config, --proxy-only  Update LiteLLM configuration and restart service
   --restart                      Force restart the service
   -h, --help                     Display this help message
 
@@ -362,9 +356,7 @@ show_status_summary() {
     echo -e "${BOLD}Database URL:${NC}            ${masked_db_url}"
     echo -e "${BOLD}Routing Strategy:${NC}        ${configured_strategy} (MBP Activity Priority + Least-Busy)"
     echo -e "${BOLD}MBP Cooldown Lock:${NC}       ${MBP_COOLDOWN_SECONDS}s (qwen-3.8-27b warm cache reservation)"
-    echo -e "${BOLD}Config File:${NC}             ${LITELLM_CONFIG}"
-    echo -e "${BOLD}Router / Proxy:${NC}          ${LITELLM_DIR}/unified_proxy.py (Port 13306)"
-    echo -e "${BOLD}Service Watchdog:${NC}        ${LITELLM_DIR}/service_watchdog.py (Automated SSH recovery)"
+    echo -e "${BOLD}Router / Proxy:${NC}          NVIDIA Personal AI Router (PAIR) (Port 11434)"
     echo -e "${BOLD}Virtualenv:${NC}              ${VENV_DIR}"
     echo ""
     echo -e "${CYAN}LiteLLM GUI Admin Access Instructions:${NC}"
@@ -472,28 +464,16 @@ while [[ $# -gt 0 ]]; do
             MBP_COOLDOWN_SECONDS="$2"
             shift 2
             ;;
-        --watchdog-user)
-            WATCHDOG_SSH_USER="$2"
-            shift 2
-            ;;
-        --watchdog-cooldown)
-            WATCHDOG_COOLDOWN_SECONDS="$2"
-            shift 2
-            ;;
-        --watchdog-probe-timeout)
-            WATCHDOG_PROBE_TIMEOUT="$2"
-            shift 2
-            ;;
-        --watchdog-recovery-timeout)
-            WATCHDOG_RECOVERY_TIMEOUT="$2"
+        --watchdog-user|--watchdog-cooldown|--watchdog-probe-timeout|--watchdog-recovery-timeout)
+            # Deprecated options maintained for backwards compatibility
             shift 2
             ;;
         --strategy)
             ROUTING_STRATEGY="$2"
             shift 2
             ;;
-        --proxy-only|--update-proxy|--rebuild-proxy)
-            ACTION_PROXY_ONLY=true
+        --proxy-only|--update-proxy|--update-config|--rebuild-proxy)
+            ACTION_UPDATE_CONFIG=true
             shift
             ;;
         --restart)
@@ -545,59 +525,134 @@ EOF
     rm -f "${tmp_file}"
 }
 
-rebuild_unified_proxy_only() {
-    log_section "Quick Update: Unified Hardware Proxy & Service Watchdog"
-    log_info "Updating unified_proxy.py, service_watchdog.py, and models_map.json in ${LITELLM_DIR}..."
+install_pair() {
+    log_info "Installing / Updating NVIDIA Personal AI Router (PAIR)..."
+
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl tmux jq ca-certificates
+
+    log_info "Fetching latest PAIR release metadata..."
+    local PAIR_YML_CONTENT=""
+    local PAIR_RELEASE_URLS=(
+        "https://github.com/NVIDIA/Personal-AI-Router/releases/latest/download/latest-linux.yml"
+        "https://github.com/NVIDIA/Personal-AI-Router/releases/download/latest/latest-linux.yml"
+    )
+    for r_url in "${PAIR_RELEASE_URLS[@]}"; do
+        if PAIR_YML_CONTENT=$(curl -sSL -f "${r_url}" 2>/dev/null); then
+            [ -n "${PAIR_YML_CONTENT}" ] && break
+        fi
+    done
+
+    local PAIR_DEB_NAME=""
+    if [ -n "${PAIR_YML_CONTENT}" ]; then
+        PAIR_DEB_NAME=$(echo "${PAIR_YML_CONTENT}" | awk -F': ' '/url:.*\.deb/{print $2}' | tr -d ' "\r' | head -n 1)
+        if [ -z "${PAIR_DEB_NAME}" ]; then
+            PAIR_DEB_NAME=$(echo "${PAIR_YML_CONTENT}" | awk -F': ' '/path:.*\.deb/{print $2}' | tr -d ' "\r' | head -n 1)
+        fi
+    fi
+
+    if [ -z "${PAIR_DEB_NAME}" ]; then
+        PAIR_DEB_NAME="NVPAIR-Setup-0.1.1-amd64.deb"
+        log_warn "Could not parse deb filename from release YAML. Using fallback: ${PAIR_DEB_NAME}"
+    fi
+
+    local PAIR_DOWNLOAD_URLS=(
+        "https://github.com/NVIDIA/Personal-AI-Router/releases/latest/download/${PAIR_DEB_NAME}"
+        "https://github.com/NVIDIA/Personal-AI-Router/releases/download/latest/${PAIR_DEB_NAME}"
+    )
+
+    local TEMP_DEB="/tmp/${PAIR_DEB_NAME}"
+    local DOWNLOADED=false
+    for dl_url in "${PAIR_DOWNLOAD_URLS[@]}"; do
+        log_info "Attempting download from ${dl_url}..."
+        if curl -sSL -f -o "${TEMP_DEB}" "${dl_url}"; then
+            DOWNLOADED=true
+            break
+        fi
+    done
+
+    if [ "${DOWNLOADED}" = true ] && [ -s "${TEMP_DEB}" ]; then
+        log_info "Installing ${TEMP_DEB}..."
+        if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${TEMP_DEB}"; then
+            log_warn "apt-get install returned non-zero; attempting dpkg -i and apt-get install -f..."
+            dpkg -i "${TEMP_DEB}" || true
+            DEBIAN_FRONTEND=noninteractive apt-get install -f -y -qq
+        fi
+        rm -f "${TEMP_DEB}"
+        log_success "NVIDIA Personal AI Router package installed."
+    else
+        log_warn "Could not download PAIR package. Checking if /opt/PAIR is already present..."
+        if [ ! -d "/opt/PAIR" ]; then
+            log_warn "PAIR installation skipped or pending network connectivity."
+        fi
+    fi
+
+    if [ -x "/opt/PAIR/resources/cli-bin/nvpair-tui" ]; then
+        ln -sf "/opt/PAIR/resources/cli-bin/nvpair-tui" "/usr/bin/nvpair-tui"
+        ln -sf "/opt/PAIR/resources/cli-bin/nvpair-tui" "/usr/local/bin/nvpair-tui"
+    fi
+    if [ -x "/opt/PAIR/resources/cli-bin/nvpair" ]; then
+        ln -sf "/opt/PAIR/resources/cli-bin/nvpair" "/usr/bin/nvpair"
+        ln -sf "/opt/PAIR/resources/cli-bin/nvpair" "/usr/local/bin/nvpair"
+    fi
+
+    # Configure and start nvpair tmux daemon service
+    log_info "Configuring nvpair tmux daemon service..."
+    local NVPAIR_INSTALLER=""
+    local CANDIDATE_INSTALLERS=(
+        "${SCRIPT_DIR}/nvidia_personal_ai_router/install_nvpair_service.sh"
+        "${REPO_ROOT}/.github/issues/bare_metal_migration/nvidia_personal_ai_router/install_nvpair_service.sh"
+    )
+    for cand in "${CANDIDATE_INSTALLERS[@]}"; do
+        if [ -f "${cand}" ]; then
+            NVPAIR_INSTALLER="${cand}"
+            break
+        fi
+    done
+
+    if [ -z "${NVPAIR_INSTALLER}" ]; then
+        log_info "Fetching install_nvpair_service.sh at runtime from remote repository..."
+        local REMOTE_INSTALLER_URL="https://raw.githubusercontent.com/teqonix/turnstone-teqonix/main/.github/issues/bare_metal_migration/nvidia_personal_ai_router/install_nvpair_service.sh"
+        local TMP_INSTALLER="/tmp/install_nvpair_service.sh"
+        if curl -sSfL "${REMOTE_INSTALLER_URL}" -o "${TMP_INSTALLER}" 2>/dev/null; then
+            NVPAIR_INSTALLER="${TMP_INSTALLER}"
+            log_success "Downloaded install_nvpair_service.sh from remote."
+        fi
+    fi
+
+    if [ -n "${NVPAIR_INSTALLER}" ]; then
+        bash "${NVPAIR_INSTALLER}" --user "${LITELLM_USER:-turnstone}"
+    else
+        log_warn "Failed to locate or download install_nvpair_service.sh. Skipping nvpair tmux service setup."
+    fi
+}
+
+update_config_only() {
+    log_section "Quick Update: LiteLLM Configuration"
+    log_info "Updating ${LITELLM_CONFIG}..."
 
     mkdir -p "${LITELLM_DIR}"
-    fetch_and_install_file "unified_proxy.py" "${LITELLM_DIR}/unified_proxy.py" false
-    fetch_and_install_file "service_watchdog.py" "${LITELLM_DIR}/service_watchdog.py" false
-    fetch_and_install_file "models_map.json" "${LITELLM_DIR}/models_map.json" false
-    chown -R "${LITELLM_USER}:${LITELLM_USER}" "${LITELLM_DIR}" 2>/dev/null || true
-
-    log_info "Restarting Unified Hardware Proxy service..."
-    pkill -f "unified_proxy.py" || true
-    sleep 1
+    fetch_and_install_file "config.yaml" "${LITELLM_CONFIG}" true
+    chown -R "${LITELLM_USER}:${LITELLM_USER}" "${LITELLM_DIR}"
+    chmod 600 "${LITELLM_CONFIG}"
 
     if pidof systemd &>/dev/null || [ -d /run/systemd/system ]; then
         if systemctl is-active --quiet litellm.service; then
-            log_info "Restarting litellm.service via systemd (restarts unified_proxy via ExecStartPre)..."
+            log_info "Restarting litellm.service via systemd..."
             systemctl restart litellm.service
-        else
-            log_info "Starting unified_proxy.py directly in background..."
-            nohup sudo -u "${LITELLM_USER}" "${VENV_DIR}/bin/python3" "${LITELLM_DIR}/unified_proxy.py" > "${LITELLM_DIR}/unified_proxy.log" 2>&1 &
         fi
-    else
-        log_info "Starting unified_proxy.py directly in background..."
-        nohup sudo -u "${LITELLM_USER}" "${VENV_DIR}/bin/python3" "${LITELLM_DIR}/unified_proxy.py" > "${LITELLM_DIR}/unified_proxy.log" 2>&1 &
     fi
-
-    log_info "Verifying Unified Hardware Proxy status on port 13306..."
-    PROXY_UP=false
-    for i in $(seq 1 10); do
-        if curl -s http://127.0.0.1:13306/ &>/dev/null || pgrep -f "unified_proxy.py" &>/dev/null; then
-            PROXY_UP=true
-            log_success "Unified Hardware Proxy is active and running on port 13306!"
-            break
-        fi
-        sleep 1
-    done
-
-    if [ "${PROXY_UP}" = false ]; then
-        log_warn "Unified Proxy did not respond on port 13306 within 10s. Check ${LITELLM_DIR}/unified_proxy.log."
-    fi
-
-    log_success "Unified Hardware Proxy update complete."
+    log_success "LiteLLM configuration update complete."
     exit 0
 }
 
-# If proxy-only update requested, execute and exit immediately
-if [ "${ACTION_PROXY_ONLY:-false}" = true ]; then
+# If config update requested, execute and exit immediately
+if [ "${ACTION_UPDATE_CONFIG:-false}" = true ]; then
     if [ "$EUID" -ne 0 ]; then
-        log_warn "Root privileges required to update system services. Re-executing with sudo..."
+        log_warn "Root privileges required to update configuration. Re-executing with sudo..."
         exec sudo bash "$0" "$@"
     fi
-    rebuild_unified_proxy_only
+    update_config_only
 fi
 
 log_section "LiteLLM Proxy Installation (Debian Trixie Container)"
@@ -1027,17 +1082,18 @@ fi
 # -----------------------------------------------------------------------------
 # Step 7a: Fetch and Configure LiteLLM Router and Config
 # -----------------------------------------------------------------------------
-log_info "Installing LiteLLM Router, Service Watchdog, and Configuration files..."
-
-fetch_and_install_file "unified_proxy.py" "${LITELLM_DIR}/unified_proxy.py" false
-fetch_and_install_file "service_watchdog.py" "${LITELLM_DIR}/service_watchdog.py" false
-fetch_and_install_file "models_map.json" "${LITELLM_DIR}/models_map.json" false
-chown "${LITELLM_USER}:${LITELLM_USER}" "${LITELLM_DIR}/unified_proxy.py" "${LITELLM_DIR}/service_watchdog.py" 2>/dev/null || true
+log_info "Installing LiteLLM Configuration..."
 
 fetch_and_install_file "config.yaml" "${LITELLM_CONFIG}" true
 chown -R "${LITELLM_USER}:${LITELLM_USER}" "${LITELLM_DIR}"
 chmod 600 "${LITELLM_CONFIG}"
 log_success "Configuration created at ${LITELLM_CONFIG}."
+
+# -----------------------------------------------------------------------------
+# Step 7b: Install NVIDIA Personal AI Router (PAIR)
+# -----------------------------------------------------------------------------
+log_section "Step 7b: Installing NVIDIA Personal AI Router (PAIR)"
+install_pair
 
 # -----------------------------------------------------------------------------
 # Step 8: Configure & Start Service
@@ -1064,15 +1120,8 @@ Environment="DATABASE_URL=${DATABASE_URL}"
 Environment="STORE_MODEL_IN_DB=True"
 Environment="PYTHONUNBUFFERED=1"
 Environment="PYTHONPATH=${LITELLM_DIR}"
-Environment="MBP_COOLDOWN_SECONDS=${MBP_COOLDOWN_SECONDS}"
-Environment="WATCHDOG_SSH_USER=${WATCHDOG_SSH_USER}"
-Environment="WATCHDOG_COOLDOWN_SECONDS=${WATCHDOG_COOLDOWN_SECONDS}"
-Environment="WATCHDOG_PROBE_TIMEOUT=${WATCHDOG_PROBE_TIMEOUT}"
-Environment="WATCHDOG_RECOVERY_TIMEOUT=${WATCHDOG_RECOVERY_TIMEOUT}"
 Environment="MBP_HOSTNAME=${NODE_MBP_HOSTNAME}"
 Environment="PATH=${VENV_DIR}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-ExecStartPre=-/bin/sh -c 'pkill -f "unified_proxy.py" || true'
-ExecStartPre=-/bin/sh -c 'nohup ${VENV_DIR}/bin/python3 ${LITELLM_DIR}/unified_proxy.py > ${LITELLM_DIR}/unified_proxy.log 2>&1 &'
 ExecStart=${VENV_DIR}/bin/python3 -m litellm.proxy.proxy_cli --config ${LITELLM_CONFIG} --host ${LITELLM_HOST} --port ${LITELLM_PORT}
 Restart=always
 RestartSec=5s
@@ -1102,23 +1151,14 @@ export DATABASE_URL="${DATABASE_URL}"
 export STORE_MODEL_IN_DB="True"
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="${LITELLM_DIR}:\${PYTHONPATH:-}"
-export MBP_COOLDOWN_SECONDS="${MBP_COOLDOWN_SECONDS}"
-export WATCHDOG_SSH_USER="${WATCHDOG_SSH_USER}"
-export WATCHDOG_COOLDOWN_SECONDS="${WATCHDOG_COOLDOWN_SECONDS}"
-export WATCHDOG_PROBE_TIMEOUT="${WATCHDOG_PROBE_TIMEOUT}"
-export WATCHDOG_RECOVERY_TIMEOUT="${WATCHDOG_RECOVERY_TIMEOUT}"
 export MBP_HOSTNAME="${NODE_MBP_HOSTNAME}"
 export PATH="${VENV_DIR}/bin:\$PATH"
-
-# Start the unified proxy
-nohup ${VENV_DIR}/bin/python3 ${LITELLM_DIR}/unified_proxy.py > ${LITELLM_DIR}/unified_proxy.log 2>&1 &
 
 exec ${VENV_DIR}/bin/python3 -m litellm.proxy.proxy_cli --config ${LITELLM_CONFIG} --host ${LITELLM_HOST} --port ${LITELLM_PORT}
 EOF
     chmod +x /usr/local/bin/start-litellm
 
     # Kill previous instances if restarting
-    pkill -f "unified_proxy.py" || true
     pkill -f "litellm.*--config" || true
     sleep 1
 
