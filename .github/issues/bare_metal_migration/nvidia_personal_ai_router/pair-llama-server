@@ -544,7 +544,7 @@ start_multi_server() {
         --bind "${BIND_HOST}" \
         --port "${PORT}" \
         --backends "${backends_joined}" \
-        --pid-file "${pid_file}" &
+        --pid-file "${pid_file}" </dev/null >>"${pid_dir}/pair-multiplexer-${PORT}.log" 2>&1 &
 
     sleep 1.0
 

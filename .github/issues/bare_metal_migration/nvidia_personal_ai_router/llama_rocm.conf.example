@@ -35,7 +35,7 @@ MODELS=(
 # -----------------------------------------------------------------------------
 # Advanced Hardware & Inference Tuning (Ported from ai-toolbox-cockpit)
 # -----------------------------------------------------------------------------
-# LLAMA_IMAGE="docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-10.0-qwen-3.8-flash-next"
+# LLAMA_IMAGE="docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-10.0-rocmfpx"
 # CONTEXT_SIZE=262144
 # GPU_LAYERS=999
 # LOAD_MODE="dio"          # Direct I/O (dio) bypasses Linux page cache
