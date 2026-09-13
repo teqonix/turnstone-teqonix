@@ -135,6 +135,7 @@ def get_merged_models() -> dict:
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
+    allow_reuse_address = True
 
 
 class MultiplexerHandler(BaseHTTPRequestHandler):

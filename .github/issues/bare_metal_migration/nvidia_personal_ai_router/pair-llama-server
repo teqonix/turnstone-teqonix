@@ -529,6 +529,15 @@ start_multi_server() {
         fi
         rm -f "${pid_file}"
     fi
+    pkill -f "pair_model_multiplexer.*--port ${PORT}" 2>/dev/null || true
+    local port_pids
+    port_pids="$(ss -tulpn "sport = :${PORT}" 2>/dev/null | grep -o 'pid=[0-9]*' | cut -d= -f2 || true)"
+    if [ -n "${port_pids}" ]; then
+        for p in ${port_pids}; do
+            kill -9 "${p}" 2>/dev/null || true
+        done
+        sleep 0.5
+    fi
 
     echo "[INFO] Launching PAIR Model Multiplexer on port ${PORT} (routing to: ${backends_joined})..."
     python3 "${multiplexer_bin}" \
@@ -587,6 +596,14 @@ stop_server() {
         rm -f "${pid_file}"
     fi
     pkill -f "pair_model_multiplexer.*--port ${PORT}" 2>/dev/null || true
+    local port_pids
+    port_pids="$(ss -tulpn "sport = :${PORT}" 2>/dev/null | grep -o 'pid=[0-9]*' | cut -d= -f2 || true)"
+    if [ -n "${port_pids}" ]; then
+        for p in ${port_pids}; do
+            kill -9 "${p}" 2>/dev/null || true
+        done
+        sleep 0.5
+    fi
 
     # 2. Stop container instances
     if [ "${engine}" != "none" ]; then
