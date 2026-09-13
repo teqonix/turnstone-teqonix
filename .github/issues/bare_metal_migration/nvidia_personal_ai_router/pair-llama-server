@@ -37,14 +37,33 @@ EXTRA_ARGS="${EXTRA_ARGS:-}"
 find_models_dir() {
     local candidates=(
         "${MODELS_DIR:-}"
+        "/models"
+        "/models/shared"
         "/home/turnstone/silo-14/ai-playground/models"
         "/home/turnstone/silo-14/ai-playground"
         "/mnt/silo-14/ai-playground/models"
         "/mnt/silo-14/ai-playground"
+        "/mnt/ai-playground/models"
+        "/mnt/ai-playground"
         "/home/teqonix/silo-14/ai-playground/models"
-        "/models"
+        "/home/teqonix/silo-14/ai-playground"
+        "/home/turnstone/.cache/lm-studio/models"
+        "/home/teqonix/.cache/lm-studio/models"
+        "${HOME}/.cache/lm-studio/models"
+        "/home/turnstone/models"
+        "/home/teqonix/models"
         "${HOME}/models"
     )
+    # First pass: find a directory that actually contains .gguf files
+    for dir in "${candidates[@]}"; do
+        if [ -n "${dir}" ] && [ -d "${dir}" ] && [ -r "${dir}" ]; then
+            if find "${dir}" -maxdepth 6 -type f -iname "*.gguf" ! -iname "*mtp*" 2>/dev/null | grep -q .; then
+                echo "${dir}"
+                return 0
+            fi
+        fi
+    done
+    # Second pass: return first existing directory
     for dir in "${candidates[@]}"; do
         if [ -n "${dir}" ] && [ -d "${dir}" ]; then
             echo "${dir}"
@@ -63,16 +82,23 @@ find_model_file() {
         return 0
     fi
     if [ -d "${RESOLVED_MODELS_DIR}" ]; then
-        # Priority 1: Qwen 3.8 / Flash Next GGUF
+        # Priority 1: Qwen / Flash Next GGUF
         local qwen_candidate
-        qwen_candidate="$(find "${RESOLVED_MODELS_DIR}" -maxdepth 3 -type f -iname "*qwen*.gguf" ! -iname "*mtp*" | head -n 1 || true)"
+        qwen_candidate="$(find "${RESOLVED_MODELS_DIR}" -maxdepth 6 -type f -iname "*qwen*.gguf" ! -iname "*mtp*" 2>/dev/null | head -n 1 || true)"
         if [ -n "${qwen_candidate}" ]; then
             echo "${qwen_candidate}"
             return 0
         fi
-        # Priority 2: Any GGUF (excluding MTP sidecars)
+        # Priority 2: DeepSeek GGUF
+        local ds_candidate
+        ds_candidate="$(find "${RESOLVED_MODELS_DIR}" -maxdepth 6 -type f -iname "*deepseek*.gguf" ! -iname "*mtp*" 2>/dev/null | head -n 1 || true)"
+        if [ -n "${ds_candidate}" ]; then
+            echo "${ds_candidate}"
+            return 0
+        fi
+        # Priority 3: Any GGUF (excluding MTP sidecars)
         local any_gguf
-        any_gguf="$(find "${RESOLVED_MODELS_DIR}" -maxdepth 3 -type f -iname "*.gguf" ! -iname "*mtp*" | head -n 1 || true)"
+        any_gguf="$(find "${RESOLVED_MODELS_DIR}" -maxdepth 6 -type f -iname "*.gguf" ! -iname "*mtp*" 2>/dev/null | head -n 1 || true)"
         if [ -n "${any_gguf}" ]; then
             echo "${any_gguf}"
             return 0
@@ -89,7 +115,7 @@ find_mtp_draft() {
     fi
     if [ -d "${RESOLVED_MODELS_DIR}" ]; then
         local mtp_candidate
-        mtp_candidate="$(find "${RESOLVED_MODELS_DIR}" -maxdepth 3 -type f -iname "*mtp*.gguf" | head -n 1 || true)"
+        mtp_candidate="$(find "${RESOLVED_MODELS_DIR}" -maxdepth 6 -type f -iname "*mtp*.gguf" 2>/dev/null | head -n 1 || true)"
         if [ -n "${mtp_candidate}" ]; then
             echo "${mtp_candidate}"
             return 0
@@ -117,22 +143,24 @@ start_server() {
         exit 1
     fi
 
+    local c_name="${CONTAINER_NAME:-pair-llama-engine-${PORT}}"
+
     # Check if container is already running and answering health checks
-    if "${engine}" ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+    if "${engine}" ps --format '{{.Names}}' | grep -qE "^(${c_name}|pair-llama-engine)$"; then
         if curl -sf "http://127.0.0.1:${PORT}/v1/models" &>/dev/null; then
-            echo "[INFO] Container '${CONTAINER_NAME}' is already running and healthy on port ${PORT}."
+            echo "[INFO] Container '${c_name}' is already running and healthy on port ${PORT}."
             exit 0
         fi
-        echo "[WARN] Container '${CONTAINER_NAME}' is running but unresponsive. Recreating..."
-        "${engine}" rm -f "${CONTAINER_NAME}" &>/dev/null || true
+        echo "[WARN] Container '${c_name}' is running but unresponsive. Recreating..."
+        "${engine}" rm -f "${c_name}" "pair-llama-engine" &>/dev/null || true
     else
-        "${engine}" rm -f "${CONTAINER_NAME}" &>/dev/null || true
+        "${engine}" rm -f "${c_name}" "pair-llama-engine" &>/dev/null || true
     fi
 
     local target_model
     target_model="$(find_model_file)"
     if [ -z "${target_model}" ]; then
-        echo "[WARN] No GGUF model found in '${RESOLVED_MODELS_DIR}'. Llama-server will start in model management mode."
+        echo "[WARN] No explicit GGUF model found in '${RESOLVED_MODELS_DIR}'. Starting llama-server with --models-path /models."
     else
         echo "[INFO] Selected target model: ${target_model}"
     fi
@@ -144,7 +172,7 @@ start_server() {
     # Build container engine run arguments
     local engine_args=(
         "run" "-d"
-        "--name" "${CONTAINER_NAME}"
+        "--name" "${c_name}"
         "--restart" "always"
         "-p" "${PORT}:${PORT}"
     )
@@ -178,6 +206,9 @@ start_server() {
     # Mount models directory
     if [ -d "${RESOLVED_MODELS_DIR}" ]; then
         engine_args+=("-v" "${RESOLVED_MODELS_DIR}:/models:ro")
+    else
+        # Ensure dummy /models exists so volume mount or directory exists
+        engine_args+=("-v" "/tmp:/models:ro")
     fi
 
     if [ "${engine}" = "podman" ]; then
@@ -206,6 +237,8 @@ start_server() {
         local rel_model
         rel_model="$(realpath --relative-to="${RESOLVED_MODELS_DIR}" "${target_model}" 2>/dev/null || basename "${target_model}")"
         server_cmd+=("-m" "/models/${rel_model}")
+    else
+        server_cmd+=("--models-path" "/models")
     fi
 
     if [ -n "${mtp_draft}" ]; then
@@ -219,35 +252,33 @@ start_server() {
         server_cmd+=(${EXTRA_ARGS})
     fi
 
-    echo "[INFO] Launching ROCm 10.0 llama-server container..."
+    echo "[INFO] Launching ROCm 10.0 llama-server container '${c_name}'..."
     "${engine}" "${engine_args[@]}" "${server_cmd[@]}"
 
-    # Wait for readiness
-    echo "[INFO] Waiting for llama-server endpoint (http://127.0.0.1:${PORT}/v1/models)..."
-    local ready=false
-    for _ in {1..30}; do
-        if curl -sf "http://127.0.0.1:${PORT}/v1/models" &>/dev/null || curl -sf "http://127.0.0.1:${PORT}/health" &>/dev/null; then
-            ready=true
-            break
-        fi
-        sleep 1
-    done
-
-    if [ "${ready}" = true ]; then
-        echo "[SUCCESS] ROCm 10.0 llama-server is online and answering on port ${PORT}!"
-    else
-        echo "[WARN] Server launched; health check pending (initial weight load may take up to 60s)."
+    # Quick 1.5-second check: verify container didn't crash immediately on launch
+    sleep 1.5
+    if ! "${engine}" ps --format '{{.Names}}' | grep -q "^${c_name}$"; then
+        echo "[ERROR] Container '${c_name}' failed to start or crashed on launch." >&2
+        echo "=== Container Logs ===" >&2
+        "${engine}" logs --tail 30 "${c_name}" 2>&1 >&2 || true
+        exit 1
     fi
+
+    # Exit 0 immediately: PAIR's engine manager handles readiness polling via manifest 'ready' config (timeout_s: 60)
+    echo "[SUCCESS] ROCm 10.0 llama-server container '${c_name}' is running."
+    echo "[INFO] PAIR engine manager is monitoring readiness on http://127.0.0.1:${PORT}/v1/models."
+    exit 0
 }
 
 stop_server() {
     local engine
     engine="$(detect_engine)"
+    local c_name="${CONTAINER_NAME:-pair-llama-engine-${PORT}}"
     if [ "${engine}" != "none" ]; then
-        echo "[INFO] Stopping container '${CONTAINER_NAME}'..."
-        "${engine}" stop "${CONTAINER_NAME}" &>/dev/null || true
-        "${engine}" rm -f "${CONTAINER_NAME}" &>/dev/null || true
-        echo "[SUCCESS] Container '${CONTAINER_NAME}' stopped."
+        echo "[INFO] Stopping container '${c_name}'..."
+        "${engine}" stop "${c_name}" "pair-llama-engine" &>/dev/null || true
+        "${engine}" rm -f "${c_name}" "pair-llama-engine" &>/dev/null || true
+        echo "[SUCCESS] Container '${c_name}' stopped."
     fi
 }
 

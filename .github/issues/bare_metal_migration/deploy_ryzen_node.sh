@@ -581,6 +581,15 @@ if [ "${SKIP_NFS}" != "true" ]; then
         log_success "NFS storage successfully mounted at ${MOUNT_POINT}."
         if id "turnstone" &>/dev/null; then
             chown -R turnstone:turnstone "${MOUNT_POINT}" 2>/dev/null || true
+            chmod a+rx /home/turnstone 2>/dev/null || true
+        fi
+        # Create convenient system-wide /models link for container engines and PAIR runner
+        mkdir -p /models /etc/turnstone
+        chmod 755 /etc/turnstone 2>/dev/null || true
+        if [ -d "${MOUNT_POINT}/models" ]; then
+            ln -sfn "${MOUNT_POINT}/models" /models/shared 2>/dev/null || true
+        else
+            ln -sfn "${MOUNT_POINT}" /models/shared 2>/dev/null || true
         fi
     else
         log_warn "NFS share could not be mounted at ${MOUNT_POINT} during deployment. It will mount automatically at boot via /etc/fstab."
