@@ -84,21 +84,21 @@ find_model_file() {
     if [ -d "${RESOLVED_MODELS_DIR}" ]; then
         # Priority 1: Qwen / Flash Next GGUF
         local qwen_candidate
-        qwen_candidate="$(find "${RESOLVED_MODELS_DIR}" -maxdepth 6 -type f -iname "*qwen*.gguf" ! -iname "*mtp*" 2>/dev/null | head -n 1 || true)"
+        qwen_candidate="$(find "${RESOLVED_MODELS_DIR}" -maxdepth 6 -type f -iname "*qwen*.gguf" ! -iname "*mtp*" 2>/dev/null | sort | head -n 1 || true)"
         if [ -n "${qwen_candidate}" ]; then
             echo "${qwen_candidate}"
             return 0
         fi
         # Priority 2: DeepSeek GGUF
         local ds_candidate
-        ds_candidate="$(find "${RESOLVED_MODELS_DIR}" -maxdepth 6 -type f -iname "*deepseek*.gguf" ! -iname "*mtp*" 2>/dev/null | head -n 1 || true)"
+        ds_candidate="$(find "${RESOLVED_MODELS_DIR}" -maxdepth 6 -type f -iname "*deepseek*.gguf" ! -iname "*mtp*" 2>/dev/null | sort | head -n 1 || true)"
         if [ -n "${ds_candidate}" ]; then
             echo "${ds_candidate}"
             return 0
         fi
         # Priority 3: Any GGUF (excluding MTP sidecars)
         local any_gguf
-        any_gguf="$(find "${RESOLVED_MODELS_DIR}" -maxdepth 6 -type f -iname "*.gguf" ! -iname "*mtp*" 2>/dev/null | head -n 1 || true)"
+        any_gguf="$(find "${RESOLVED_MODELS_DIR}" -maxdepth 6 -type f -iname "*.gguf" ! -iname "*mtp*" 2>/dev/null | sort | head -n 1 || true)"
         if [ -n "${any_gguf}" ]; then
             echo "${any_gguf}"
             return 0
