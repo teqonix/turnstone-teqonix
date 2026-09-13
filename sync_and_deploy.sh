@@ -1,0 +1,1 @@
+.github/issues/bare_metal_migration/sync_and_deploy.sh
