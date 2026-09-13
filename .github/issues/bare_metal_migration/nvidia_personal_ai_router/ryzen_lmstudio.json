@@ -1,0 +1,84 @@
+{
+  "engine": "lmstudio",
+  "display_name": "LM Studio",
+  "manifest_version": 1,
+  "platforms": {
+    "linux/amd64": {
+      "detect": [
+        "/usr/local/bin/pair-llama-server",
+        "/usr/local/bin/lms",
+        "~/.lmstudio/bin/lms"
+      ],
+      "install": {
+        "run": [
+          "echo",
+          "LM Studio ROCm engine is pre-installed via pair-llama-server"
+        ],
+        "mode": "user"
+      },
+      "uninstall": {
+        "run": [
+          "/usr/local/bin/pair-llama-server",
+          "stop"
+        ]
+      },
+      "runtime": {
+        "mode": "command",
+        "port": 1235,
+        "bind": "0.0.0.0",
+        "start": [
+          [
+            "/usr/local/bin/pair-llama-server",
+            "server",
+            "start",
+            "--port",
+            "{port}",
+            "--bind",
+            "{host}"
+          ]
+        ],
+        "stop": {
+          "cmd": [
+            "/usr/local/bin/pair-llama-server",
+            "server",
+            "stop"
+          ]
+        },
+        "ready": {
+          "http": "http://127.0.0.1:{port}/v1/models",
+          "status": 200,
+          "timeout_s": 60
+        },
+        "health": {
+          "http": "http://127.0.0.1:{port}/v1/models",
+          "status": 200,
+          "interval_s": 10
+        }
+      }
+    }
+  },
+  "actions": {
+    "list_models": {
+      "description": "List models installed on this engine.",
+      "http": {
+        "method": "GET",
+        "path": "/v1/models"
+      },
+      "result": {
+        "array": "data",
+        "field": "id"
+      }
+    },
+    "loaded_models": {
+      "description": "List models currently loaded in memory.",
+      "http": {
+        "method": "GET",
+        "path": "/v1/models"
+      },
+      "result": {
+        "array": "data",
+        "field": "id"
+      }
+    }
+  }
+}

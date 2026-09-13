@@ -1,0 +1,327 @@
+#!/usr/bin/env bash
+# =============================================================================
+# PAIR Llama ROCm 10.0 Engine Runner (AI Toolbox Cockpit Strix Halo Port)
+#
+# Acts as a high-performance, drop-in inference engine wrapper for NVIDIA PAIR
+# (emulating LM Studio's 'lms server' CLI or running as a direct service).
+# Launches a containerized llama-server from kyuz0/amd-strix-halo-toolboxes
+# built with ROCm 10.0, Direct I/O (dio), calibrated ubatches, and MTP.
+# =============================================================================
+
+set -euo pipefail
+
+CONTAINER_NAME="${CONTAINER_NAME:-pair-llama-engine}"
+CONFIG_FILE="${CONFIG_FILE:-/etc/turnstone/llama_rocm.conf}"
+
+# Source optional override configuration if present
+if [ -f "${CONFIG_FILE}" ]; then
+    # shellcheck disable=SC1090
+    source "${CONFIG_FILE}"
+fi
+
+DEFAULT_IMAGE="docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-10.0-qwen-3.8-flash-next"
+LLAMA_IMAGE="${LLAMA_IMAGE:-${DEFAULT_IMAGE}}"
+PORT="${PORT:-1235}"
+BIND_HOST="${BIND_HOST:-0.0.0.0}"
+CONTEXT_SIZE="${CONTEXT_SIZE:-262144}"
+GPU_LAYERS="${GPU_LAYERS:-999}"
+LOAD_MODE="${LOAD_MODE:-dio}"
+BATCH_SIZE="${BATCH_SIZE:-2048}"
+UBATCH_SIZE="${UBATCH_SIZE:-2048}"
+KV_CACHE_TYPE="${KV_CACHE_TYPE:-q8_0}"
+USE_FLASH_ATTN="${USE_FLASH_ATTN:-1}"
+PARALLEL_SEQUENCES="${PARALLEL_SEQUENCES:-1}"
+EXTRA_ARGS="${EXTRA_ARGS:-}"
+
+# Auto-discover models directory
+find_models_dir() {
+    local candidates=(
+        "${MODELS_DIR:-}"
+        "/home/turnstone/silo-14/ai-playground/models"
+        "/home/turnstone/silo-14/ai-playground"
+        "/mnt/silo-14/ai-playground/models"
+        "/mnt/silo-14/ai-playground"
+        "/home/teqonix/silo-14/ai-playground/models"
+        "/models"
+        "${HOME}/models"
+    )
+    for dir in "${candidates[@]}"; do
+        if [ -n "${dir}" ] && [ -d "${dir}" ]; then
+            echo "${dir}"
+            return 0
+        fi
+    done
+    echo "/models"
+}
+
+RESOLVED_MODELS_DIR="$(find_models_dir)"
+
+# Auto-discover target model if not explicitly specified
+find_model_file() {
+    if [ -n "${LLAMA_MODEL_PATH:-}" ] && [ -f "${LLAMA_MODEL_PATH}" ]; then
+        echo "${LLAMA_MODEL_PATH}"
+        return 0
+    fi
+    if [ -d "${RESOLVED_MODELS_DIR}" ]; then
+        # Priority 1: Qwen 3.8 / Flash Next GGUF
+        local qwen_candidate
+        qwen_candidate="$(find "${RESOLVED_MODELS_DIR}" -maxdepth 3 -type f -iname "*qwen*.gguf" ! -iname "*mtp*" | head -n 1 || true)"
+        if [ -n "${qwen_candidate}" ]; then
+            echo "${qwen_candidate}"
+            return 0
+        fi
+        # Priority 2: Any GGUF (excluding MTP sidecars)
+        local any_gguf
+        any_gguf="$(find "${RESOLVED_MODELS_DIR}" -maxdepth 3 -type f -iname "*.gguf" ! -iname "*mtp*" | head -n 1 || true)"
+        if [ -n "${any_gguf}" ]; then
+            echo "${any_gguf}"
+            return 0
+        fi
+    fi
+    echo ""
+}
+
+# Auto-discover MTP draft model sidecar
+find_mtp_draft() {
+    if [ -n "${MTP_DRAFT_PATH:-}" ] && [ -f "${MTP_DRAFT_PATH}" ]; then
+        echo "${MTP_DRAFT_PATH}"
+        return 0
+    fi
+    if [ -d "${RESOLVED_MODELS_DIR}" ]; then
+        local mtp_candidate
+        mtp_candidate="$(find "${RESOLVED_MODELS_DIR}" -maxdepth 3 -type f -iname "*mtp*.gguf" | head -n 1 || true)"
+        if [ -n "${mtp_candidate}" ]; then
+            echo "${mtp_candidate}"
+            return 0
+        fi
+    fi
+    echo ""
+}
+
+# Detect container runtime engine
+detect_engine() {
+    if command -v podman &>/dev/null; then
+        echo "podman"
+    elif command -v docker &>/dev/null; then
+        echo "docker"
+    else
+        echo "none"
+    fi
+}
+
+start_server() {
+    local engine
+    engine="$(detect_engine)"
+    if [ "${engine}" = "none" ]; then
+        echo "[ERROR] Neither podman nor docker is installed. Cannot launch container." >&2
+        exit 1
+    fi
+
+    # Check if container is already running and answering health checks
+    if "${engine}" ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+        if curl -sf "http://127.0.0.1:${PORT}/v1/models" &>/dev/null; then
+            echo "[INFO] Container '${CONTAINER_NAME}' is already running and healthy on port ${PORT}."
+            exit 0
+        fi
+        echo "[WARN] Container '${CONTAINER_NAME}' is running but unresponsive. Recreating..."
+        "${engine}" rm -f "${CONTAINER_NAME}" &>/dev/null || true
+    else
+        "${engine}" rm -f "${CONTAINER_NAME}" &>/dev/null || true
+    fi
+
+    local target_model
+    target_model="$(find_model_file)"
+    if [ -z "${target_model}" ]; then
+        echo "[WARN] No GGUF model found in '${RESOLVED_MODELS_DIR}'. Llama-server will start in model management mode."
+    else
+        echo "[INFO] Selected target model: ${target_model}"
+    fi
+
+    local mtp_draft
+    mtp_draft="$(find_mtp_draft)"
+    [ -n "${mtp_draft}" ] && echo "[INFO] Selected MTP sidecar: ${mtp_draft}"
+
+    # Build container engine run arguments
+    local engine_args=(
+        "run" "-d"
+        "--name" "${CONTAINER_NAME}"
+        "--restart" "always"
+        "-p" "${PORT}:${PORT}"
+    )
+
+    # Hardware devices (ROCm / KFD / DRI)
+    if [ -e "/dev/kfd" ]; then
+        engine_args+=("--device" "/dev/kfd")
+    fi
+    if [ -d "/dev/dri" ]; then
+        engine_args+=("--device" "/dev/dri")
+    fi
+    engine_args+=(
+        "--group-add" "video"
+        "--group-add" "render"
+        "--security-opt" "seccomp=unconfined"
+    )
+
+    # RDMA / Infiniband support if available
+    if [ -d "/dev/infiniband" ]; then
+        engine_args+=("--device" "/dev/infiniband" "--group-add" "rdma" "--ulimit" "memlock=-1")
+    fi
+
+    # Strix Halo ROCm 10.0 / HIP Environment flags
+    engine_args+=(
+        "-e" "ROCBLAS_USE_HIPBLASLT=1"
+        "-e" "HSA_OVERRIDE_GFX_VERSION=11.5.1"
+        "-e" "GGML_HIP_ENABLE_UNIFIED_MEMORY=1"
+        "-e" "HSA_ENABLE_SDMA=0"
+    )
+
+    # Mount models directory
+    if [ -d "${RESOLVED_MODELS_DIR}" ]; then
+        engine_args+=("-v" "${RESOLVED_MODELS_DIR}:/models:ro")
+    fi
+
+    if [ "${engine}" = "podman" ]; then
+        engine_args+=("--security-opt" "label=disable")
+    fi
+
+    engine_args+=("${LLAMA_IMAGE}")
+
+    # Build inner llama-server command
+    local server_cmd=(
+        "llama-server"
+        "--host" "${BIND_HOST}"
+        "--port" "${PORT}"
+        "-c" "${CONTEXT_SIZE}"
+        "-ngl" "${GPU_LAYERS}"
+        "-fa" "${USE_FLASH_ATTN}"
+        "--load-mode" "${LOAD_MODE}"
+        "-b" "${BATCH_SIZE}"
+        "-ub" "${UBATCH_SIZE}"
+        "-np" "${PARALLEL_SEQUENCES}"
+        "--cache-type-k" "${KV_CACHE_TYPE}"
+        "--cache-type-v" "${KV_CACHE_TYPE}"
+    )
+
+    if [ -n "${target_model}" ]; then
+        local rel_model
+        rel_model="$(realpath --relative-to="${RESOLVED_MODELS_DIR}" "${target_model}" 2>/dev/null || basename "${target_model}")"
+        server_cmd+=("-m" "/models/${rel_model}")
+    fi
+
+    if [ -n "${mtp_draft}" ]; then
+        local rel_mtp
+        rel_mtp="$(realpath --relative-to="${RESOLVED_MODELS_DIR}" "${mtp_draft}" 2>/dev/null || basename "${mtp_draft}")"
+        server_cmd+=("--model-draft" "/models/${rel_mtp}" "--spec-draft-p-min" "0.75")
+    fi
+
+    if [ -n "${EXTRA_ARGS}" ]; then
+        # shellcheck disable=SC2086
+        server_cmd+=(${EXTRA_ARGS})
+    fi
+
+    echo "[INFO] Launching ROCm 10.0 llama-server container..."
+    "${engine}" "${engine_args[@]}" "${server_cmd[@]}"
+
+    # Wait for readiness
+    echo "[INFO] Waiting for llama-server endpoint (http://127.0.0.1:${PORT}/v1/models)..."
+    local ready=false
+    for _ in {1..30}; do
+        if curl -sf "http://127.0.0.1:${PORT}/v1/models" &>/dev/null || curl -sf "http://127.0.0.1:${PORT}/health" &>/dev/null; then
+            ready=true
+            break
+        fi
+        sleep 1
+    done
+
+    if [ "${ready}" = true ]; then
+        echo "[SUCCESS] ROCm 10.0 llama-server is online and answering on port ${PORT}!"
+    else
+        echo "[WARN] Server launched; health check pending (initial weight load may take up to 60s)."
+    fi
+}
+
+stop_server() {
+    local engine
+    engine="$(detect_engine)"
+    if [ "${engine}" != "none" ]; then
+        echo "[INFO] Stopping container '${CONTAINER_NAME}'..."
+        "${engine}" stop "${CONTAINER_NAME}" &>/dev/null || true
+        "${engine}" rm -f "${CONTAINER_NAME}" &>/dev/null || true
+        echo "[SUCCESS] Container '${CONTAINER_NAME}' stopped."
+    fi
+}
+
+status_server() {
+    if curl -sf "http://127.0.0.1:${PORT}/v1/models"; then
+        echo ""
+        exit 0
+    fi
+    echo "[ERROR] Server is not responding on port ${PORT}." >&2
+    exit 1
+}
+
+# Command Line Argument Dispatch (supports LM Studio 'lms server start/stop', direct 'start/stop', and help/version)
+COMMAND="${1:-status}"
+if [ "${COMMAND}" = "-h" ] || [ "${COMMAND}" = "--help" ] || [ "${COMMAND}" = "help" ]; then
+    echo "Usage: $0 [server start|server stop|start|stop|status] [OPTIONS]"
+    echo ""
+    echo "Options:"
+    echo "  --port, -p <port>       Set listen port [default: ${PORT}]"
+    echo "  --bind, -b <host>       Set bind host [default: ${BIND_HOST}]"
+    echo "  --model, -m <path>      Specify explicit GGUF model path"
+    echo "  -h, --help              Show this help message"
+    echo "  -v, --version           Show version information"
+    exit 0
+fi
+
+shift || true
+
+# Parse LM Studio subcommand structure (e.g. 'server start --port 1235' or 'lms ps')
+if [ "${COMMAND}" = "server" ]; then
+    COMMAND="${1:-start}"
+    shift || true
+fi
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --port|-p)
+            PORT="$2"
+            shift 2
+            ;;
+        --bind|-b)
+            BIND_HOST="$2"
+            shift 2
+            ;;
+        --model|-m)
+            LLAMA_MODEL_PATH="$2"
+            shift 2
+            ;;
+        -h|--help|help)
+            echo "Usage: $0 [server start|server stop|start|stop|status] [OPTIONS]"
+            exit 0
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+
+case "${COMMAND}" in
+    start)
+        start_server
+        ;;
+    stop)
+        stop_server
+        ;;
+    status|ps|loaded)
+        status_server
+        ;;
+    version|--version|-v)
+        echo "PAIR Llama ROCm Engine Wrapper 1.0 (ai-toolbox-cockpit optimizations)"
+        exit 0
+        ;;
+    *)
+        echo "Unknown command: ${COMMAND}. Valid options: start, stop, status." >&2
+        exit 1
+        ;;
+esac

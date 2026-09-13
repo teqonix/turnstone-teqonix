@@ -3,6 +3,8 @@ nvidia_personal_ai_router:
     - type: "ryzen"
       hosts: ["amd-ai-core-one.lan", "amd-ai-core-two.lan"]
       config_files:
+        - name: "ryzen_lmstudio.json"
+          nv_pair_path: "services/nvpair-engine-manager/manifests/lmstudio.json"
         - name: "ryzen_ollama.json"
           nv_pair_path: "services/nvpair-engine-manager/manifests/ryzen_ollama.json"
     - type: "macos"

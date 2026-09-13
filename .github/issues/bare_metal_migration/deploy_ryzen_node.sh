@@ -30,8 +30,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." 2>/dev/null && pwd || pwd)"
 
 # Configuration & Defaults
-LEMONADE_URL="${LEMONADE_URL:-http://127.0.0.1:8000/v1}"
+PAIR_ENGINE="${PAIR_ENGINE:-lmstudio}"
+PAIR_LMSTUDIO_URL="${PAIR_LMSTUDIO_URL:-http://127.0.0.1:1235/v1}"
 PAIR_OLLAMA_URL="${PAIR_OLLAMA_URL:-http://127.0.0.1:11434/v1}"
+LEMONADE_URL="${LEMONADE_URL:-http://127.0.0.1:8000/v1}"
 SKIP_RYZENADJ="${SKIP_RYZENADJ:-false}"
 SKIP_PAIR="${SKIP_PAIR:-false}"
 SKIP_TMUX_DAEMON="${SKIP_TMUX_DAEMON:-false}"
@@ -66,11 +68,12 @@ auto_discover_nfs
 usage() {
     echo "Usage: $0 [OPTIONS]"
     echo ""
-    echo "LLM inference node deployment (NVIDIA Personal AI Router + Lemonade + RyzenAdj)."
+    echo "LLM inference node deployment (NVIDIA Personal AI Router + ROCm 10.0 Llama + RyzenAdj)."
     echo ""
     echo "Options:"
+    echo "      --engine <engine>          PAIR engine backend: 'lmstudio' (ROCm 10.0 llama drop-in), 'ollama', or 'both' [default: ${PAIR_ENGINE}]"
+    echo "      --pair-url <url>           Local PAIR API base URL [default: ${PAIR_LMSTUDIO_URL}]"
     echo "      --lemonade-url <url>       Local Lemonade API base URL [default: ${LEMONADE_URL}]"
-    echo "      --pair-url <url>           Local PAIR Ollama API base URL [default: ${PAIR_OLLAMA_URL}]"
     echo "      --skip-pair                Skip downloading/installing NVIDIA Personal AI Router"
     echo "      --skip-tmux-daemon         Skip configuring/enabling the nvpair.service tmux daemon"
     echo "      --skip-ryzenadj            Skip checking/installing ryzenadj / TDP service"
@@ -84,11 +87,16 @@ usage() {
 
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --engine|--pair-engine)
+            PAIR_ENGINE="$2"
+            shift 2
+            ;;
         --lemonade-url)
             LEMONADE_URL="$2"
             shift 2
             ;;
         --pair-url)
+            PAIR_LMSTUDIO_URL="$2"
             PAIR_OLLAMA_URL="$2"
             shift 2
             ;;
@@ -238,6 +246,48 @@ if [ "${SKIP_PAIR}" != "true" ]; then
         fi
     fi
 
+    # Ensure container engine (podman or docker) is available for ROCm 10.0 llama-server
+    if ! command -v podman &>/dev/null && ! command -v docker &>/dev/null; then
+        log_info "Installing podman container engine for llama.cpp ROCm runtime..."
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq podman || log_warn "podman installation returned non-zero."
+    fi
+
+    # Install pair-llama-server runner script
+    PAIR_RUNNER_SRC=""
+    CANDIDATE_RUNNERS=(
+        "${SCRIPT_DIR}/nvidia_personal_ai_router/pair-llama-server"
+        "${REPO_ROOT}/.github/issues/bare_metal_migration/nvidia_personal_ai_router/pair-llama-server"
+    )
+    for cand_run in "${CANDIDATE_RUNNERS[@]}"; do
+        if [ -f "${cand_run}" ]; then
+            PAIR_RUNNER_SRC="${cand_run}"
+            break
+        fi
+    done
+
+    if [ -n "${PAIR_RUNNER_SRC}" ]; then
+        log_info "Installing pair-llama-server from ${PAIR_RUNNER_SRC} to /usr/local/bin..."
+        cp -f "${PAIR_RUNNER_SRC}" "/usr/local/bin/pair-llama-server"
+        chmod 755 "/usr/local/bin/pair-llama-server"
+        ln -sf "/usr/local/bin/pair-llama-server" "/usr/bin/pair-llama-server"
+        ln -sf "/usr/local/bin/pair-llama-server" "/usr/local/bin/lms"
+        ln -sf "/usr/local/bin/pair-llama-server" "/usr/bin/lms"
+
+        # Create user ~/.lmstudio/bin/lms symlinks so PAIR detect check passes unconditionally
+        for u_home in "/home/teqonix" "/root"; do
+            if [ -d "${u_home}" ]; then
+                mkdir -p "${u_home}/.lmstudio/bin"
+                ln -sf "/usr/local/bin/pair-llama-server" "${u_home}/.lmstudio/bin/lms"
+                if [ "${u_home}" = "/home/teqonix" ] && id -u teqonix &>/dev/null; then
+                    chown -R teqonix:teqonix "${u_home}/.lmstudio" 2>/dev/null || true
+                fi
+            fi
+        done
+        log_success "pair-llama-server and LMS drop-in wrappers installed."
+    else
+        log_warn "pair-llama-server not found locally. Skipping runner copy."
+    fi
+
     # Ensure nvpair-tui is accessible on standard PATH
     if [ -x "/opt/PAIR/resources/cli-bin/nvpair-tui" ]; then
         ln -sf "/opt/PAIR/resources/cli-bin/nvpair-tui" "/usr/bin/nvpair-tui"
@@ -248,56 +298,107 @@ if [ "${SKIP_PAIR}" != "true" ]; then
         ln -sf "/opt/PAIR/resources/cli-bin/nvpair" "/usr/local/bin/nvpair"
     fi
 
-    # Step 4: Inject Custom PAIR Configurations (ROCm Ollama Manifest)
-    log_info "Step 4: Injecting custom PAIR manifest configurations (ROCm Ollama)..."
-    PAIR_MANIFEST_SRC=""
-    CANDIDATE_MANIFESTS=(
-        "${SCRIPT_DIR}/nvidia_personal_ai_router/ryzen_ollama.json"
-        "${REPO_ROOT}/.github/issues/bare_metal_migration/nvidia_personal_ai_router/ryzen_ollama.json"
-    )
-    for cand in "${CANDIDATE_MANIFESTS[@]}"; do
-        if [ -f "${cand}" ]; then
-            PAIR_MANIFEST_SRC="${cand}"
-            break
-        fi
-    done
+    # Step 4: Inject Custom PAIR Configurations
+    log_info "Step 4: Injecting custom PAIR manifest configurations (Engine: ${PAIR_ENGINE})..."
 
-    if [ -z "${PAIR_MANIFEST_SRC}" ]; then
-        log_info "Fetching ryzen_ollama.json at runtime from remote repository..."
-        REMOTE_MANIFEST_URL="https://raw.githubusercontent.com/teqonix/turnstone-teqonix/main/.github/issues/bare_metal_migration/nvidia_personal_ai_router/ryzen_ollama.json"
-        TMP_MANIFEST="/tmp/ryzen_ollama.json"
-        if curl -sSfL "${REMOTE_MANIFEST_URL}" -o "${TMP_MANIFEST}" 2>/dev/null; then
-            PAIR_MANIFEST_SRC="${TMP_MANIFEST}"
-            log_success "Downloaded ryzen_ollama.json from remote."
+    # 4a. LM Studio drop-in manifest (ROCm 10.0 Llama)
+    if [ "${PAIR_ENGINE}" = "lmstudio" ] || [ "${PAIR_ENGINE}" = "both" ]; then
+        LMS_MANIFEST_SRC=""
+        CANDIDATE_LMS_MANIFESTS=(
+            "${SCRIPT_DIR}/nvidia_personal_ai_router/ryzen_lmstudio.json"
+            "${REPO_ROOT}/.github/issues/bare_metal_migration/nvidia_personal_ai_router/ryzen_lmstudio.json"
+        )
+        for cand in "${CANDIDATE_LMS_MANIFESTS[@]}"; do
+            if [ -f "${cand}" ]; then
+                LMS_MANIFEST_SRC="${cand}"
+                break
+            fi
+        done
+
+        if [ -z "${LMS_MANIFEST_SRC}" ]; then
+            log_info "Fetching ryzen_lmstudio.json at runtime from remote repository..."
+            REMOTE_LMS_URL="https://raw.githubusercontent.com/teqonix/turnstone-teqonix/main/.github/issues/bare_metal_migration/nvidia_personal_ai_router/ryzen_lmstudio.json"
+            TMP_LMS_MANIFEST="/tmp/ryzen_lmstudio.json"
+            if curl -sSfL "${REMOTE_LMS_URL}" -o "${TMP_LMS_MANIFEST}" 2>/dev/null; then
+                LMS_MANIFEST_SRC="${TMP_LMS_MANIFEST}"
+                log_success "Downloaded ryzen_lmstudio.json from remote."
+            fi
+        fi
+
+        if [ -n "${LMS_MANIFEST_SRC}" ]; then
+            log_info "Found ryzen_lmstudio.json at: ${LMS_MANIFEST_SRC}"
+            mkdir -p "/opt/PAIR/resources/services/nvpair-engine-manager/manifests"
+            cp -f "${LMS_MANIFEST_SRC}" "/opt/PAIR/resources/services/nvpair-engine-manager/manifests/lmstudio.json"
+
+            if [ -d "/opt/PAIR/resources/cli-bin" ]; then
+                mkdir -p "/opt/PAIR/resources/cli-bin/manifests"
+                cp -f "${LMS_MANIFEST_SRC}" "/opt/PAIR/resources/cli-bin/manifests/lmstudio.json"
+            fi
+
+            for u_home in "/home/teqonix" "/root"; do
+                if [ -d "${u_home}" ]; then
+                    u_dir="${u_home}/.config/Nvidia Corporation/Personal AI Router/manifests"
+                    mkdir -p "${u_dir}"
+                    cp -f "${LMS_MANIFEST_SRC}" "${u_dir}/lmstudio.json"
+                    if [ "${u_home}" = "/home/teqonix" ] && id -u teqonix &>/dev/null; then
+                        chown -R teqonix:teqonix "${u_home}/.config"
+                    fi
+                    log_success "Injected LM Studio drop-in manifest to: ${u_dir}/lmstudio.json"
+                fi
+            done
+        else
+            log_warn "ryzen_lmstudio.json not found. Skipping LM Studio manifest injection."
         fi
     fi
 
-    if [ -n "${PAIR_MANIFEST_SRC}" ]; then
-        log_info "Found ryzen_ollama.json at: ${PAIR_MANIFEST_SRC}"
-        # 1. System service engine manager manifests
-        mkdir -p "/opt/PAIR/resources/services/nvpair-engine-manager/manifests"
-        cp -f "${PAIR_MANIFEST_SRC}" "/opt/PAIR/resources/services/nvpair-engine-manager/manifests/ryzen_ollama.json"
-
-        # 2. CLI bin manifests if present
-        if [ -d "/opt/PAIR/resources/cli-bin" ]; then
-            mkdir -p "/opt/PAIR/resources/cli-bin/manifests"
-            cp -f "${PAIR_MANIFEST_SRC}" "/opt/PAIR/resources/cli-bin/manifests/ryzen_ollama.json"
-        fi
-
-        # 3. User config manifests (teqonix and root)
-        for u_home in "/home/teqonix" "/root"; do
-            if [ -d "${u_home}" ]; then
-                u_dir="${u_home}/.config/Nvidia Corporation/Personal AI Router/manifests"
-                mkdir -p "${u_dir}"
-                cp -f "${PAIR_MANIFEST_SRC}" "${u_dir}/ryzen_ollama.json"
-                if [ "${u_home}" = "/home/teqonix" ] && id -u teqonix &>/dev/null; then
-                    chown -R teqonix:teqonix "${u_home}/.config"
-                fi
-                log_success "Injected manifest to: ${u_dir}/ryzen_ollama.json"
+    # 4b. Ollama manifest
+    if [ "${PAIR_ENGINE}" = "ollama" ] || [ "${PAIR_ENGINE}" = "both" ]; then
+        OLLAMA_MANIFEST_SRC=""
+        CANDIDATE_OLLAMA_MANIFESTS=(
+            "${SCRIPT_DIR}/nvidia_personal_ai_router/ryzen_ollama.json"
+            "${REPO_ROOT}/.github/issues/bare_metal_migration/nvidia_personal_ai_router/ryzen_ollama.json"
+        )
+        for cand in "${CANDIDATE_OLLAMA_MANIFESTS[@]}"; do
+            if [ -f "${cand}" ]; then
+                OLLAMA_MANIFEST_SRC="${cand}"
+                break
             fi
         done
-    else
-        log_warn "ryzen_ollama.json not found. Skipping manifest injection."
+
+        if [ -z "${OLLAMA_MANIFEST_SRC}" ]; then
+            log_info "Fetching ryzen_ollama.json at runtime from remote repository..."
+            REMOTE_OLLAMA_URL="https://raw.githubusercontent.com/teqonix/turnstone-teqonix/main/.github/issues/bare_metal_migration/nvidia_personal_ai_router/ryzen_ollama.json"
+            TMP_OLLAMA_MANIFEST="/tmp/ryzen_ollama.json"
+            if curl -sSfL "${REMOTE_OLLAMA_URL}" -o "${TMP_OLLAMA_MANIFEST}" 2>/dev/null; then
+                OLLAMA_MANIFEST_SRC="${TMP_OLLAMA_MANIFEST}"
+                log_success "Downloaded ryzen_ollama.json from remote."
+            fi
+        fi
+
+        if [ -n "${OLLAMA_MANIFEST_SRC}" ]; then
+            log_info "Found ryzen_ollama.json at: ${OLLAMA_MANIFEST_SRC}"
+            mkdir -p "/opt/PAIR/resources/services/nvpair-engine-manager/manifests"
+            cp -f "${OLLAMA_MANIFEST_SRC}" "/opt/PAIR/resources/services/nvpair-engine-manager/manifests/ryzen_ollama.json"
+
+            if [ -d "/opt/PAIR/resources/cli-bin" ]; then
+                mkdir -p "/opt/PAIR/resources/cli-bin/manifests"
+                cp -f "${OLLAMA_MANIFEST_SRC}" "/opt/PAIR/resources/cli-bin/manifests/ryzen_ollama.json"
+            fi
+
+            for u_home in "/home/teqonix" "/root"; do
+                if [ -d "${u_home}" ]; then
+                    u_dir="${u_home}/.config/Nvidia Corporation/Personal AI Router/manifests"
+                    mkdir -p "${u_dir}"
+                    cp -f "${OLLAMA_MANIFEST_SRC}" "${u_dir}/ryzen_ollama.json"
+                    if [ "${u_home}" = "/home/teqonix" ] && id -u teqonix &>/dev/null; then
+                        chown -R teqonix:teqonix "${u_home}/.config"
+                    fi
+                    log_success "Injected Ollama manifest to: ${u_dir}/ryzen_ollama.json"
+                fi
+            done
+        else
+            log_warn "ryzen_ollama.json not found. Skipping Ollama manifest injection."
+        fi
     fi
 else
     log_info "Step 3-4: Skipping PAIR installation (--skip-pair specified)."
@@ -340,20 +441,41 @@ fi
 
 # Step 6: Verify Local Inference Endpoints
 log_info "Step 6: Verifying local inference endpoints..."
-# PAIR / Ollama check (port 11434)
-PAIR_READY=false
-for _attempt in {1..10}; do
-    if curl -sf "${PAIR_OLLAMA_URL%/*}/api/tags" &>/dev/null 2>&1 || curl -sf "http://127.0.0.1:11434/" &>/dev/null 2>&1; then
-        PAIR_READY=true
-        break
-    fi
-    sleep 1
-done
 
-if [ "${PAIR_READY}" = true ]; then
-    log_success "PAIR Ollama endpoint is active and responding on port 11434."
-else
-    log_warn "PAIR Ollama endpoint not yet responding on port 11434 (will start with nvpair tmux session)."
+# Check LM Studio drop-in endpoint if selected (port 1235)
+if [ "${PAIR_ENGINE}" = "lmstudio" ] || [ "${PAIR_ENGINE}" = "both" ]; then
+    LMS_READY=false
+    for _attempt in {1..10}; do
+        if curl -sf "${PAIR_LMSTUDIO_URL}/models" &>/dev/null 2>&1 || curl -sf "http://127.0.0.1:1235/v1/models" &>/dev/null 2>&1; then
+            LMS_READY=true
+            break
+        fi
+        sleep 1
+    done
+
+    if [ "${LMS_READY}" = true ]; then
+        log_success "PAIR LM Studio (ROCm 10.0 llama) endpoint is active on port 1235."
+    else
+        log_warn "PAIR LM Studio endpoint not yet responding on port 1235 (will start with nvpair tmux session)."
+    fi
+fi
+
+# Check Ollama endpoint if selected (port 11434)
+if [ "${PAIR_ENGINE}" = "ollama" ] || [ "${PAIR_ENGINE}" = "both" ]; then
+    OLLAMA_READY=false
+    for _attempt in {1..10}; do
+        if curl -sf "${PAIR_OLLAMA_URL%/*}/api/tags" &>/dev/null 2>&1 || curl -sf "http://127.0.0.1:11434/" &>/dev/null 2>&1; then
+            OLLAMA_READY=true
+            break
+        fi
+        sleep 1
+    done
+
+    if [ "${OLLAMA_READY}" = true ]; then
+        log_success "PAIR Ollama endpoint is active and responding on port 11434."
+    else
+        log_warn "PAIR Ollama endpoint not yet responding on port 11434 (will start with nvpair tmux session)."
+    fi
 fi
 
 # Optional Lemonade check
@@ -473,8 +595,13 @@ LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || hostname -i 2>/dev/null 
 echo -e "${GREEN}=================================================================${NC}"
 echo -e "${GREEN}  LLM Inference Node (AMD Ryzen AI Halo) Provisioned!          ${NC}"
 echo -e "${GREEN}=================================================================${NC}"
-echo -e "Node role: LLM inference server (NVIDIA PAIR + ROCm Ollama)"
-echo -e "PAIR Ollama endpoint: http://${LAN_IP}:11434"
+echo -e "Node role: LLM inference server (NVIDIA PAIR + ROCm 10.0 Llama / Ollama)"
+if [ "${PAIR_ENGINE}" = "lmstudio" ] || [ "${PAIR_ENGINE}" = "both" ]; then
+    echo -e "PAIR Engine (LM Studio alias): http://${LAN_IP}:1235/v1 (ROCm 10.0 llama.cpp)"
+fi
+if [ "${PAIR_ENGINE}" = "ollama" ] || [ "${PAIR_ENGINE}" = "both" ]; then
+    echo -e "PAIR Ollama endpoint:          http://${LAN_IP}:11434"
+fi
 echo -e "nvpair tmux session:  nvpair.service (user: teqonix, session: pair)"
 echo -e "LAN IP: ${LAN_IP}"
 echo -e "Power management: ryzenadj (TDP)"
@@ -484,3 +611,4 @@ fi
 echo -e ""
 echo -e "To attach to the PAIR TUI directly on this host:"
 echo -e "  sudo -u teqonix tmux attach -t pair"
+
