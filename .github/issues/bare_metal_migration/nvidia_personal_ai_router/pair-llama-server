@@ -12,6 +12,9 @@ set -euo pipefail
 
 CONTAINER_NAME="${CONTAINER_NAME:-pair-llama-engine}"
 CONFIG_FILE="${CONFIG_FILE:-/etc/turnstone/llama_rocm.conf}"
+# Declare MODELS array for Multi-Model Resident Stacking (Option 2)
+declare -a MODELS=()
+CLI_MODEL_SPECIFIED=""
 
 # Source optional override configuration if present
 if [ -f "${CONFIG_FILE}" ]; then
@@ -135,7 +138,49 @@ detect_engine() {
     fi
 }
 
-start_server() {
+find_multiplexer() {
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local candidates=(
+        "/usr/local/bin/pair-model-multiplexer"
+        "/usr/bin/pair-model-multiplexer"
+        "${script_dir}/pair_model_multiplexer.py"
+        "/etc/turnstone/pair_model_multiplexer.py"
+    )
+    for c in "${candidates[@]}"; do
+        if [ -x "${c}" ] || [ -f "${c}" ]; then
+            echo "${c}"
+            return 0
+        fi
+    done
+    echo ""
+}
+
+resolve_model_entry() {
+    local pattern="$1"
+    if [ -f "${pattern}" ]; then
+        echo "${pattern}"
+        return 0
+    fi
+    # If directory, find first gguf
+    if [ -d "${pattern}" ]; then
+        local cand
+        cand="$(find "${pattern}" -maxdepth 4 -type f -iname "*.gguf" ! -iname "*mtp*" 2>/dev/null | sort | head -n 1 || true)"
+        if [ -n "${cand}" ]; then
+            echo "${cand}"
+            return 0
+        fi
+    fi
+    # If glob expression
+    local matched=( ${pattern} )
+    if [ -f "${matched[0]:-}" ]; then
+        echo "${matched[0]}"
+        return 0
+    fi
+    echo "${pattern}"
+}
+
+start_single_server() {
     local engine
     engine="$(detect_engine)"
     if [ "${engine}" = "none" ]; then
@@ -220,8 +265,18 @@ start_server() {
     )
 
     # Mount models directory
-    if [ -d "${RESOLVED_MODELS_DIR}" ]; then
+    local model_abs
+    model_abs="$(realpath "${target_model}" 2>/dev/null || echo "${target_model}")"
+    local model_dir
+    model_dir="$(dirname "${model_abs}")"
+
+    if [ -d "${RESOLVED_MODELS_DIR}" ] && [[ "${model_abs}" == "${RESOLVED_MODELS_DIR}"* ]]; then
         engine_args+=("-v" "${RESOLVED_MODELS_DIR}:/models:ro")
+    else
+        engine_args+=("-v" "${model_dir}:${model_dir}:ro")
+        if [ -d "${RESOLVED_MODELS_DIR}" ]; then
+            engine_args+=("-v" "${RESOLVED_MODELS_DIR}:/models:ro")
+        fi
     fi
 
     engine_args+=("${LLAMA_IMAGE}")
@@ -242,14 +297,22 @@ start_server() {
         "--cache-type-v" "${KV_CACHE_TYPE}"
     )
 
-    local rel_model
-    rel_model="$(realpath --relative-to="${RESOLVED_MODELS_DIR}" "${target_model}" 2>/dev/null || basename "${target_model}")"
-    server_cmd+=("-m" "/models/${rel_model}")
+    if [ -d "${RESOLVED_MODELS_DIR}" ] && [[ "${model_abs}" == "${RESOLVED_MODELS_DIR}"* ]]; then
+        local rel_model
+        rel_model="$(realpath --relative-to="${RESOLVED_MODELS_DIR}" "${model_abs}" 2>/dev/null || basename "${model_abs}")"
+        server_cmd+=("-m" "/models/${rel_model}")
+    else
+        server_cmd+=("-m" "${model_abs}")
+    fi
 
     if [ -n "${mtp_draft}" ]; then
-        local rel_mtp
-        rel_mtp="$(realpath --relative-to="${RESOLVED_MODELS_DIR}" "${mtp_draft}" 2>/dev/null || basename "${mtp_draft}")"
-        server_cmd+=("--model-draft" "/models/${rel_mtp}" "--spec-draft-p-min" "0.75")
+        if [ -d "${RESOLVED_MODELS_DIR}" ] && [[ "${mtp_draft}" == "${RESOLVED_MODELS_DIR}"* ]]; then
+            local rel_mtp
+            rel_mtp="$(realpath --relative-to="${RESOLVED_MODELS_DIR}" "${mtp_draft}" 2>/dev/null || basename "${mtp_draft}")"
+            server_cmd+=("--model-draft" "/models/${rel_mtp}" "--spec-draft-p-min" "0.75")
+        else
+            server_cmd+=("--model-draft" "${mtp_draft}" "--spec-draft-p-min" "0.75")
+        fi
     fi
 
     if [ -n "${EXTRA_ARGS}" ]; then
@@ -275,15 +338,253 @@ start_server() {
     exit 0
 }
 
+start_multi_server() {
+    local engine
+    engine="$(detect_engine)"
+    if [ "${engine}" = "none" ]; then
+        echo "[ERROR] Neither podman nor docker is installed. Cannot launch container." >&2
+        exit 1
+    fi
+
+    local multiplexer_bin
+    multiplexer_bin="$(find_multiplexer)"
+    if [ -z "${multiplexer_bin}" ]; then
+        echo "[ERROR] pair-model-multiplexer executable not found. Cannot run multi-model mode." >&2
+        exit 1
+    fi
+
+    local base_internal_port=$((PORT + 10000))
+    local backend_urls=()
+    local mtp_draft
+    mtp_draft="$(find_mtp_draft)"
+
+    echo "[INFO] Starting ${#MODELS[@]} resident models in Multi-Model LM Studio masquerade mode..."
+
+    for idx in "${!MODELS[@]}"; do
+        local raw_model="${MODELS[$idx]}"
+        local resolved_model
+        resolved_model="$(resolve_model_entry "${raw_model}")"
+
+        if [ ! -f "${resolved_model}" ]; then
+            echo "[WARN] Model file not found on host: '${raw_model}' (resolved: '${resolved_model}'). Skipping." >&2
+            continue
+        fi
+
+        local inst_port=$((base_internal_port + idx))
+        local inst_cname="pair-llama-inst-${PORT}-${idx}"
+        backend_urls+=("http://127.0.0.1:${inst_port}")
+
+        echo "[INFO] [Model $((idx+1))/${#MODELS[@]}] Preparing ${resolved_model} on internal port ${inst_port}..."
+
+        # If already running and responsive, keep it
+        if "${engine}" ps --format '{{.Names}}' | grep -qE "^${inst_cname}$"; then
+            if curl -sf "http://127.0.0.1:${inst_port}/v1/models" &>/dev/null; then
+                echo "[INFO] Instance '${inst_cname}' is already running and healthy on port ${inst_port}."
+                continue
+            fi
+            echo "[WARN] Instance '${inst_cname}' is running but unresponsive. Recreating..."
+            "${engine}" rm -f "${inst_cname}" &>/dev/null || true
+        else
+            "${engine}" rm -f "${inst_cname}" &>/dev/null || true
+        fi
+
+        local model_abs
+        model_abs="$(realpath "${resolved_model}" 2>/dev/null || echo "${resolved_model}")"
+        local model_dir
+        model_dir="$(dirname "${model_abs}")"
+
+        # Determine parent model directory to mount
+        local top_model_dir
+        if [[ "${model_dir}" == /home/turnstone/models* ]]; then
+            top_model_dir="/home/turnstone/models"
+        elif [[ "${model_dir}" == /home/teqonix/models* ]]; then
+            top_model_dir="/home/teqonix/models"
+        elif [[ "${model_dir}" == /models* ]]; then
+            top_model_dir="/models"
+        elif [ -d "${RESOLVED_MODELS_DIR}" ] && [[ "${model_dir}" == "${RESOLVED_MODELS_DIR}"* ]]; then
+            top_model_dir="${RESOLVED_MODELS_DIR}"
+        else
+            top_model_dir="${model_dir}"
+        fi
+
+        local inst_engine_args=(
+            "run" "-d"
+            "--name" "${inst_cname}"
+            "--restart" "always"
+            "-p" "127.0.0.1:${inst_port}:${inst_port}"
+        )
+
+        if [ -e "/dev/kfd" ]; then
+            inst_engine_args+=("--device" "/dev/kfd")
+        fi
+        if [ -d "/dev/dri" ]; then
+            inst_engine_args+=("--device" "/dev/dri")
+        fi
+
+        if [ "${engine}" = "podman" ]; then
+            inst_engine_args+=(
+                "--group-add" "keep-groups"
+                "--userns=keep-id"
+                "--security-opt" "label=disable"
+                "--security-opt" "seccomp=unconfined"
+            )
+        else
+            inst_engine_args+=(
+                "--group-add" "video"
+                "--group-add" "render"
+                "--security-opt" "seccomp=unconfined"
+            )
+        fi
+
+        if [ -d "/dev/infiniband" ]; then
+            inst_engine_args+=("--device" "/dev/infiniband" "--group-add" "rdma" "--ulimit" "memlock=-1")
+        fi
+
+        inst_engine_args+=(
+            "-e" "ROCBLAS_USE_HIPBLASLT=1"
+            "-e" "HSA_OVERRIDE_GFX_VERSION=11.5.1"
+            "-e" "GGML_HIP_ENABLE_UNIFIED_MEMORY=1"
+            "-e" "HSA_ENABLE_SDMA=0"
+            "-e" "HIP_VISIBLE_DEVICES=0"
+            "-e" "XDG_CACHE_HOME=/tmp"
+            "-v" "${top_model_dir}:${top_model_dir}:ro"
+        )
+
+        if [ -d "${RESOLVED_MODELS_DIR}" ] && [ "${RESOLVED_MODELS_DIR}" != "${top_model_dir}" ]; then
+            inst_engine_args+=("-v" "${RESOLVED_MODELS_DIR}:/models:ro")
+        fi
+        if [ "${top_model_dir}" != "/models" ] && [ ! -d "/models" ]; then
+            inst_engine_args+=("-v" "${top_model_dir}:/models:ro")
+        fi
+
+        inst_engine_args+=("${LLAMA_IMAGE}")
+
+        local base_alias
+        base_alias="$(basename "${model_abs}" .gguf | sed -E 's/-00001-of-[0-9]+//')"
+
+        local inst_cmd=(
+            "llama-server"
+            "--host" "0.0.0.0"
+            "--port" "${inst_port}"
+            "-c" "${CONTEXT_SIZE}"
+            "-ngl" "${GPU_LAYERS}"
+            "-fa" "${USE_FLASH_ATTN}"
+            "--load-mode" "${LOAD_MODE}"
+            "-b" "${BATCH_SIZE}"
+            "-ub" "${UBATCH_SIZE}"
+            "-np" "${PARALLEL_SEQUENCES}"
+            "--cache-type-k" "${KV_CACHE_TYPE}"
+            "--cache-type-v" "${KV_CACHE_TYPE}"
+            "--alias" "${base_alias}"
+            "-m" "${model_abs}"
+        )
+
+        if [ -n "${mtp_draft}" ] && [[ "${model_abs,,}" == *"qwen"* ]]; then
+            inst_cmd+=("--model-draft" "${mtp_draft}" "--spec-draft-p-min" "0.75")
+        fi
+
+        if [ -n "${EXTRA_ARGS}" ]; then
+            # shellcheck disable=SC2086
+            inst_cmd+=(${EXTRA_ARGS})
+        fi
+
+        echo "[INFO] Spawning instance container '${inst_cname}' for ${base_alias}..."
+        "${engine}" "${inst_engine_args[@]}" "${inst_cmd[@]}"
+    done
+
+    if [ "${#backend_urls[@]}" -eq 0 ]; then
+        echo "[ERROR] None of the models specified in MODELS array could be found or launched." >&2
+        exit 1
+    fi
+
+    # Assemble comma-separated backends list
+    local backends_joined
+    backends_joined="$(IFS=,; echo "${backend_urls[*]}")"
+
+    local pid_dir="${XDG_RUNTIME_DIR:-/tmp}"
+    local pid_file="${pid_dir}/pair-multiplexer-${PORT}.pid"
+
+    # Stop prior multiplexer if running on this port
+    if [ -f "${pid_file}" ]; then
+        local old_pid
+        old_pid="$(cat "${pid_file}" 2>/dev/null || true)"
+        if [ -n "${old_pid}" ] && kill -0 "${old_pid}" 2>/dev/null; then
+            echo "[INFO] Stopping previous multiplexer PID ${old_pid}..."
+            kill "${old_pid}" 2>/dev/null || true
+            sleep 0.5
+        fi
+        rm -f "${pid_file}"
+    fi
+
+    echo "[INFO] Launching PAIR Model Multiplexer on port ${PORT} (routing to: ${backends_joined})..."
+    python3 "${multiplexer_bin}" \
+        --bind "${BIND_HOST}" \
+        --port "${PORT}" \
+        --backends "${backends_joined}" \
+        --pid-file "${pid_file}" &
+
+    sleep 1.0
+
+    if [ -f "${pid_file}" ]; then
+        local new_pid
+        new_pid="$(cat "${pid_file}" 2>/dev/null || true)"
+        if ! kill -0 "${new_pid}" 2>/dev/null; then
+            echo "[ERROR] Multiplexer process failed to start or crashed." >&2
+            exit 1
+        fi
+    fi
+
+    echo "[SUCCESS] Multi-Model resident stack is running on port ${PORT}."
+    echo "[INFO] PAIR engine manager is monitoring readiness on http://127.0.0.1:${PORT}/v1/models."
+    exit 0
+}
+
+start_server() {
+    local num_models=0
+    if [ "${#MODELS[@]:-0}" -gt 1 ]; then
+        num_models="${#MODELS[@]}"
+    fi
+
+    if [ -n "${CLI_MODEL_SPECIFIED:-}" ]; then
+        start_single_server
+    elif [ "${num_models}" -gt 1 ]; then
+        start_multi_server
+    else
+        if [ -z "${LLAMA_MODEL_PATH:-}" ] && [ "${#MODELS[@]:-0}" -eq 1 ]; then
+            LLAMA_MODEL_PATH="${MODELS[0]}"
+        fi
+        start_single_server
+    fi
+}
+
 stop_server() {
     local engine
     engine="$(detect_engine)"
-    local c_name="${CONTAINER_NAME:-pair-llama-engine-${PORT}}"
+    local pid_dir="${XDG_RUNTIME_DIR:-/tmp}"
+    local pid_file="${pid_dir}/pair-multiplexer-${PORT}.pid"
+
+    # 1. Stop multiplexer if running
+    if [ -f "${pid_file}" ]; then
+        local m_pid
+        m_pid="$(cat "${pid_file}" 2>/dev/null || true)"
+        if [ -n "${m_pid}" ]; then
+            echo "[INFO] Stopping multiplexer PID ${m_pid}..."
+            kill "${m_pid}" 2>/dev/null || true
+        fi
+        rm -f "${pid_file}"
+    fi
+    pkill -f "pair_model_multiplexer.*--port ${PORT}" 2>/dev/null || true
+
+    # 2. Stop container instances
     if [ "${engine}" != "none" ]; then
-        echo "[INFO] Stopping container '${c_name}'..."
-        "${engine}" stop "${c_name}" "pair-llama-engine" &>/dev/null || true
-        "${engine}" rm -f "${c_name}" "pair-llama-engine" &>/dev/null || true
-        echo "[SUCCESS] Container '${c_name}' stopped."
+        echo "[INFO] Stopping ROCm llama-server containers for port ${PORT}..."
+        local containers_to_stop
+        containers_to_stop="$("${engine}" ps -a --format '{{.Names}}' | grep -E "^(pair-llama-inst-${PORT}-|pair-llama-engine-${PORT}$|pair-llama-engine$)" || true)"
+        if [ -n "${containers_to_stop}" ]; then
+            echo "${containers_to_stop}" | xargs -r "${engine}" stop &>/dev/null || true
+            echo "${containers_to_stop}" | xargs -r "${engine}" rm -f &>/dev/null || true
+        fi
+        echo "[SUCCESS] All llama containers stopped."
     fi
 }
 
@@ -330,6 +631,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --model|-m)
             LLAMA_MODEL_PATH="$2"
+            CLI_MODEL_SPECIFIED="true"
             shift 2
             ;;
         -h|--help|help)

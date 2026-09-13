@@ -1,0 +1,47 @@
+# =============================================================================
+# Turnstone ROCm 10.0 Strix Halo Llama Configuration
+# Location: /etc/turnstone/llama_rocm.conf
+# =============================================================================
+#
+# This file configures the ROCm 10.0 llama.cpp engine runner (pair-llama-server)
+# and its OpenAI-compatible multiplexer for NVIDIA PAIR (masquerading as LM Studio).
+#
+
+# -----------------------------------------------------------------------------
+# MODE A: Multi-Model Resident RAM Stacking (Option 2 - LM Studio Masquerade)
+# -----------------------------------------------------------------------------
+# Define multiple models in an array. Each model is launched in its own
+# isolated container on internal backend ports (e.g. 11235, 11236, 11237)
+# and kept perpetually resident in unified RAM / VRAM.
+# The multiplexer proxy listens on port 1235 and routes incoming requests
+# by requested model name.
+#
+# For sharded models (*-00001-of-0000X.gguf), only specify shard 1;
+# llama.cpp automatically links and loads the remaining shards.
+
+MODELS=(
+    "/home/turnstone/models/Qwen3.8-Flash-Next-GGUF/UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf"
+    "/home/turnstone/models/gemma-4-31B-it-GGUF/gemma-4-31B-it-UD-Q4_K_XL.gguf"
+    "/home/turnstone/models/Ministral-3-14B-Instruct-2512-GGUF/Ministral-3-14B-Instruct-2512-UD-Q4_K_XL.gguf"
+)
+
+# -----------------------------------------------------------------------------
+# MODE B: Single Model Dedicated Mode
+# -----------------------------------------------------------------------------
+# Uncomment to run a single dedicated model without the multiplexer proxy.
+#
+# LLAMA_MODEL_PATH="/home/turnstone/models/Qwen3.8-Flash-Next-GGUF/UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf"
+
+# -----------------------------------------------------------------------------
+# Advanced Hardware & Inference Tuning (Ported from ai-toolbox-cockpit)
+# -----------------------------------------------------------------------------
+# LLAMA_IMAGE="docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-10.0-qwen-3.8-flash-next"
+# CONTEXT_SIZE=262144
+# GPU_LAYERS=999
+# LOAD_MODE="dio"          # Direct I/O (dio) bypasses Linux page cache
+# BATCH_SIZE=2048          # Calibrated prompt processing batch size
+# UBATCH_SIZE=2048         # Calibrated micro-batch size for Strix Halo
+# KV_CACHE_TYPE="q8_0"     # 8-bit quantized KV cache saves ~50% VRAM
+# USE_FLASH_ATTN=1         # Flash attention acceleration
+# PARALLEL_SEQUENCES=1
+

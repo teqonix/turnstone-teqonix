@@ -186,7 +186,7 @@ if [ "${SKIP_PAIR}" != "true" ]; then
 
     # Install prerequisites
     DEBIAN_FRONTEND=noninteractive apt-get update -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl tmux jq ca-certificates
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl tmux jq ca-certificates python3
 
     log_info "Fetching latest PAIR release metadata..."
     PAIR_YML_CONTENT=""
@@ -302,6 +302,62 @@ if [ "${SKIP_PAIR}" != "true" ]; then
         log_success "pair-llama-server and LMS drop-in wrappers installed."
     else
         log_warn "pair-llama-server not found locally. Skipping runner copy."
+    fi
+
+    # Install pair-model-multiplexer (LM Studio Multi-Model OpenAI proxy)
+    PAIR_MUX_SRC=""
+    CANDIDATE_MUX=(
+        "${SCRIPT_DIR}/nvidia_personal_ai_router/pair_model_multiplexer.py"
+        "${REPO_ROOT}/.github/issues/bare_metal_migration/nvidia_personal_ai_router/pair_model_multiplexer.py"
+    )
+    for cand_mux in "${CANDIDATE_MUX[@]}"; do
+        if [ -f "${cand_mux}" ]; then
+            PAIR_MUX_SRC="${cand_mux}"
+            break
+        fi
+    done
+
+    if [ -n "${PAIR_MUX_SRC}" ]; then
+        log_info "Installing pair-model-multiplexer from ${PAIR_MUX_SRC} to /usr/local/bin..."
+        cp -f "${PAIR_MUX_SRC}" "/usr/local/bin/pair-model-multiplexer"
+        chmod 755 "/usr/local/bin/pair-model-multiplexer"
+        ln -sf "/usr/local/bin/pair-model-multiplexer" "/usr/bin/pair-model-multiplexer"
+        log_success "pair-model-multiplexer installed."
+    else
+        log_warn "pair_model_multiplexer.py not found locally. Skipping multiplexer copy."
+    fi
+
+    # Install /etc/turnstone/llama_rocm.conf template and configure resident models
+    mkdir -p /etc/turnstone /models
+    chmod 755 /etc/turnstone /models 2>/dev/null || true
+
+    if [ -d "/home/turnstone/models" ]; then
+        ln -sfn "/home/turnstone/models" /models/local 2>/dev/null || true
+    fi
+
+    CONF_EXAMPLE_SRC=""
+    CANDIDATE_CONFS=(
+        "${SCRIPT_DIR}/nvidia_personal_ai_router/llama_rocm.conf.example"
+        "${REPO_ROOT}/.github/issues/bare_metal_migration/nvidia_personal_ai_router/llama_rocm.conf.example"
+    )
+    for cand_c in "${CANDIDATE_CONFS[@]}"; do
+        if [ -f "${cand_c}" ]; then
+            CONF_EXAMPLE_SRC="${cand_c}"
+            break
+        fi
+    done
+
+    if [ -n "${CONF_EXAMPLE_SRC}" ]; then
+        cp -f "${CONF_EXAMPLE_SRC}" "/etc/turnstone/llama_rocm.conf.example"
+        chmod 644 "/etc/turnstone/llama_rocm.conf.example"
+        if [ ! -f "/etc/turnstone/llama_rocm.conf" ]; then
+            log_info "Deploying default /etc/turnstone/llama_rocm.conf from template..."
+            cp -f "${CONF_EXAMPLE_SRC}" "/etc/turnstone/llama_rocm.conf"
+            chmod 644 "/etc/turnstone/llama_rocm.conf"
+            log_success "Created /etc/turnstone/llama_rocm.conf with Multi-Model Resident Stacking configuration."
+        else
+            log_info "Preserving existing /etc/turnstone/llama_rocm.conf (template updated at /etc/turnstone/llama_rocm.conf.example)."
+        fi
     fi
 
     # Ensure nvpair-tui is accessible on standard PATH
@@ -471,6 +527,10 @@ if [ "${PAIR_ENGINE}" = "lmstudio" ] || [ "${PAIR_ENGINE}" = "both" ]; then
 
     if [ "${LMS_READY}" = true ]; then
         log_success "PAIR LM Studio (ROCm 10.0 llama) endpoint is active on port 1235."
+        DETECTED_MODELS=$(curl -sf "http://127.0.0.1:1235/v1/models" 2>/dev/null | jq -r '.data[].id' 2>/dev/null | tr '\n' ' ' || true)
+        if [ -n "${DETECTED_MODELS}" ]; then
+            log_info "Active resident models on port 1235: ${DETECTED_MODELS}"
+        fi
     else
         log_warn "PAIR LM Studio endpoint not yet responding on port 1235 (will start with nvpair tmux session)."
     fi
@@ -622,7 +682,8 @@ echo -e "${GREEN}  LLM Inference Node (AMD Ryzen AI Halo) Provisioned!          
 echo -e "${GREEN}=================================================================${NC}"
 echo -e "Node role: LLM inference server (NVIDIA PAIR + ROCm 10.0 Llama / Ollama)"
 if [ "${PAIR_ENGINE}" = "lmstudio" ] || [ "${PAIR_ENGINE}" = "both" ]; then
-    echo -e "PAIR Engine (LM Studio alias): http://${LAN_IP}:1235/v1 (ROCm 10.0 llama.cpp)"
+    echo -e "PAIR Engine (LM Studio alias): http://${LAN_IP}:1235/v1 (ROCm 10.0 multi-model resident stack)"
+    echo -e "Engine Configuration:          /etc/turnstone/llama_rocm.conf"
 fi
 if [ "${PAIR_ENGINE}" = "ollama" ] || [ "${PAIR_ENGINE}" = "both" ]; then
     echo -e "PAIR Ollama endpoint:          http://${LAN_IP}:11434"
