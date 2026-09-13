@@ -540,19 +540,18 @@ start_multi_server() {
 }
 
 start_server() {
-    local num_models=0
-    if [ "${#MODELS[@]:-0}" -gt 1 ]; then
-        num_models="${#MODELS[@]}"
-    fi
+    local num_models="${#MODELS[@]}"
 
     if [ -n "${CLI_MODEL_SPECIFIED:-}" ]; then
         start_single_server
     elif [ "${num_models}" -gt 1 ]; then
         start_multi_server
-    else
-        if [ -z "${LLAMA_MODEL_PATH:-}" ] && [ "${#MODELS[@]:-0}" -eq 1 ]; then
+    elif [ "${num_models}" -eq 1 ]; then
+        if [ -z "${LLAMA_MODEL_PATH:-}" ]; then
             LLAMA_MODEL_PATH="${MODELS[0]}"
         fi
+        start_single_server
+    else
         start_single_server
     fi
 }
