@@ -14,6 +14,7 @@ Features:
 - Health check endpoint (GET /health, GET /) for PAIR readiness probes.
 """
 
+import copy
 import argparse
 import json
 import logging
@@ -47,7 +48,72 @@ DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 def normalize_model_name(name: str) -> str:
     """Normalize model identifier for robust lookup."""
-    return name.lower().strip().replace("openai/", "")
+    return name.lower().strip().replace("openai/", "").replace("google/", "").replace("nvidia/", "").replace("qwen/", "")
+
+
+def get_model_family(name: str) -> str:
+    """Classify model string into a canonical family for robust cross-alias routing."""
+    n = name.lower().replace("-", "").replace("_", "").replace(".", "").replace(":", "").replace("/", "").replace(" ", "")
+    if "gemma" in n:
+        return "gemma"
+    if "flashnext" in n:
+        return "qwen_flash_next"
+    if "qwen" in n:
+        return "qwen"
+    if "nemotron" in n or "nano" in n:
+        return "nemotron"
+    if "ministral" in n or "mistral" in n:
+        return "ministral"
+    return ""
+
+
+def generate_aliases_for_model(model_id: str) -> list[str]:
+    """Generate common canonical and PAIR cluster aliases for a given model ID."""
+    aliases = []
+    fam = get_model_family(model_id)
+
+    if fam == "gemma":
+        aliases.extend([
+            "gemma-4-31b",
+            "google/gemma-4-31b",
+            "gemma-4",
+            "gemma-4-31b-it",
+            "gemma-4-31b-it-mlx",
+            "gemma-4-31b-it-qat",
+            "gemma4:31b-mlx",
+        ])
+    elif fam == "qwen":
+        aliases.extend([
+            "qwen-3.8-27b",
+            "qwen3.8-27b",
+            "qwen/qwen3.8-27b",
+            "qwen3.8:27b-mlx",
+            "qwen-27b",
+            "Qwen3.8-27B-ROCmFP4-FAST",
+            "Qwen3.8-27B-ROCmFP4-STRIX_LEAN",
+        ])
+    elif fam == "nemotron":
+        aliases.extend([
+            "nvidia/nemotron-3-nano-4b",
+            "nemotron-3-nano-4b",
+            "nemotron-4b",
+            "nemotron",
+            "NVIDIA-Nemotron-3-Nano-4B-Q4_K_M",
+        ])
+    elif fam == "ministral":
+        aliases.extend([
+            "mistralai/ministral-3-14b",
+            "ministral-3-14b",
+            "ministral-14b",
+            "ministral",
+        ])
+    elif fam == "qwen_flash_next":
+        aliases.extend([
+            "qwen3.8-flash-next",
+            "qwen3.8-flash-next:125b-mlx",
+        ])
+
+    return aliases
 
 
 def refresh_backend_models():
@@ -71,11 +137,13 @@ def refresh_backend_models():
                             if m_id:
                                 new_table[m_id] = backend
                                 new_table[normalize_model_name(m_id)] = backend
-                                # Map basename if path-like
                                 base = os.path.basename(m_id)
                                 if base:
                                     new_table[base] = backend
                                     new_table[normalize_model_name(base)] = backend
+                                for alias in generate_aliases_for_model(m_id):
+                                    new_table[alias] = backend
+                                    new_table[normalize_model_name(alias)] = backend
             except Exception as e:
                 logger.debug("Failed to query %s: %s", models_url, e)
 
@@ -93,25 +161,34 @@ def get_target_backend(requested_model: str) -> str:
         if not requested_model:
             return BACKENDS[0]
 
-        norm = normalize_model_name(requested_model)
-
-        # 1. Exact match
+        # 1. Exact match in routing table
         if requested_model in ROUTING_TABLE:
             return ROUTING_TABLE[requested_model]
+
+        # 2. Normalized exact match
+        norm = normalize_model_name(requested_model)
         if norm in ROUTING_TABLE:
             return ROUTING_TABLE[norm]
 
-        # 2. Substring / fuzzy match
+        # 3. Model family keyword match (highest confidence)
+        req_fam = get_model_family(requested_model)
+        if req_fam:
+            for key, backend in ROUTING_TABLE.items():
+                if get_model_family(key) == req_fam:
+                    return backend
+
+        # 4. Substring / fuzzy match in routing table
         for key, backend in ROUTING_TABLE.items():
             if norm in key or key in norm:
                 return backend
 
-        # 3. Fallback to first available backend
+        # 5. Fallback to first available backend
         return BACKENDS[0]
 
 
 def get_merged_models() -> dict:
-    """Fetch and merge models from all active backends."""
+    """Fetch and merge models from all active backends, including aliases."""
+    refresh_backend_models()
     merged = []
     seen_ids = set()
 
@@ -127,6 +204,15 @@ def get_merged_models() -> dict:
                         if m_id and m_id not in seen_ids:
                             seen_ids.add(m_id)
                             merged.append(item)
+
+                        if m_id:
+                            for alias in generate_aliases_for_model(m_id):
+                                if alias not in seen_ids:
+                                    seen_ids.add(alias)
+                                    alias_item = copy.deepcopy(item)
+                                    alias_item["id"] = alias
+                                    alias_item["aliases"] = [alias, m_id]
+                                    merged.append(alias_item)
         except Exception as e:
             logger.debug("Error querying models from %s: %s", models_url, e)
 
