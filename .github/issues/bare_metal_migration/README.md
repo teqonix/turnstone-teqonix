@@ -25,10 +25,10 @@ flowchart TD
     end
 
     subgraph INFER["LLM Inference Servers (hardware)"]
-        ROUTER["LiteLLM proxy / direct endpoints"]
-        RYZEN1["Ryzen Halo #1<br/>Lemonade ROCm (:8000)"]
-        RYZEN2["Ryzen Halo #2<br/>Lemonade ROCm (:8000)"]
-        MLX["MLX Node (M5 Max)<br/>mlx-lm.server (:8000) + Ollama (:11434)"]
+        ROUTER["NVIDIA Personal AI Router (PAIR)"]
+        RYZEN1["Ryzen Halo #1<br/>PAIR / ROCm (:8000 / :11434)"]
+        RYZEN2["Ryzen Halo #2<br/>PAIR / ROCm (:8000 / :11434)"]
+        MLX["MLX Node (M5 Max)<br/>PAIR / mlx-lm.server (:8000)"]
     end
 
     ROUTER --> RYZEN1
@@ -40,7 +40,7 @@ flowchart TD
 
 | Participant | Role | Deployed by |
 |-------------|------|-------------|
-| **Ryzen Nodes** (`ryzen-halo-1`, `ryzen-halo-2`) | **LLM Inference servers** — run Lemonade ROCm model servers behind a local `:8000/v1` endpoint, with `ryzenadj` TDP control. No Turnstone node is installed here. | `deploy_ryzen_node.sh` |
+| **Ryzen Nodes** (`ryzen-halo-1`, `ryzen-halo-2`) | **LLM Inference servers** — run PAIR / ROCm model servers behind local `:8000/v1` or `:11434/v1` endpoints, with `ryzenadj` TDP control. No Turnstone node is installed here. | `deploy_ryzen_node.sh` |
 | **MLX Node** (`mbp-ai-core`) | **LLM Inference server** — runs `mlx-lm.server` (`:8000`) plus an Ollama engine (`:11434`) behind macOS `launchd`. No Turnstone node is installed here. | `deploy_mlx_node.sh` |
 | **Debian 12 Container** | **Turnstone Node** — runs `turnstone-server` (`:8080`), registers with the Coordinator, connects to PostgreSQL, and proxies LLM traffic to the inference servers. Runs as a foreground container process (or a systemd unit when PID-1 systemd is present). | `deploy_turnstone_debian12.sh` |
 | **Coordinator (TrueNAS VM)** | **Turnstone Coordinator** — `silo-14`: PostgreSQL 18, `turnstone-console` UI (`:8090`/`:9443`), Caddy HTTPS proxy, SearxNG metasearch (`:8081`). | `deploy_coordinator.sh` |
@@ -60,13 +60,12 @@ flowchart TD
 | [`restore_postgres.sh`](restore_postgres.sh) | Migration | Database Host | Restores Turnstone PostgreSQL backup (.sql, .sql.gz, .dump) to an existing PostgreSQL database. |
 | [`migrate_from_compose.sh`](migrate_from_compose.sh) | Migration | Local Host & `silo-14` | Exports database (19,944+ turns), Caddy CA root keys, and secrets (`--export`), then imports them onto `silo-14` (`--import`). |
 | [`deploy_mlx_node.sh`](deploy_mlx_node.sh) | Inference Node | `mbp-ai-core.lan` (M5 Max) | Sets up Apple MLX (`mlx-lm.server`) + Ollama as `launchd` services and pulls models. Inference-only — no Turnstone node. |
-| [`deploy_ryzen_node.sh`](deploy_ryzen_node.sh) | Inference Node | Ryzen Halo #1 & #2 (Linux) | Provisions `ryzenadj` TDP control and verifies the local Lemonade inference server. Inference-only — no Turnstone node. |
+| [`deploy_ryzen_node.sh`](deploy_ryzen_node.sh) | Inference Node | Ryzen Halo #1 & #2 (Linux) | Provisions `ryzenadj` TDP control, NVIDIA PAIR, and ROCm inference engine. Inference-only — no Turnstone node. |
 | [`deploy_turnstone_debian12.sh`](deploy_turnstone_debian12.sh) | Turnstone Node | Debian 12 container | Installs the full Turnstone node (user, venv + `turnstone` package, `/etc/turnstone/config.toml`, host-mounted `/workspace`, OpenSSH root login, Podman, Podman Compose, Homebrew) and runs `turnstone-server` as a foreground container process (or systemd unit when PID-1 systemd is present). |
-| [`deploy_litellm_proxy.sh`](deploy_litellm_proxy.sh) | Load Balancer VM | Dedicated Proxy VM | Idempotently deploys LiteLLM proxy with least-busy routing across Ryzen and Apple Silicon nodes. |
 | [`backup_turnstone.sh`](backup_turnstone.sh) | Backup Cron | `silo-14` TrueNAS VM | Runs daily compressed `pg_dump` of all conversation history, settings, and configs into TrueNAS ZFS dataset. |
-| [`sync_repo.sh`](sync_repo.sh) | Cluster Sync | Cluster Nodes (`turnstone-postgres.lan`, `turnstone-coordinator-nerd-projects.lan`, `amd-ai-core-one.lan`, `amd-ai-core-two.lan`, `mbp-ai-core.lan`, `litellm-proxy.lan`) | Syncs local turnstone repo copy to LLM cluster nodes via rsync over passwordless SSH. |
+| [`sync_repo.sh`](sync_repo.sh) | Cluster Sync | Cluster Nodes (`turnstone-postgres.lan`, `turnstone-coordinator-nerd-projects.lan`, `amd-ai-core-one.lan`, `amd-ai-core-two.lan`, `mbp-ai-core.lan`, `silo-14.lan`) | Syncs local turnstone repo copy to LLM cluster nodes via rsync over passwordless SSH. |
 | [`set_concurrency_limit.sh`](set_concurrency_limit.sh) | Cluster / Node Config | All Cluster Nodes / Local | Auto-detects installed inference engines and Turnstone configs, setting concurrency limits to 1. |
-| [`install_ryzenadj.sh`](install_ryzenadj.sh) | Worker Node (Ryzen) | Ryzen Halo #1 & #2 (Linux) | Fetches, builds, and installs `ryzen_smu` DKMS driver, `ryzenadj`, and sets up `ryzen-tdp.service` systemd unit for persistent boot TDP limits. |
+| [`install_ryzenadj.sh`](ryzen_node_custom/install_ryzenadj.sh) | Worker Node (Ryzen) | Ryzen Halo #1 & #2 (Linux) | Fetches, builds, and installs `ryzen_smu` DKMS driver, `ryzenadj`, and sets up `ryzen-tdp.service` systemd unit for persistent boot TDP limits (located in `ryzen_node_custom/`). |
 
 
 
@@ -165,13 +164,13 @@ NODE_ID="ryzen-halo-2" sudo -E ./.github/issues/bare_metal_migration/deploy_ryze
 Provision the dedicated Turnstone node in a fresh Debian 12 container. It registers with the Coordinator, connects to PostgreSQL, and proxies LLM traffic to the inference nodes:
 ```bash
 # Inside / attached to a fresh Debian 12 container:
-LLM_BASE_URL="http://litellm-proxy.lan:4000/v1" \
+LLM_BASE_URL="http://amd-ai-core-one.lan:11434/v1" \
 NODE_ID="turnstone-debian12" \
 ./.github/issues/bare_metal_migration/deploy_turnstone_debian12.sh
 
 # Or as a container entrypoint (runs the server in the foreground):
 docker run -d --name turnstone-node \
-  -e LLM_BASE_URL=http://litellm-proxy.lan:4000/v1 \
+  -e LLM_BASE_URL=http://amd-ai-core-one.lan:11434/v1 \
   -e NODE_ID=turnstone-debian12 \
   -v /mnt/silo-14/ai-playground:/home/turnstone/silo-14.lan/ai-playground \
   debian:12 \

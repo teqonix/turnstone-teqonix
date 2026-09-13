@@ -150,13 +150,19 @@ log_info "Step 2: Checking for ryzenadj power management utility..."
 if [ "${SKIP_RYZENADJ}" != "true" ]; then
     if ! command -v ryzenadj &>/dev/null && [ ! -x "/usr/local/bin/ryzenadj" ] && [ ! -x "/usr/bin/ryzenadj" ]; then
         log_warn "'ryzenadj' is not installed on this node."
-        RYZENADJ_INSTALLER="${SCRIPT_DIR}/install_ryzenadj.sh"
-        if [ -f "${RYZENADJ_INSTALLER}" ]; then
+        RYZENADJ_INSTALLER=""
+        for cand in "${SCRIPT_DIR}/ryzen_node_custom/install_ryzenadj.sh" "${SCRIPT_DIR}/install_ryzenadj.sh"; do
+            if [ -f "${cand}" ]; then
+                RYZENADJ_INSTALLER="${cand}"
+                break
+            fi
+        done
+        if [ -n "${RYZENADJ_INSTALLER}" ] && [ -f "${RYZENADJ_INSTALLER}" ]; then
             log_info "Executing RyzenAdj installer (${RYZENADJ_INSTALLER})..."
             bash "${RYZENADJ_INSTALLER}"
             log_success "RyzenAdj and TDP service installation complete."
         else
-            log_warn "RyzenAdj installer script not found at '${RYZENADJ_INSTALLER}'. Continuing deployment."
+            log_warn "RyzenAdj installer script not found at '${SCRIPT_DIR}/ryzen_node_custom/install_ryzenadj.sh'. Continuing deployment."
         fi
     else
         INSTALLED_RYZENADJ="$(command -v ryzenadj 2>/dev/null || ( [ -x "/usr/local/bin/ryzenadj" ] && echo "/usr/local/bin/ryzenadj" ) || echo "/usr/bin/ryzenadj")"

@@ -1,7 +1,7 @@
 {
   "models": [
     {
-      "litellm_name": "gemma-4-31b",
+      "model_name": "gemma-4-31b",
       "lemonade_target": "gemma-4-31B-it-GGUF-UD-Q4_K_XL",
       "mlx_target": "mlx-community/gemma-4-31B-it-4bit",
       "ollama_target": "gemma-4-31b",
@@ -11,7 +11,7 @@
       "supports_reasoning": true
     },
     {
-      "litellm_name": "qwen-3.8-27b",
+      "model_name": "qwen-3.8-27b",
       "lemonade_target": "Qwen3.8-27B-GGUF-Q4_0",
       "mlx_target": "mlx-community/Qwen3.8-27B-4bit",
       "ollama_target": "qwen-3.8-27b",
@@ -21,7 +21,7 @@
       "supports_reasoning": true
     },
     {
-      "litellm_name": "ornith-1.5-9b",
+      "model_name": "ornith-1.5-9b",
       "lemonade_target": "Ornith-1.5-9B-GGUF-Q8_0",
       "mlx_target": "mistralai/Mistral-Nemo-Base-2407",
       "ollama_target": "ornith-1.5:9b",

@@ -82,9 +82,10 @@ except Exception as e:
 def resolve_model_path(model_name: str) -> str:
     norm = model_name.replace("openai/", "").lower().strip()
     
-    # Exact match on litellm_name or mlx_target
+    # Exact match on model_name or mlx_target
     for m in MODELS_REGISTRY:
-        if m.get("litellm_name", "").lower() == norm:
+        alias = (m.get("model_name") or m.get("litellm_name") or "").lower()
+        if alias == norm:
             return m.get("mlx_target", model_name)
         if m.get("mlx_target", "").lower() == norm:
             return m.get("mlx_target", model_name)
@@ -92,7 +93,7 @@ def resolve_model_path(model_name: str) -> str:
     # Fallback to substring
     for m in MODELS_REGISTRY:
         targ = m.get("mlx_target", "").lower()
-        alias = m.get("litellm_name", "").lower()
+        alias = (m.get("model_name") or m.get("litellm_name") or "").lower()
         if (alias and alias in norm) or (targ and targ in norm):
             return m.get("mlx_target", model_name)
             
@@ -354,7 +355,7 @@ async def list_models():
     for m in MODELS_REGISTRY:
         if m.get("mlx_target"):
             data.append({
-                "id": m.get("litellm_name"),
+                "id": m.get("model_name") or m.get("litellm_name"),
                 "object": "model",
                 "created": int(time.time()),
                 "owned_by": "turnstone-mlx",

@@ -12,7 +12,7 @@ It supports two operational deployment modes:
 
 ```mermaid
 flowchart TD
-    Coordinator["Coordinator VM / LiteLLM Proxy"] -->|"Port 8080 (REST / SSE)"| TurnstoneServer["turnstone-server.service<br/>(Port 8080)"]
+    Coordinator["Coordinator VM / PAIR Router"] -->|"Port 8080 (REST / SSE)"| TurnstoneServer["turnstone-server.service<br/>(Port 8080)"]
     
     subgraph RyzenNode["AMD Ryzen AI Compute Node (Watchdog Mode)"]
         TurnstoneServer -->|"Direct Base URL: http://127.0.0.1:13305/v1"| Lemond["lemond.service<br/>(OOtB Lemonade Server - Port 13305)"]

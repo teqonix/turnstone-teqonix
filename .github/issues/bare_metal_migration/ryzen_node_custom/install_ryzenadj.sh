@@ -27,6 +27,8 @@ log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
 trap 'log_error "An error occurred on line $LINENO. Installation stopped."; exit 1' ERR
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # Default Configuration
 RYZENADJ_REPO="https://github.com/FlyGoat/RyzenAdj.git"
 RYZENADJ_REF="main"
@@ -307,10 +309,14 @@ install_ryzen_smu() {
     fi
 
     log_info "Step 4: Fetching and installing ryzen_smu DKMS kernel module..."
-    log_info "Cloning ${RYZEN_SMU_REPO} (${RYZEN_SMU_REF})..."
-
-    git clone --depth 1 --branch "${RYZEN_SMU_REF}" "${RYZEN_SMU_REPO}" "${TMP_DIR}/ryzen_smu" 2>/dev/null || \
-    git clone "${RYZEN_SMU_REPO}" "${TMP_DIR}/ryzen_smu"
+    if [ -d "${SCRIPT_DIR}/ryzen_smu" ] && [ -f "${SCRIPT_DIR}/ryzen_smu/Makefile" ]; then
+        log_info "Using local ryzen_smu sources from ${SCRIPT_DIR}/ryzen_smu..."
+        cp -r "${SCRIPT_DIR}/ryzen_smu" "${TMP_DIR}/ryzen_smu"
+    else
+        log_info "Cloning ${RYZEN_SMU_REPO} (${RYZEN_SMU_REF})..."
+        git clone --depth 1 --branch "${RYZEN_SMU_REF}" "${RYZEN_SMU_REPO}" "${TMP_DIR}/ryzen_smu" 2>/dev/null || \
+        git clone "${RYZEN_SMU_REPO}" "${TMP_DIR}/ryzen_smu"
+    fi
 
     cd "${TMP_DIR}/ryzen_smu"
     if [ "${RYZEN_SMU_REF}" != "master" ] && [ "${RYZEN_SMU_REF}" != "main" ]; then
