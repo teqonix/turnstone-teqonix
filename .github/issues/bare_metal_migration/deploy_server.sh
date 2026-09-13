@@ -59,6 +59,9 @@ SMB_PATH="${SMB_PATH:-}"
 SMB_USER="${SMB_USER:-}"
 SMB_PASSWORD="${SMB_PASSWORD:-}"
 WORKSPACE_DIR="${WORKSPACE_DIR:-/home/turnstone/silo-14.lan/ai-playground}"
+COORDINATOR_DIR="/opt/turnstone-coordinator"
+NON_INTERACTIVE="${NON_INTERACTIVE:-false}"
+QUICK_UPDATE="${QUICK_UPDATE:-false}"
 
 usage() {
     echo "Usage: $0 [OPTIONS]"
@@ -72,6 +75,8 @@ usage() {
     echo "      --smb-user <user>              SMB username (e.g. turnstone-np)"
     echo "      --smb-pass <pass>              SMB password"
     echo "      --turnstone-user <user>        Local Debian system user [default: turnstone]"
+    echo "      --quick, --update-only         Restart coordinator containers without full stack reconfiguration"
+    echo "  -y, --non-interactive              Run unattended without interactive prompts"
     echo "  --disable, --stop, --down          Stop and remove coordinator containers and services"
     echo "  --purge                            When used with --disable, remove configs and volumes (/opt/turnstone-coordinator)"
     echo "  -h, --help                         Display this help message and exit"
@@ -116,6 +121,14 @@ while [[ $# -gt 0 ]]; do
         --turnstone-user|--debian-user)
             TURNSTONE_USER_DEBIAN="$2"
             shift 2
+            ;;
+        --quick|--update-only)
+            QUICK_UPDATE="true"
+            shift
+            ;;
+        -y|--non-interactive)
+            NON_INTERACTIVE="true"
+            shift
             ;;
         --disable|--down|--stop)
             DISABLE_STACK="true"
@@ -263,6 +276,8 @@ load_secrets() {
         target_file="${DEFAULT_SECRET_FILE}"
     elif [ -f "${SYS_ADMIN_ENV}" ]; then
         target_file="${SYS_ADMIN_ENV}"
+    elif [ -f "${COORDINATOR_DIR}/.env" ]; then
+        target_file="${COORDINATOR_DIR}/.env"
     fi
 
     if [ -n "${target_file}" ] && [ -f "${target_file}" ]; then
@@ -409,6 +424,18 @@ if ! docker compose version &> /dev/null && ! command -v podman-compose &> /dev/
 fi
 log_success "Container compose environment verified."
 
+if [ "${QUICK_UPDATE}" = "true" ]; then
+    log_info "Quick update requested (--quick). Restarting coordinator console and channel services..."
+    if [ -d "${COORDINATOR_DIR}" ] && [ -f "${COORDINATOR_DIR}/docker-compose.yml" ]; then
+        cd "${COORDINATOR_DIR}"
+        docker compose restart console channel || docker compose up -d console channel
+        log_success "Coordinator services restarted successfully."
+        exit 0
+    else
+        log_warn "Coordinator compose file not found at ${COORDINATOR_DIR}/docker-compose.yml; performing full deployment."
+    fi
+fi
+
 # Step 3: Directory Structure Setup
 COORDINATOR_DIR="/opt/turnstone-coordinator"
 log_info "Step 3: Setting up installation directory at ${COORDINATOR_DIR}..."
@@ -446,9 +473,11 @@ log_info "Step 4: Configuring secrets and environment (.env)..."
 
 if [ -z "${SECRET_FILE}" ]; then
     if [ -z "${POSTGRES_USER}" ]; then
-        read -r -p "Enter PostgreSQL username [e.g. turnstone-np, postgres, turnstone]: " INPUT_USER
-        if [ -n "${INPUT_USER}" ]; then
-            POSTGRES_USER=$(echo "${INPUT_USER}" | xargs)
+        if [ "${NON_INTERACTIVE}" != "true" ] && [ -t 0 ]; then
+            read -r -p "Enter PostgreSQL username [e.g. turnstone-np, postgres, turnstone]: " INPUT_USER
+            if [ -n "${INPUT_USER}" ]; then
+                POSTGRES_USER=$(echo "${INPUT_USER}" | xargs)
+            fi
         fi
     fi
 
@@ -464,16 +493,25 @@ fi
 if [ -z "${SECRET_FILE}" ]; then
     if [ -f "${DEFAULT_SECRET_FILE}" ]; then
         log_info "Default secret file found at '${DEFAULT_SECRET_FILE}'."
-        read -r -p "Enter path to .secret file [press Enter to use default '${DEFAULT_SECRET_FILE}']: " INPUT_SECRET
-        SECRET_FILE="${INPUT_SECRET:-${DEFAULT_SECRET_FILE}}"
+        if [ "${NON_INTERACTIVE}" != "true" ] && [ -t 0 ]; then
+            read -r -p "Enter path to .secret file [press Enter to use default '${DEFAULT_SECRET_FILE}']: " INPUT_SECRET
+            SECRET_FILE="${INPUT_SECRET:-${DEFAULT_SECRET_FILE}}"
+        else
+            SECRET_FILE="${DEFAULT_SECRET_FILE}"
+        fi
     elif [ -f "${SYS_ADMIN_ENV}" ]; then
         log_info "System database configuration file found at '${SYS_ADMIN_ENV}'."
         SECRET_FILE="${SYS_ADMIN_ENV}"
+    elif [ -f "${ENV_FILE}" ]; then
+        log_info "Existing coordinator configuration file found at '${ENV_FILE}'."
+        SECRET_FILE="${ENV_FILE}"
     else
-        echo ""
-        read -r -p "Enter path to .secret file containing DB connection string [leave blank to enter DB details interactively]: " INPUT_SECRET
-        if [ -n "${INPUT_SECRET}" ]; then
-            SECRET_FILE="${INPUT_SECRET}"
+        if [ "${NON_INTERACTIVE}" != "true" ] && [ -t 0 ]; then
+            echo ""
+            read -r -p "Enter path to .secret file containing DB connection string [leave blank to enter DB details interactively]: " INPUT_SECRET
+            if [ -n "${INPUT_SECRET}" ]; then
+                SECRET_FILE="${INPUT_SECRET}"
+            fi
         fi
     fi
 fi
@@ -487,8 +525,10 @@ if [ -n "${SECRET_FILE}" ]; then
 fi
 
 if [ -z "${POSTGRES_HOST}" ]; then
-    read -r -p "Enter central PostgreSQL host IP / hostname [leave blank for local embedded DB]: " INPUT_HOST
-    POSTGRES_HOST="${INPUT_HOST}"
+    if [ "${NON_INTERACTIVE}" != "true" ] && [ -t 0 ]; then
+        read -r -p "Enter central PostgreSQL host IP / hostname [leave blank for local embedded DB]: " INPUT_HOST
+        POSTGRES_HOST="${INPUT_HOST}"
+    fi
 fi
 
 POSTGRES_USER="${POSTGRES_USER:-turnstone}"
@@ -498,9 +538,14 @@ POSTGRES_DB="${POSTGRES_DB:-turnstone}"
 
 if [ -z "${POSTGRES_PASSWORD}" ]; then
     if [ "${POSTGRES_HOST}" != "postgres" ] && [ "${POSTGRES_HOST}" != "localhost" ] && [ "${POSTGRES_HOST}" != "127.0.0.1" ]; then
-        read -r -s -p "Enter PostgreSQL Password for '${POSTGRES_USER}'@'${POSTGRES_HOST}': " INPUT_PASS
-        echo ""
-        POSTGRES_PASSWORD="${INPUT_PASS}"
+        if [ "${NON_INTERACTIVE}" != "true" ] && [ -t 0 ]; then
+            read -r -s -p "Enter PostgreSQL Password for '${POSTGRES_USER}'@'${POSTGRES_HOST}': " INPUT_PASS
+            echo ""
+            POSTGRES_PASSWORD="${INPUT_PASS}"
+        else
+            log_error "POSTGRES_PASSWORD is required for remote host '${POSTGRES_HOST}' in non-interactive mode."
+            exit 1
+        fi
     else
         POSTGRES_PASSWORD=$(python3 -c "import secrets; print(secrets.token_hex(24))" 2>/dev/null || openssl rand -hex 24)
         log_info "Auto-generated secure PostgreSQL password."

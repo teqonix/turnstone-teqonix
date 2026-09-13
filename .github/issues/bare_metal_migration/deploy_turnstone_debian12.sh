@@ -22,6 +22,9 @@
 
 set -euo pipefail
 
+# Ensure standard system binary paths are present in PATH (for usermod, groupadd, adduser, uv, etc.)
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${HOME}/.local/bin:/root/.local/bin:/home/turnstone/.local/bin:${PATH}"
+
 # Color Output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -66,6 +69,8 @@ SKIP_NFS="${SKIP_NFS:-false}"
 SKIP_TOOLS="${SKIP_TOOLS:-false}"
 # Run the server in the foreground at the end of the script (container mode).
 RUN_FOREGROUND="${RUN_FOREGROUND:-true}"
+QUICK_UPDATE="${QUICK_UPDATE:-false}"
+NON_INTERACTIVE="${NON_INTERACTIVE:-false}"
 
 usage() {
     echo "Usage: $0 [OPTIONS]"
@@ -85,6 +90,8 @@ usage() {
     echo "      --skip-nfs                     Skip NFS utilities and share mounting"
     echo "      --skip-tools                   Skip optional extra tooling (all-smi, Rust/Cargo, Jujutsu)"
     echo "      --no-foreground                Do not exec the server in the foreground at the end"
+    echo "      --quick, --update-only         Quickly reinstall package into virtualenv and restart service"
+    echo "  -y, --non-interactive              Run unattended without prompting for inputs"
     echo "  -h, --help                         Display this help message and exit"
     exit 0
 }
@@ -137,6 +144,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-foreground)
             RUN_FOREGROUND="false"
+            shift
+            ;;
+        --quick|--update-only)
+            QUICK_UPDATE="true"
+            shift
+            ;;
+        -y|--non-interactive)
+            NON_INTERACTIVE="true"
             shift
             ;;
         -h|--help)
@@ -204,6 +219,34 @@ auto_load_all_secrets() {
         "${HOME}/nerd_projects/turnstone-teqonix/secrets"
         "/etc/turnstone"
     )
+
+    # Read existing /etc/turnstone/config.toml if present
+    if [ -f "/etc/turnstone/config.toml" ]; then
+        if [ -z "${JWT_SECRET:-}" ]; then
+            local existing_jwt
+            existing_jwt=$(grep -E '^[[:space:]]*jwt_secret[[:space:]]*=' /etc/turnstone/config.toml 2>/dev/null | cut -d'=' -f2- | tr -d ' "' | tr -d "'" || true)
+            if [ -n "${existing_jwt}" ]; then
+                JWT_SECRET="${existing_jwt}"
+                log_info "Loaded JWT secret from '/etc/turnstone/config.toml'."
+            fi
+        fi
+        if [ -z "${POSTGRES_PASSWORD:-}" ]; then
+            local existing_url
+            existing_url=$(grep -E '^[[:space:]]*url[[:space:]]*=' /etc/turnstone/config.toml 2>/dev/null | cut -d'=' -f2- | tr -d ' "' | tr -d "'" || true)
+            if [ -n "${existing_url}" ]; then
+                parse_connection_uri "${existing_url}"
+                log_info "Loaded PostgreSQL connection settings from '/etc/turnstone/config.toml'."
+            fi
+        fi
+    fi
+
+    if [ -z "${NODE_ID:-}" ] && [ -f "/usr/local/bin/turnstone-node-entrypoint" ]; then
+        local entry_node_id
+        entry_node_id=$(grep -E '^[[:space:]]*export TURNSTONE_NODE_ID=' /usr/local/bin/turnstone-node-entrypoint 2>/dev/null | cut -d'=' -f2- | tr -d ' "' | tr -d "'" || true)
+        if [ -n "${entry_node_id}" ]; then
+            NODE_ID="${entry_node_id}"
+        fi
+    fi
 
     # 1. PostgreSQL Secret Discovery & Parsing
     if [ -z "${POSTGRES_PASSWORD:-}" ]; then
@@ -366,12 +409,21 @@ fi
 auto_load_all_secrets
 
 if [ -z "${POSTGRES_PASSWORD}" ]; then
+    if [ "${NON_INTERACTIVE}" = "true" ] || [ ! -t 0 ]; then
+        log_error "POSTGRES_PASSWORD is not set and running non-interactively (-y)."
+        exit 1
+    fi
     read -r -s -p "Enter PostgreSQL Password for user '${POSTGRES_USER}'@'${POSTGRES_HOST}': " POSTGRES_PASSWORD
     echo ""
 fi
 
 if [ -z "${JWT_SECRET}" ]; then
-    read -rp "Enter TURNSTONE_JWT_SECRET from Coordinator setup: " JWT_SECRET
+    if [ "${NON_INTERACTIVE}" = "true" ] || [ ! -t 0 ]; then
+        log_warn "JWT_SECRET not found; auto-generating a secure JWT secret..."
+        JWT_SECRET=$(python3 -c "import secrets; print(secrets.token_hex(32))" 2>/dev/null || openssl rand -hex 32)
+    else
+        read -rp "Enter TURNSTONE_JWT_SECRET from Coordinator setup: " JWT_SECRET
+    fi
 fi
 
 if [ -z "${NODE_ID}" ]; then
@@ -379,8 +431,12 @@ if [ -z "${NODE_ID}" ]; then
     if [ "${DEFAULT_NODE_ID}" = "localhost" ] || [ -z "${DEFAULT_NODE_ID}" ]; then
         DEFAULT_NODE_ID="turnstone-worker-one"
     fi
-    read -rp "Enter Node ID (e.g. turnstone-worker-one, turnstone-worker-two) [default: ${DEFAULT_NODE_ID}]: " INPUT_NODE_ID
-    NODE_ID="${INPUT_NODE_ID:-${DEFAULT_NODE_ID}}"
+    if [ "${NON_INTERACTIVE}" = "true" ] || [ ! -t 0 ]; then
+        NODE_ID="${DEFAULT_NODE_ID}"
+    else
+        read -rp "Enter Node ID (e.g. turnstone-worker-one, turnstone-worker-two) [default: ${DEFAULT_NODE_ID}]: " INPUT_NODE_ID
+        NODE_ID="${INPUT_NODE_ID:-${DEFAULT_NODE_ID}}"
+    fi
 fi
 log_info "Deploying with Node ID: '${NODE_ID}'"
 
@@ -388,6 +444,39 @@ LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || hostname -i 2>/dev/null 
 [ -z "${LAN_IP}" ] && LAN_IP="127.0.0.1"
 
 log_success "Configured credentials for PostgreSQL (${POSTGRES_USER}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB})."
+
+# Quick Update execution block
+if [ "${QUICK_UPDATE}" = "true" ]; then
+    log_info "Quick update mode enabled (--quick). Reinstalling Turnstone package and restarting service..."
+    VENV_DIR="/opt/turnstone-venv"
+    if [ ! -d "${VENV_DIR}" ]; then
+        log_info "Virtualenv not found at ${VENV_DIR}; creating it..."
+        uv venv "${VENV_DIR}" --python "$(command -v python3 || echo /usr/bin/python3)"
+    fi
+    log_info "Reinstalling turnstone package from ${REPO_ROOT} into ${VENV_DIR}..."
+    if [ -f "${REPO_ROOT}/pyproject.toml" ]; then
+        uv pip install --python "${VENV_DIR}" --reinstall "${REPO_ROOT}"
+    else
+        uv pip install --python "${VENV_DIR}" turnstone
+    fi
+    chown -R "${TURNSTONE_USER}:${TURNSTONE_USER}" "${VENV_DIR}" 2>/dev/null || true
+    chmod -R a+rX "${VENV_DIR}"
+    chmod +x "${VENV_DIR}/bin"/* 2>/dev/null || true
+
+    if command -v systemctl &>/dev/null && [ -d /run/systemd/system ]; then
+        log_info "Restarting turnstone-server.service..."
+        systemctl restart turnstone-server.service || true
+        sleep 2
+        if systemctl is-active --quiet turnstone-server.service; then
+            log_success "turnstone-server.service is ACTIVE."
+        else
+            log_warn "turnstone-server.service is not active! Recent logs:"
+            journalctl -u turnstone-server.service -n 25 --no-pager || true
+        fi
+    fi
+    log_success "Quick update complete for ${NODE_ID}."
+    exit 0
+fi
 
 # Step 3: Base Packages, OpenSSH, Podman & Podman Compose
 log_info "Step 3: Installing base packages, OpenSSH server, Podman, and Podman Compose..."
