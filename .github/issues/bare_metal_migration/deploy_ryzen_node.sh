@@ -261,6 +261,13 @@ if [ "${SKIP_PAIR}" != "true" ]; then
             fi
         fi
     done
+
+    # Enable lingering for service user teqonix so rootless Podman user session stays active
+    loginctl enable-linger teqonix 2>/dev/null || true
+    if id -u teqonix &>/dev/null; then
+        systemctl start "user@$(id -u teqonix).service" 2>/dev/null || true
+    fi
+
     if [ -e "/dev/kfd" ]; then
         chmod 666 /dev/kfd 2>/dev/null || true
     fi
@@ -333,6 +340,9 @@ if [ "${SKIP_PAIR}" != "true" ]; then
 
     if [ -d "/home/turnstone/models" ]; then
         ln -sfn "/home/turnstone/models" /models/local 2>/dev/null || true
+    fi
+    if [ -d "/home/turnstone/.lmstudio/models" ]; then
+        ln -sfn "/home/turnstone/.lmstudio/models" /models/lmstudio 2>/dev/null || true
     fi
 
     CONF_EXAMPLE_SRC=""

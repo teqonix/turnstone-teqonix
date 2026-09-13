@@ -142,14 +142,22 @@ USER_HOME="$(getent passwd "${SERVICE_USER}" 2>/dev/null | cut -d: -f6 || true)"
 if [ -z "${USER_HOME}" ]; then
     USER_HOME="/home/${SERVICE_USER}"
 fi
+USER_ID="$(id -u "${SERVICE_USER}" 2>/dev/null || echo "1001")"
 
-log_info "Injecting service user '${SERVICE_USER}' (home: ${USER_HOME}) into ${SERVICE_DEST}..."
+# Ensure service user lingering and systemd user session are enabled for rootless containers
+loginctl enable-linger "${SERVICE_USER}" 2>/dev/null || true
+if [ -d "/run/systemd/system" ]; then
+    systemctl start "user@${USER_ID}.service" 2>/dev/null || true
+fi
+
+log_info "Injecting service user '${SERVICE_USER}' (UID: ${USER_ID}, home: ${USER_HOME}) into ${SERVICE_DEST}..."
 sed -i \
     -e "s|\${SERVICE_USER}|${SERVICE_USER}|g" \
     -e "s|^User=.*|User=${SERVICE_USER}|g" \
     -e "s|^Group=.*|Group=${SERVICE_USER}|g" \
     -e "s|^WorkingDirectory=.*|WorkingDirectory=${USER_HOME}|g" \
     -e "s|^Environment=\"HOME=.*|Environment=\"HOME=${USER_HOME}\"|g" \
+    -e "s|^Environment=\"XDG_RUNTIME_DIR=.*|Environment=\"XDG_RUNTIME_DIR=/run/user/${USER_ID}\"|g" \
     "${SERVICE_DEST}"
 
 chmod 644 "${SERVICE_DEST}"

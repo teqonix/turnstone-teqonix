@@ -10,6 +10,13 @@
 
 set -euo pipefail
 
+# Ensure XDG_RUNTIME_DIR is set for rootless Podman execution
+if [ -z "${XDG_RUNTIME_DIR:-}" ]; then
+    if [ -d "/run/user/$(id -u)" ]; then
+        export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+    fi
+fi
+
 CONTAINER_NAME="${CONTAINER_NAME:-pair-llama-engine}"
 CONFIG_FILE="${CONFIG_FILE:-/etc/turnstone/llama_rocm.conf}"
 # Declare MODELS array for Multi-Model Resident Stacking (Option 2)
@@ -22,11 +29,11 @@ if [ -f "${CONFIG_FILE}" ]; then
     source "${CONFIG_FILE}"
 fi
 
-DEFAULT_IMAGE="docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-10.0-qwen-3.8-flash-next"
+DEFAULT_IMAGE="docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-10.0-rocmfpx"
 LLAMA_IMAGE="${LLAMA_IMAGE:-${DEFAULT_IMAGE}}"
 PORT="${PORT:-1235}"
 BIND_HOST="${BIND_HOST:-0.0.0.0}"
-CONTEXT_SIZE="${CONTEXT_SIZE:-262144}"
+CONTEXT_SIZE="${CONTEXT_SIZE:-32768}"
 GPU_LAYERS="${GPU_LAYERS:-999}"
 LOAD_MODE="${LOAD_MODE:-dio}"
 BATCH_SIZE="${BATCH_SIZE:-2048}"
@@ -259,8 +266,6 @@ start_single_server() {
         "-e" "ROCBLAS_USE_HIPBLASLT=1"
         "-e" "HSA_OVERRIDE_GFX_VERSION=11.5.1"
         "-e" "GGML_HIP_ENABLE_UNIFIED_MEMORY=1"
-        "-e" "HSA_ENABLE_SDMA=0"
-        "-e" "HIP_VISIBLE_DEVICES=0"
         "-e" "XDG_CACHE_HOME=/tmp"
     )
 
@@ -269,6 +274,10 @@ start_single_server() {
     model_abs="$(realpath "${target_model}" 2>/dev/null || echo "${target_model}")"
     local model_dir
     model_dir="$(dirname "${model_abs}")"
+
+    if [ -d "/home/turnstone" ]; then
+        engine_args+=("-v" "/home/turnstone:/home/turnstone:ro")
+    fi
 
     if [ -d "${RESOLVED_MODELS_DIR}" ] && [[ "${model_abs}" == "${RESOLVED_MODELS_DIR}"* ]]; then
         engine_args+=("-v" "${RESOLVED_MODELS_DIR}:/models:ro")
@@ -397,6 +406,8 @@ start_multi_server() {
         local top_model_dir
         if [[ "${model_dir}" == /home/turnstone/models* ]]; then
             top_model_dir="/home/turnstone/models"
+        elif [[ "${model_dir}" == /home/turnstone/.lmstudio* ]]; then
+            top_model_dir="/home/turnstone/.lmstudio"
         elif [[ "${model_dir}" == /home/teqonix/models* ]]; then
             top_model_dir="/home/teqonix/models"
         elif [[ "${model_dir}" == /models* ]]; then
@@ -444,11 +455,14 @@ start_multi_server() {
             "-e" "ROCBLAS_USE_HIPBLASLT=1"
             "-e" "HSA_OVERRIDE_GFX_VERSION=11.5.1"
             "-e" "GGML_HIP_ENABLE_UNIFIED_MEMORY=1"
-            "-e" "HSA_ENABLE_SDMA=0"
-            "-e" "HIP_VISIBLE_DEVICES=0"
             "-e" "XDG_CACHE_HOME=/tmp"
-            "-v" "${top_model_dir}:${top_model_dir}:ro"
         )
+
+        if [ -d "/home/turnstone" ]; then
+            inst_engine_args+=("-v" "/home/turnstone:/home/turnstone:ro")
+        fi
+
+        inst_engine_args+=("-v" "${top_model_dir}:${top_model_dir}:ro")
 
         if [ -d "${RESOLVED_MODELS_DIR}" ] && [ "${RESOLVED_MODELS_DIR}" != "${top_model_dir}" ]; then
             inst_engine_args+=("-v" "${RESOLVED_MODELS_DIR}:/models:ro")

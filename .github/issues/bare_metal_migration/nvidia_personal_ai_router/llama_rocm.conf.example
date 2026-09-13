@@ -20,9 +20,9 @@
 # llama.cpp automatically links and loads the remaining shards.
 
 MODELS=(
-    "/home/turnstone/models/Qwen3.8-Flash-Next-GGUF/UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf"
     "/home/turnstone/models/gemma-4-31B-it-GGUF/gemma-4-31B-it-UD-Q4_K_XL.gguf"
-    "/home/turnstone/models/Ministral-3-14B-Instruct-2512-GGUF/Ministral-3-14B-Instruct-2512-UD-Q4_K_XL.gguf"
+    "/home/turnstone/models/Qwen-3.8-27B-ROCmFP4-FAST-GGUF"
+    "/home/turnstone/.lmstudio/models/lmstudio-community/NVIDIA-Nemotron-3-Nano-4B-GGUF/NVIDIA-Nemotron-3-Nano-4B-Q4_K_M.gguf"
 )
 
 # -----------------------------------------------------------------------------
