@@ -160,7 +160,10 @@ start_server() {
     local target_model
     target_model="$(find_model_file)"
     if [ -z "${target_model}" ]; then
-        echo "[WARN] No explicit GGUF model found in '${RESOLVED_MODELS_DIR}'. Starting llama-server with --models-path /models."
+        echo "[ERROR] No GGUF model found in '${RESOLVED_MODELS_DIR}' or candidate search paths." >&2
+        echo "[ERROR] llama-server requires an explicit GGUF model file to start." >&2
+        echo "[ERROR] Please place a .gguf model in /models or configure LLAMA_MODEL_PATH in /etc/turnstone/llama_rocm.conf" >&2
+        exit 1
     else
         echo "[INFO] Selected target model: ${target_model}"
     fi
@@ -184,11 +187,22 @@ start_server() {
     if [ -d "/dev/dri" ]; then
         engine_args+=("--device" "/dev/dri")
     fi
-    engine_args+=(
-        "--group-add" "video"
-        "--group-add" "render"
-        "--security-opt" "seccomp=unconfined"
-    )
+
+    # Device permissions & user namespaces
+    if [ "${engine}" = "podman" ]; then
+        engine_args+=(
+            "--group-add" "keep-groups"
+            "--userns=keep-id"
+            "--security-opt" "label=disable"
+            "--security-opt" "seccomp=unconfined"
+        )
+    else
+        engine_args+=(
+            "--group-add" "video"
+            "--group-add" "render"
+            "--security-opt" "seccomp=unconfined"
+        )
+    fi
 
     # RDMA / Infiniband support if available
     if [ -d "/dev/infiniband" ]; then
@@ -201,18 +215,13 @@ start_server() {
         "-e" "HSA_OVERRIDE_GFX_VERSION=11.5.1"
         "-e" "GGML_HIP_ENABLE_UNIFIED_MEMORY=1"
         "-e" "HSA_ENABLE_SDMA=0"
+        "-e" "HIP_VISIBLE_DEVICES=0"
+        "-e" "XDG_CACHE_HOME=/tmp"
     )
 
     # Mount models directory
     if [ -d "${RESOLVED_MODELS_DIR}" ]; then
         engine_args+=("-v" "${RESOLVED_MODELS_DIR}:/models:ro")
-    else
-        # Ensure dummy /models exists so volume mount or directory exists
-        engine_args+=("-v" "/tmp:/models:ro")
-    fi
-
-    if [ "${engine}" = "podman" ]; then
-        engine_args+=("--security-opt" "label=disable")
     fi
 
     engine_args+=("${LLAMA_IMAGE}")
@@ -233,13 +242,9 @@ start_server() {
         "--cache-type-v" "${KV_CACHE_TYPE}"
     )
 
-    if [ -n "${target_model}" ]; then
-        local rel_model
-        rel_model="$(realpath --relative-to="${RESOLVED_MODELS_DIR}" "${target_model}" 2>/dev/null || basename "${target_model}")"
-        server_cmd+=("-m" "/models/${rel_model}")
-    else
-        server_cmd+=("--models-path" "/models")
-    fi
+    local rel_model
+    rel_model="$(realpath --relative-to="${RESOLVED_MODELS_DIR}" "${target_model}" 2>/dev/null || basename "${target_model}")"
+    server_cmd+=("-m" "/models/${rel_model}")
 
     if [ -n "${mtp_draft}" ]; then
         local rel_mtp

@@ -84,6 +84,12 @@ if ! id -u "${SERVICE_USER}" &>/dev/null; then
     useradd -m -s /bin/bash "${SERVICE_USER}" || true
 fi
 
+# Ensure service user has hardware GPU device permissions (render, video)
+usermod -aG render,video "${SERVICE_USER}" 2>/dev/null || true
+if getent group docker &>/dev/null; then
+    usermod -aG docker "${SERVICE_USER}" 2>/dev/null || true
+fi
+
 # Step 3: Ensure tmux is Installed
 if ! command -v tmux &>/dev/null; then
     log_info "Installing tmux..."

@@ -252,6 +252,22 @@ if [ "${SKIP_PAIR}" != "true" ]; then
         DEBIAN_FRONTEND=noninteractive apt-get install -y -qq podman || log_warn "podman installation returned non-zero."
     fi
 
+    # Ensure users teqonix and turnstone belong to render and video groups for ROCm GPU access
+    for u in "teqonix" "turnstone"; do
+        if id -u "${u}" &>/dev/null; then
+            usermod -aG render,video "${u}" 2>/dev/null || true
+            if getent group docker &>/dev/null; then
+                usermod -aG docker "${u}" 2>/dev/null || true
+            fi
+        fi
+    done
+    if [ -e "/dev/kfd" ]; then
+        chmod 666 /dev/kfd 2>/dev/null || true
+    fi
+    if [ -d "/dev/dri" ]; then
+        chmod 666 /dev/dri/* 2>/dev/null || true
+    fi
+
     # Install pair-llama-server runner script
     PAIR_RUNNER_SRC=""
     CANDIDATE_RUNNERS=(
